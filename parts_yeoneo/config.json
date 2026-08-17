@@ -3,20 +3,20 @@
  "scale": 0.34,
  "screen_quad": [
   [
-   195,
-   892
+   193,
+   916
   ],
   [
-   356,
-   889
+   354,
+   913
   ],
   [
-   345,
-   957
+   343,
+   981
   ],
   [
-   172,
-   957
+   170,
+   981
   ]
  ],
  "blink": null,
@@ -328,5 +328,5 @@
  "reset_menu": false,
  "char_lift": 95,
  "pen_over_head": true,
- "pen_pin": true
+ "eye_move": 0.55
 }
