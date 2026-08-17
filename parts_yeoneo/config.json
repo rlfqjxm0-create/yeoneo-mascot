@@ -328,5 +328,9 @@
  "reset_menu": false,
  "char_lift": 95,
  "pen_over_head": true,
- "eye_move": 0.55
+ "eye_move": 0.55,
+ "arm_shoulder": [
+  12,
+  9
+ ]
 }
