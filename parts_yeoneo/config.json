@@ -327,5 +327,6 @@
  },
  "reset_menu": false,
  "char_lift": 95,
- "pen_over_head": true
+ "pen_over_head": true,
+ "pen_pin": true
 }
