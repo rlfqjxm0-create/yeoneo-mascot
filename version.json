@@ -1,5 +1,5 @@
 {
- "version": 1786947258,
+ "version": 1786947792,
  "files": {
   "mascot.py": "eb89ca966cdcb7405a68420d1456eb6c379b39c106a4b47e64398bbaca6a5918",
   "parts_yeoneo/arm_key.png": "318526fc90f00705eb6fedcf2b80c7ea83036a8833ac14eee5833c38de942050",
@@ -7,7 +7,7 @@
   "parts_yeoneo/arm_right.png": "d5b89dcb705a5ddc4bb4c9220f3c4e1a50511aaede7cfd8a383eee1668612e10",
   "parts_yeoneo/arm_right_typing.png": "318526fc90f00705eb6fedcf2b80c7ea83036a8833ac14eee5833c38de942050",
   "parts_yeoneo/body_open.png": "c8a2baf6a7a2ff8ffc8b95db1c8c69c9b3e24469f9b970f9eff85b5f0905bc39",
-  "parts_yeoneo/config.json": "86bf189a52f97b852dc435e7f4551f4f5e35014b236c60cf0d4b253e6480948f",
+  "parts_yeoneo/config.json": "07e184bf391b3f8e96ed26c4a698f1fb45b1fb5266cea9ad4eb39b10a0d6bebb",
   "parts_yeoneo/crown.png": "b1b7426a0222ac294a782cb06db6c9c4aba4e660591dd1761dc9e4da050175fc",
   "parts_yeoneo/desk.png": "e5aac3c2fa4d55a5481b2d4f007040b87e0338db153edc9d63964b7765889e6d",
   "parts_yeoneo/eyes_closed.png": "8d88e30756a653d93b5e279a730cbe3d81fce8b0232b7061843be2ca19e14b1b",
@@ -31,12 +31,12 @@
   "parts_yeoneo/prop8_back.png": "99f43250f738ef4426d7e1ad29454944475da34631a099a8fa219185b86ffb09",
   "parts_yeoneo/prop9.png": "f8edafd9344f2452340c8d69fd95541dfc65efd676c12fc2aaf04351ef335a68",
   "parts_yeoneo/pupils.png": "6fa466e21df6bf014ed03517399a711777f572b1f0be6a561b947790cda9f634",
-  "parts_yeoneo/seat.png": "19da771400be7fd3bd20c7c27c344e2c9b0cb626fbac35d1f593c9923d482f56",
-  "parts_yeoneo/seat_idle.png": "b99ba9ec9d3b5c9b2c628885d471dc915bc79ab5ebf8680d53341631cc834b99",
-  "parts_yeoneo/seat_meta.json": "0a758dd19f0cf838ceb3fe8294dc249e53716d05951249d0d9c20b052c7540d3",
-  "parts_yeoneo/seat_pen.png": "2ceb34621686bf7ec21125145e549fb5d169bb97938038588039e34168c5e122",
-  "parts_yeoneo/seat_pen2.png": "f0817d6ebb99987c776c57b2ad159673a9238b6f6305c5fe831b9be71819c06e",
-  "parts_yeoneo/seat_type.png": "ff4e1b04952c893bad0ef9ad4f20c72003b75b82f012d3996a764f95fd9ec8ab",
+  "parts_yeoneo/seat.png": "562ee7240aa13e1fc5730a6e9fa389e1585a13d1743322ec9c4b445df5a29292",
+  "parts_yeoneo/seat_idle.png": "cce256c2de2739caba15ffe881004f753ebbdbe0f29a31a2777d215b5bf7e50c",
+  "parts_yeoneo/seat_meta.json": "232854a3bfe7901e1d9c5895e28902c943b2a20d53be82127e4707e66d3819c8",
+  "parts_yeoneo/seat_pen.png": "430e95470b9ba33f0b3b85bb30c3c59754d2e3e4bb6a9ec26d2e3d9211681e46",
+  "parts_yeoneo/seat_pen2.png": "a4b339bd6bc016da94a077d2fe446d64991ea9add0ae5d89886912b3bd8761ee",
+  "parts_yeoneo/seat_type.png": "f9980ced617098044605a43af6c7024fd291535fccf5942fc2a7a4ef2711eb33",
   "parts_yeoneo/smile.png": "e733e26f8410c4b038a1d3047b3e48b685e6d51ff00632655c3c5a42ae410292",
   "parts_yeoneo/fonts/Pretendard-Bold.otf": "2e91915fab54df71cc9598ebf608b2bdb54c6fe3c066ac61dff0bc44fca71cc7",
   "parts_yeoneo/fonts/Pretendard-Regular.otf": "3ffbacde6ab8411f1d2db54bb9b1f0b3ee2a738932033722cf0388c06aed1c93",
@@ -341,11 +341,6 @@
   "stickers/__init__.py": "d77e3dc92cb353dced8d192c140643c6458bc3901facdf2e0a0d0830fa4244b7",
   "youtube_player.py": "33dd7fc8cf781b8b8a37c1a60a54b7506ebce5b44399d28fc0841d143d19e70c"
  },
- "notes": [
-  "새 주민 '연어'가 이사 왔어요 — 홈에서 만나요",
-  "홈 위쪽 ♪ 단추 — 모두의 플레이리스트! 오늘 올라온 노래를 이어 들을 수 있어요",
-  "곡이 끝나면 다음 곡으로 넘어가요 (맥은 곡을 누르면 유튜브로 열려요)",
-  "홈에서 나를 고르고 간식을 누르면 내 컵케이크를 먹어요 — 10분에 한 번!",
-  "환경설정에서 '타이머와 머리 사이 여백'을 직접 조절할 수 있어요"
- ]
+ "notes": [],
+ "silent": true
 }

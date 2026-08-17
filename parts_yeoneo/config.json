@@ -31,7 +31,7 @@
   395,
   727
  ],
- "arms_over_head": true,
+ "arms_over_head": false,
  "pen_grain": false,
  "todo": true,
  "talk": [
@@ -281,5 +281,11 @@
   }
  },
  "reset_menu": false,
- "char_lift": 95
+ "char_lift": 95,
+ "part_offsets": {
+  "arm_key": [
+   52,
+   0
+  ]
+ }
 }
