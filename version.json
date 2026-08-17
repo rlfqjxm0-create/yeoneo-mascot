@@ -1,7 +1,7 @@
 {
- "version": 1786974800,
+ "version": 1786975947,
  "files": {
-  "mascot.py": "089c9e8757762c96ff4f82ce91f871f444c26dda881a6d049995df2c7b6401ba",
+  "mascot.py": "9fa0b54a6a042887bf71e7bce619ecd0a3f77b1e86ecd44e2e35f556b14afba7",
   "parts_yeoneo/arm_key.png": "318526fc90f00705eb6fedcf2b80c7ea83036a8833ac14eee5833c38de942050",
   "parts_yeoneo/arm_pen.png": "9f5989174ed0c9eb0e9b1d62040292a5122bf743d748e2e8b1943a1a6afa83d8",
   "parts_yeoneo/arm_right.png": "d5b89dcb705a5ddc4bb4c9220f3c4e1a50511aaede7cfd8a383eee1668612e10",
@@ -346,12 +346,6 @@
   "stickers/__init__.py": "d77e3dc92cb353dced8d192c140643c6458bc3901facdf2e0a0d0830fa4244b7",
   "youtube_player.py": "b24fce8125c2234285ae5f8dfbb612eb879c8897476d7fbfcc04856057e42e76"
  },
- "notes": [
-  "홈 꾸미기가 새로워졌어요!\n배경을 없음·이미지·그라데이션에서 골라요. 그라데이션은 시작·끝 색과 방향을 직접 정하고, 밝은 오버레이로 배경을 연하게 누르면 카드가 또렷해져요.",
-  "심플모드 한마디 말풍선\n자리가 좁아도 항상 보이고, 마우스를 올리면 잘린 글이 옆으로 흘러요.",
-  "홈에 '모두 보기'가 생겼어요!\n왼쪽 아래 단추를 누르면 전원이 캡슐로 한 화면에 보여요 (심플모드). 다시 누르면 일반모드로 돌아와요.",
-  "캡슐에는 다 들어 있어요\n레벨·칭호·한마디 말풍선·노래(♪·하트)·게이지·작업 시간, 그리고 배경은 테마색이 그 사람의 방 이미지로 녹아들어요.",
-  "심플모드에도 살아 있는 것들\n숨쉬기, 음표, 24시간 반짝임이 캡슐에서도 돌아요.",
-  "준사의 홈 모습이 메이드복으로 보여요."
- ]
+ "notes": [],
+ "silent": true
 }
