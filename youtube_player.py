@@ -1,0 +1,494 @@
+# -*- coding: utf-8 -*-
+"""유튜브 음악 재생기 — 타이머와 따로 도는 작은 프로그램.
+
+■ 왜 프로세스를 나누는가
+pywebview는 창을 반드시 메인 스레드에서 열어야 한다(메인 스레드가 아니면
+webview가 스스로 예외를 던진다). 그 자리는 이미 tkinter 타이머가 쓰고 있어서
+같은 프로세스 안에는 넣을 수 없다. 그래서 이 파일을 자식으로 띄우고 파이프로
+이야기한다. 덤으로, 음악을 끄면 프로세스째 사라져 메모리가 0으로 돌아온다.
+
+■ 대화 방식
+부모 → 자식 : 표준입력에 한 줄 JSON.  {"c":"load","v":"영상ID"} 처럼.
+자식 → 부모 : 표준출력에 `@YT {json}` 한 줄. 그 밖의 출력(엔진 경고 등)은
+              부모가 전부 버린다.
+부모가 죽으면 표준입력이 닫히므로 자식도 스스로 끝난다. 고아가 남지 않는다.
+
+■ 왜 작은 웹서버를 같이 띄우는가
+유튜브 IFrame API는 페이지의 origin을 본다. 파일(file://)이나 문자열로 띄우면
+origin이 null이라 postMessage가 막혀 조종이 안 된다. 127.0.0.1에 임시 서버를
+하나 띄우면 제대로 된 http origin이 생겨 공식 API가 그대로 동작한다.
+
+■ 창을 왜 '숨기지 않고 화면 밖에' 두는가  (실측으로 갈랐다)
+크로미움은 감춘 창(SW_HIDE)에서는 재생을 시작하지 못한다. 실측하면 상태가
+'받는 중(3)'에 붙어 재생 위치가 0.0에서 안 움직인다. 반면 화면 밖 좌표에
+'보이는' 창으로 두면 정상 재생된다. 한 번 재생이 시작된 뒤에는 숨겨도 계속
+나오지만, 곡을 바꿀 때마다 다시 시작해야 하므로 그냥 계속 화면 밖에 둔다.
+작업표시줄·Alt+Tab에 안 뜨도록 도구창 속성을, 포커스를 빼앗지 않도록 비활성
+속성을 준다. 다만 로그인할 때는 글자를 쳐야 하므로 둘 다 잠시 푼다.
+
+■ 로그인
+`--profile <폴더>`를 주면 그 폴더에 브라우저 자료(쿠키 포함)를 남긴다.
+한 번 유튜브에 로그인해 두면 다음부터는 저절로 로그인된 채로 뜨고, 프리미엄
+계정이면 광고 없이 나온다. 그 폴더에는 구글 세션이 들어 있으니 절대 공개
+저장소에 올리지 말 것 (.gitignore에 넣어 두었다).
+"""
+import ctypes
+import ctypes.wintypes as wt
+import json
+import os
+import sys
+import threading
+import time
+
+# WebView2가 뜨기 전에 정해 두어야 하는 값들.
+#  - autoplay-policy : 사람이 클릭하지 않으면 소리 나는 재생을 막는 기본 정책.
+#                      우리 창은 사람이 볼 수 없으니 이걸 풀어야 재생된다.
+#  - CalculateNativeWinOcclusion : 이걸 안 끄면 화면 밖 창을 '가려졌다'고 보고
+#                      렌더링을 멈춘다. 화면 밖에 두는 우리 방식과 충돌한다.
+#  - GPU 끄기 : 영상을 볼 일이 없으니 그림 가속이 필요 없다. 실측 55MB 절약.
+#  - low-end-device-mode : 크로미움의 저사양 모드. 실측 10MB쯤 더 줄었다.
+#  - 프로세스 격리(site isolation)는 끄지 않는다. 조금 더 줄지만 이 프로필에
+#    구글 로그인이 들어 있어, 사이트끼리 벽을 허무는 건 값이 너무 비싸다.
+#  - mute-audio 아님 : 소리가 목적이므로 절대 넣지 않는다.
+os.environ.setdefault(
+    "WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS",
+    "--autoplay-policy=no-user-gesture-required "
+    "--disable-features=CalculateNativeWinOcclusion "
+    "--disable-gpu --disable-gpu-compositing "
+    "--enable-low-end-device-mode")
+
+# 화면 배율(DPI)을 아는 프로그램으로 선언한다. 안 하면 윈도우가 좌표를 배율만큼
+# 접어서 넘겨, 부모가 알려 준 로그인 창 자리가 엉뚱한 곳이 된다(150% 화면에서
+# 1.5배 어긋났다). 창을 만들기 전에 해야 한다.
+try:
+    ctypes.windll.shcore.SetProcessDpiAwareness(2)      # 모니터별 인식
+except Exception:
+    try:
+        ctypes.windll.user32.SetProcessDPIAware()
+    except Exception:
+        pass
+
+# 모든 모니터 바깥이면서, 최소화한 창이 쓰는 마법의 자리(-32000)는 피한 좌표.
+OFF_X, OFF_Y = -30000, -30000
+LOGIN_URL = ("https://accounts.google.com/ServiceLogin"
+             "?continue=https%3A%2F%2Fwww.youtube.com%2F&hl=ko")
+
+GWL_EXSTYLE = -20
+WS_EX_TOOLWINDOW = 0x00000080     # 작업표시줄·Alt+Tab 에 안 뜨게
+WS_EX_NOACTIVATE = 0x08000000     # 포커스를 빼앗지 않게
+
+PAGE = """<!doctype html>
+<html><head><meta charset="utf-8">
+<style>html,body{margin:0;padding:0;background:#000;overflow:hidden}</style>
+</head><body>
+<div id="p"></div>
+<script src="https://www.youtube.com/iframe_api"></script>
+<script>
+var pl = null, ready = false, lastErr = 0, pending = null;
+
+function onYouTubeIframeAPIReady() {
+  pl = new YT.Player('p', {
+    height: '180', width: '320',
+    playerVars: {autoplay: 0, controls: 0, disablekb: 1, fs: 0,
+                 modestbranding: 1, rel: 0, playsinline: 1,
+                 origin: location.origin},
+    events: {
+      onReady: function () {
+        ready = true;
+        try { pl.setPlaybackQuality('small'); } catch (e) {}
+        if (pending) { var q = pending; pending = null; q(); }
+      },
+      onError: function (e) { lastErr = e.data || 0; },
+      onStateChange: function (e) {
+        // 화질은 재생이 시작될 때마다 유튜브가 되돌리므로 다시 낮춘다.
+        // 소리만 들으니 제일 낮은 화질이면 충분하다 (디코딩 비용 절약).
+        if (e.data === 1) { try { pl.setPlaybackQuality('small'); } catch (x) {} }
+      }
+    }
+  });
+}
+
+function later(fn) { if (ready) { fn(); return true; } pending = fn; return false; }
+
+window.ytLoad = function (vid, list, vol) {
+  lastErr = 0;
+  return later(function () {
+    try { pl.setVolume(vol); } catch (e) {}
+    if (list) { pl.loadPlaylist({list: list, listType: 'playlist', index: 0}); }
+    else { pl.loadVideoById(vid); }
+  });
+};
+window.ytPlay  = function () { return later(function () { pl.playVideo(); }); };
+window.ytPause = function () { return later(function () { pl.pauseVideo(); }); };
+window.ytVol   = function (v) { return later(function () { pl.setVolume(v); }); };
+
+window.ytStatus = function () {
+  var o = {ready: ready, state: -9, pos: 0, dur: 0, title: '', vid: '',
+           err: lastErr};
+  if (!ready || !pl) return o;
+  try { o.state = pl.getPlayerState(); } catch (e) {}
+  try { o.pos = pl.getCurrentTime() || 0; } catch (e) {}
+  try { o.dur = pl.getDuration() || 0; } catch (e) {}
+  try {
+    var d = pl.getVideoData() || {};
+    o.title = d.title || '';
+    o.vid = d.video_id || '';
+  } catch (e) {}
+  return o;
+};
+</script></body></html>
+"""
+
+
+_MAIN = None
+
+
+def _main_window():
+    """진짜 창 하나만 골라 낸다 (한 번 찾으면 기억한다).
+
+    이 프로세스에는 IME·GDI+ 같은 보이지 않는 도우미 창이 여럿 딸려 있다.
+    전부를 대상으로 ShowWindow를 부르면 그 숨은 창들까지 '보임'으로 바뀐다.
+    WinForms 프레임이면서 제목이 있는 창이 우리 창이다.
+    """
+    global _MAIN
+    u = ctypes.WinDLL("user32", use_last_error=True)
+    if _MAIN and u.IsWindow(_MAIN):
+        return u, _MAIN
+    me = ctypes.WinDLL("kernel32").GetCurrentProcessId()
+    found = []
+    CB = ctypes.WINFUNCTYPE(ctypes.c_int, wt.HWND, wt.LPARAM)
+
+    def cb(h, _):
+        pid = wt.DWORD()
+        u.GetWindowThreadProcessId(h, ctypes.byref(pid))
+        if pid.value != me:
+            return 1
+        cls = ctypes.create_unicode_buffer(200)
+        u.GetClassNameW(h, cls, 200)
+        if cls.value.startswith("WindowsForms10.Window") \
+                and u.GetWindowTextLengthW(h) > 0:
+            found.append(h)
+        return 1
+
+    u.EnumWindows(CB(cb), 0)
+    _MAIN = found[0] if found else None
+    return u, _MAIN
+
+
+def _park_offscreen():
+    """창을 화면 밖으로 옮기고, 작업표시줄에 안 뜨는 도구창으로 바꾼다.
+
+    작업표시줄 단추는 창을 숨겼다 다시 보일 때만 다시 계산된다. 보이는 채로
+    도구창 속성만 바꾸면 단추가 그대로 남는다 — 로그인을 마치고 돌아왔을 때
+    작업표시줄에 아이콘이 남던 원인이 이것이다.
+    """
+    try:
+        u, h = _main_window()
+        if not h:
+            return False
+        ex = u.GetWindowLongW(h, GWL_EXSTYLE)
+        want = ex | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE
+        if want != ex and u.IsWindowVisible(h):
+            u.ShowWindow(h, 0)                 # SW_HIDE
+            u.SetWindowLongW(h, GWL_EXSTYLE, want)
+            u.ShowWindow(h, 8)                 # SW_SHOWNA (활성화하지 않고)
+        else:
+            u.SetWindowLongW(h, GWL_EXSTYLE, want)
+        # SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE
+        u.SetWindowPos(h, 0, OFF_X, OFF_Y, 0, 0, 0x1 | 0x4 | 0x10)
+        return True
+    except Exception:
+        return False
+
+
+def _bring_out(x, y, w, h):
+    """로그인할 때 — 평범한 창으로 되돌리고 화면 안으로 꺼낸다.
+
+    비활성(WS_EX_NOACTIVATE) 속성을 반드시 풀어야 한다. 안 그러면 창이
+    포커스를 못 받아 아이디를 칠 수가 없다.
+    """
+    try:
+        u, wh = _main_window()
+        if not wh:
+            return False
+        ex = u.GetWindowLongW(wh, GWL_EXSTYLE)
+        u.SetWindowLongW(wh, GWL_EXSTYLE,
+                         ex & ~WS_EX_TOOLWINDOW & ~WS_EX_NOACTIVATE)
+        u.SetWindowPos(wh, 0, int(x), int(y), int(w), int(h), 0x4)
+        u.ShowWindow(wh, 5)              # SW_SHOW
+        u.SetForegroundWindow(wh)
+        return True
+    except Exception:
+        return False
+
+
+def _serve():
+    """127.0.0.1에 페이지 하나만 내주는 임시 서버. (포트는 OS가 고른다)"""
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    body = PAGE.encode("utf-8")
+
+    class H(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def do_GET(self):
+            # 경로가 무엇이든 이 한 장만 내준다. 파일 시스템은 건드리지 않는다.
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *a):       # 표준오류를 어지럽히지 않게
+            pass
+
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv, srv.server_address[1]
+
+
+class Player:
+    def __init__(self, window, page):
+        self.win = window
+        self.page = page
+        self.vol = 60
+        self.want_play = False
+        self.mode = "play"           # play | login
+        self.signed = None           # 로그인 상태를 확인했는가 (모르면 None)
+        self.cur = ("", "")          # 지금 틀어 둔 (영상, 재생목록)
+        self.resume = False          # 로그인에서 돌아와 다시 틀어야 하는가
+        self._last = None
+        self._sent = 0.0
+        self._replay = 0.0
+
+    # ── 페이지에 말 걸기 ──────────────────────────────────────────────────
+    def js(self, expr):
+        """창이 죽었거나 스크립트가 터져도 재생기가 통째로 멈추지는 않게."""
+        try:
+            return self.win.evaluate_js(expr)
+        except Exception:
+            return None
+
+    def load(self, vid, lst):
+        self.cur = (vid, lst)
+        self.js("ytLoad(%s,%s,%d)" % (json.dumps(vid), json.dumps(lst),
+                                      self.vol))
+
+    def cmd(self, msg):
+        c = msg.get("c")
+        if c == "load":
+            self.want_play = True
+            if self.mode == "login":     # 로그인 끝나면 이 곡으로 시작한다
+                self.cur = (str(msg.get("v") or ""), str(msg.get("list") or ""))
+                self.resume = True
+                return
+            self.load(str(msg.get("v") or ""), str(msg.get("list") or ""))
+        elif c == "play":
+            self.want_play = True
+            self.js("ytPlay()")
+        elif c == "pause":
+            self.want_play = False
+            self.js("ytPause()")
+        elif c == "vol":
+            try:
+                self.vol = max(0, min(100, int(msg.get("v", 60))))
+            except (TypeError, ValueError):
+                return
+            self.js("ytVol(%d)" % self.vol)
+        elif c == "login":
+            self.begin_login(msg.get("x", 200), msg.get("y", 120))
+        elif c == "login_done":
+            self.end_login(None)
+
+    # ── 로그인 ───────────────────────────────────────────────────────────
+    def begin_login(self, x, y):
+        self.mode = "login"
+        try:
+            self.win.load_url(LOGIN_URL)
+        except Exception:
+            pass
+        _bring_out(x, y, 560, 720)
+
+    def end_login(self, signed):
+        """로그인 화면을 접고 재생 페이지로 돌아간다."""
+        if signed is not None:
+            self.signed = bool(signed)
+        self.mode = "play"
+        self.resume = bool(self.cur[0] or self.cur[1])
+        try:
+            self.win.load_url(self.page)
+        except Exception:
+            pass
+        _park_offscreen()
+
+    def check_login(self):
+        """로그인이 끝났는지 본다 — 유튜브로 돌아왔고 계정이 붙었으면 끝."""
+        href = self.js("location.href") or ""
+        if "youtube.com" not in href:
+            return
+        got = self.js("(function(){try{"
+                      "return !!(window.ytcfg && ytcfg.get('LOGGED_IN'));"
+                      "}catch(e){return false}})()")
+        if got:
+            self.end_login(True)
+
+    # ── 상태 알리기 ──────────────────────────────────────────────────────
+    def status(self):
+        base = {"mode": self.mode, "signed": self.signed}
+        o = self.js("ytStatus()") if self.mode == "play" else None
+        if not isinstance(o, dict):
+            base.update({"ready": False, "state": -9, "playing": False,
+                         "buffering": False, "ended": False, "title": "",
+                         "vid": "", "pos": 0.0, "dur": 0.0, "err": 0})
+            return base
+        st = int(o.get("state", -9))
+        base.update({"ready": bool(o.get("ready")), "state": st,
+                     "playing": st == 1, "buffering": st == 3, "ended": st == 0,
+                     "title": str(o.get("title") or ""),
+                     "vid": str(o.get("vid") or ""),
+                     "pos": float(o.get("pos") or 0.0),
+                     "dur": float(o.get("dur") or 0.0),
+                     "err": int(o.get("err") or 0)})
+        return base
+
+    def resume_if_needed(self, s):
+        """로그인에서 돌아와 페이지가 다시 준비되면 틀던 곡을 이어 튼다."""
+        if not (self.resume and s["ready"]):
+            return
+        self.resume = False
+        self.load(*self.cur)
+        if self.want_play:
+            self.js("ytPlay()")
+
+    def loop_if_ended(self, s):
+        """곡이 끝나면 다시 튼다 — 한 곡짜리는 처음부터, 목록은 첫 곡부터.
+
+        작업하는 내내 소리가 이어지라는 뜻이다. 사람이 멈춘 것(want_play가
+        거짓)일 때는 건드리지 않는다.
+        """
+        now = time.time()
+        if s.get("ended") and self.want_play and now - self._replay > 3.0:
+            self._replay = now
+            self.js("ytPlay()")
+
+    def emit(self, s):
+        """달라졌을 때만 보낸다. 다만 2초에 한 번은 살아있음을 알린다.
+
+        재생 위치(pos)는 계속 바뀌므로 비교에서 뺀다. 안 그러면 0.4초마다
+        한 줄씩 나가 부모가 읽을 것만 늘어난다.
+        """
+        key = (s["ready"], s["state"], s["title"], s["vid"], s["err"],
+               s["mode"], s["signed"])
+        now = time.time()
+        if key == self._last and now - self._sent < 2.0:
+            return
+        self._last, self._sent = key, now
+        try:
+            sys.stdout.write("@YT " + json.dumps(s, ensure_ascii=False) + "\n")
+            sys.stdout.flush()
+        except Exception:
+            pass
+
+
+def _profile_arg():
+    a = sys.argv[1:]
+    if "--profile" in a:
+        i = a.index("--profile")
+        if i + 1 < len(a):
+            return a[i + 1]
+    return None
+
+
+def main():
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+    import webview
+
+    prof = _profile_arg()
+    if prof:
+        try:
+            os.makedirs(prof, exist_ok=True)
+        except OSError:
+            prof = None
+    srv, port = _serve()
+    page = "http://127.0.0.1:%d/" % port
+    # 테두리 있는 평범한 창으로 만든다 — 로그인할 때 사람이 써야 하므로.
+    # 평소에는 화면 밖 도구창이라 어차피 보이지 않는다.
+    win = webview.create_window("ENA 음악", page, width=320, height=180,
+                                x=OFF_X, y=OFF_Y, hidden=True, on_top=False)
+    pl = Player(win, page)
+    stop = threading.Event()
+
+    def on_closing():
+        # 로그인 창을 그냥 닫으면 재생기까지 죽는다. 닫기를 취소하고
+        # 재생 페이지로 되돌린다 (로그인은 안 한 것으로 둔다).
+        if pl.mode == "login":
+            pl.end_login(False)
+            return False
+        return True
+
+    try:
+        win.events.closing += on_closing
+    except Exception:
+        pass
+
+    def reader():
+        """부모의 명령을 읽는다. 파이프가 닫히면(=부모가 죽으면) 끝낸다."""
+        try:
+            for line in sys.stdin:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    msg = json.loads(line)
+                except ValueError:
+                    continue
+                if msg.get("c") == "quit":
+                    break
+                try:
+                    pl.cmd(msg)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        stop.set()
+
+    def pump():
+        """상태를 주기적으로 부모에게 알린다."""
+        threading.Thread(target=reader, daemon=True).start()
+        # 화면 밖으로 치우고 도구창으로 바꾼 뒤에 보이게 한다. 순서가 중요하다 —
+        # 먼저 보이면 한 프레임이나마 화면에 나타나고 포커스도 빼앗는다.
+        _park_offscreen()
+        try:
+            win.show()
+        except Exception:
+            pass
+        _park_offscreen()                # show가 자리를 되돌릴 수 있어 한 번 더
+        # 창을 만들자마자 상태를 물으면 아직 페이지가 없다. 조금 기다린다.
+        while not stop.wait(0.4):
+            try:
+                if pl.mode == "login":
+                    pl.check_login()
+                s = pl.status()
+                pl.resume_if_needed(s)
+                pl.loop_if_ended(s)
+            except Exception:
+                continue
+            pl.emit(s)
+        try:
+            srv.shutdown()
+        except Exception:
+            pass
+        try:
+            win.destroy()
+        except Exception:
+            pass
+
+    webview.start(pump, gui="edgechromium",
+                  private_mode=not prof, storage_path=prof or None)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,18230 @@
+"""ENA 마스코트 — 입력 반응형 데스크탑 캐릭터 (+선택형 작업 타이머).
+
+캐릭터별 파츠 폴더(extract_psd.py로 PSD에서 추출)를 조합해 움직인다:
+  python mascot.py                      # 기본 캐릭터 (parts/ = 까만 고양이)
+  python mascot.py --char parts_junsa   # 준사 (작업 타이머 포함)
+  python mascot.py --preview            # 대표 포즈 PNG 저장 후 종료 (개발용)
+
+동작:
+- 키 입력            → 손이 어깨를 축으로 회전하며 키보드를 두드림 (어깨는 몸에 고정)
+- 커서 이동/그리기    → 펜 쥔 오른손이 미니 타블렛 화면 위에서 커서를 따라다니고,
+                       오른팔은 어깨 고정·손끝 추적으로 치즈스틱처럼 늘어남
+- 타이핑만 할 때      → 펜 손·팔은 숨고 '오른팔-타자' 파츠가 나와 양손 타이핑
+- 시선/유휴          → 눈동자 커서 추적, 숨쉬기, (마스크 구조가 있으면) 깜빡임
+- 타이머(config)     → 캐릭터 위 캡슐 배지에 오늘 작업시간. 입력이 끊기면 휴식 전환.
+                       작업일 경계 06:00, 상태는 주기 저장(강제종료 대비).
+
+config.json 주요 키: scale, screen_quad, blink, trail_color, pen_tip,
+  hard_alpha(외곽 픽셀 이분화 — 밝은 캐릭터의 검은 테두리 방지),
+  timer({"enabled": true, "idle_sec": 60})
+조작: 캐릭터 드래그 = 위치 이동, 우클릭 = 메뉴.
+"""
+import base64 as _b64
+import ctypes
+import hashlib
+import json
+import math
+import os
+import random
+import sys
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import tkinter as tk
+
+from PIL import Image, ImageDraw, ImageFont, ImageOps, ImageTk
+
+if sys.platform == "darwin":
+    # 맥에서는 pynput을 쓰지 않는다. pynput의 맥 리스너는 별도 스레드에서
+    # HIToolbox의 TSMGetInputSourceProperty를 호출하는데, macOS 26부터 이 API가
+    # 메인 큐 밖 호출을 금지해 앱이 즉사한다 (퀸시 크래시 로그로 확인).
+    keyboard = mouse = None
+else:
+    from pynput import keyboard, mouse
+
+IS_WIN = sys.platform.startswith("win")
+IS_MAC = sys.platform == "darwin"
+
+_CRASH_DIR = [None]          # 기록을 남길 폴더 (Mascot 이 켜지면서 채운다)
+
+
+def _install_crash_log():
+    """잡히지 않은 예외를 .error.log 에 남긴다.
+
+    런처(exe·맥 앱)는 Mascot(...) 을 try 로 감싸지 않는다. 그래서 켜는
+    도중에 터지면 창도 안 뜨고 아무 기록도 안 남아, 사람 쪽에서는
+    '그냥 안 켜진다'로만 보이고 원인을 알 길이 없다. 맥 런처는 코드를
+    읽어 들이는 단계조차 감싸지 않는다.
+    """
+    prev = sys.excepthook
+
+    def hook(kind, value, tb):
+        try:
+            import traceback
+            d = _CRASH_DIR[0] or os.path.expanduser("~")
+            with open(os.path.join(d, ".error.log"), "a",
+                      encoding="utf-8") as fp:
+                fp.write("\n===== %s 켜지 못함\n"
+                         % time.strftime("%Y-%m-%d %H:%M:%S"))
+                fp.write("python=%s frozen=%s platform=%s\n"
+                         % (sys.version.split()[0],
+                            getattr(sys, "frozen", False), sys.platform))
+                fp.write("".join(traceback.format_exception(kind, value, tb)))
+        except Exception:
+            pass
+        try:
+            prev(kind, value, tb)
+        except Exception:
+            pass
+
+    sys.excepthook = hook
+
+
+_install_crash_log()
+
+
+if IS_WIN:
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)  # PER_MONITOR_DPI_AWARE
+    except Exception:
+        try:
+            ctypes.windll.shcore.SetProcessDpiAwareness(1)
+        except Exception:
+            pass
+
+_MAC_CG = None
+if IS_MAC:                       # 커서·유휴 시간을 얻는 macOS 프레임워크
+    try:
+        from ctypes import util as _cutil
+        _MAC_CG = ctypes.cdll.LoadLibrary(_cutil.find_library("CoreGraphics"))
+        _MAC_CG.CGEventSourceSecondsSinceLastEventType.restype = ctypes.c_double
+        _MAC_CG.CGEventSourceSecondsSinceLastEventType.argtypes = [
+            ctypes.c_uint32, ctypes.c_uint32]
+    except Exception:
+        _MAC_CG = None
+
+class _MacChromaKey:
+    """맥에서 키 색만 화면 합성 단계에 지워 투명하게 만드는 장치.
+
+    Tk 9 는 systemTransparent 를 '칠하지 않음'으로 처리하지 않고 **불투명한 검정**으로
+    칠한다. 그래서 NSWindow 를 아무리 투명하게 만들어도(setOpaque_(False) +
+    clearColor, 실제로 배경알파 0.00 으로 적용됨) 그 위의 뷰가 검정을 덮어써서 검은
+    사각형이 남는다. contentView 의 레이어 배경까지 지워도 마찬가지인데, 검정을
+    칠하는 주체가 레이어 배경이 아니라 Tk 의 그리기 자체이기 때문이다.
+
+    그래서 윈도우판과 같은 방법을 쓴다 — 캔버스를 MAC_KEY 로 칠해 두고, 그 색만
+    알파 0 으로 바꾸는 색 큐브(CIColorCubeWithColorSpace)를 창 레이어의
+    compositingFilter 로 걸어 합성 단계에서 지운다. 색 큐브를 filters 가 아니라
+    compositingFilter 로 걸어야 알파 0 이 실제 투명으로 반영된다.
+
+    pyobjc 대신 ctypes 를 쓰는 이유: CIFilter 는 pyobjc-framework-Quartz 에 있는데
+    빌드는 Cocoa 만 설치한다. ctypes 면 의존성을 늘리지 않아도 된다.
+    """
+
+    N = 64          # 색 큐브 한 변 (64^3 칸)
+    RAD = 2         # 이 안쪽은 완전히 투명 (반올림·보간 여유)
+    SOFT = 8        # RAD~SOFT 구간은 서서히 불투명해지며 키 색 기운을 빼낸다.
+                    # 파츠 색은 키에서 최소 3칸, 대부분 11칸 이상 떨어져 있어
+                    # 이 구간에 걸리는 파츠 픽셀은 수백 개 수준이다.
+
+    def __init__(self, key_hex):
+        self.err = None
+        self.filter = None
+        self._keep = []          # 해제되면 안 되는 ObjC 객체를 붙잡아 둔다
+        try:
+            self._setup(key_hex)
+        except Exception as e:
+            self.err = repr(e)
+
+    # ── ObjC 최소 브리지 ────────────────────────────────────────────────
+    def _setup(self, key_hex):
+        self._objc = ctypes.CDLL("/usr/lib/libobjc.dylib")
+        for fw in ("AppKit", "QuartzCore", "CoreImage", "CoreGraphics"):
+            ctypes.CDLL("/System/Library/Frameworks/%s.framework/%s" % (fw, fw),
+                        mode=ctypes.RTLD_GLOBAL)
+        self._cg = ctypes.CDLL(
+            "/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics")
+        self._objc.objc_getClass.restype = ctypes.c_void_p
+        self._objc.objc_getClass.argtypes = [ctypes.c_char_p]
+        self._objc.sel_registerName.restype = ctypes.c_void_p
+        self._objc.sel_registerName.argtypes = [ctypes.c_char_p]
+        self._send = ctypes.cast(self._objc.objc_msgSend, ctypes.c_void_p).value
+        self.filter = self._build_filter(key_hex)
+
+    def _cls(self, name):
+        return self._objc.objc_getClass(name.encode())
+
+    def _sel(self, name):
+        return self._objc.sel_registerName(name.encode())
+
+    def _msg(self, obj, name, *args, **kw):
+        restype = kw.get("restype", ctypes.c_void_p)
+        argtypes = kw.get("argtypes", ())
+        proto = ctypes.CFUNCTYPE(restype, ctypes.c_void_p, ctypes.c_void_p, *argtypes)
+        return proto(self._send)(obj, self._sel(name), *args)
+
+    def _nsstr(self, s):
+        return self._msg(self._cls("NSString"), "stringWithUTF8String:",
+                         s.encode(), argtypes=(ctypes.c_char_p,))
+
+    def _hold(self, obj):
+        """autorelease 풀에 쓸려가지 않게 붙잡아 둔다 (Tk 이벤트 루프가 풀을 비운다)."""
+        if obj:
+            self._msg(obj, "retain")
+            self._keep.append(obj)
+        return obj
+
+    # ── 색 큐브 만들기 ──────────────────────────────────────────────────
+    def _cube_bytes(self, key_hex):
+        """키 색은 투명, 그 언저리는 부드럽게 — 값은 알파를 곱한 상태로 넣는다.
+
+        가장자리 픽셀은 캐릭터 색과 키 색이 섞인 값이라, 딱 잘라 지우면 키 색 테두리가
+        남는다. 그래서 키에서 멀어질수록 알파를 올리면서 섞여 들어간 키 색 몫
+        ((1-a)*K)을 빼 준다. 파츠 색은 키에서 충분히 떨어져 있어 영향이 없다.
+        """
+        import array
+        n, rad, soft = self.N, self.RAD, self.SOFT
+        key = key_hex.lstrip("#")
+        rgb = tuple(int(key[i:i + 2], 16) for i in (0, 2, 4))
+        ki = tuple(int(round(v / 255 * (n - 1))) for v in rgb)
+        kf = tuple(v / 255.0 for v in rgb)
+        step = 1.0 / (n - 1)
+        buf = array.array("f", bytes(4 * 4 * n * n * n))
+        rv = [i * step for i in range(n)]
+        p = 0
+        for bi in range(n):
+            db = abs(bi - ki[2])
+            bv = bi * step
+            for gi in range(n):
+                dgb = max(db, abs(gi - ki[1]))
+                gv = gi * step
+                row = []
+                for ri in range(n):
+                    d = max(dgb, abs(ri - ki[0]))
+                    if d <= rad:                        # 키 색 → 완전 투명
+                        row += (0.0, 0.0, 0.0, 0.0)
+                    elif d >= soft:                     # 충분히 머니 손대지 않음
+                        row += (rv[ri], gv, bv, 1.0)
+                    else:                               # 중간 = 부드러운 경계
+                        a = (d - rad) / float(soft - rad)
+                        c = (rv[ri], gv, bv)
+                        row += (min(max(c[0] - (1 - a) * kf[0], 0.0), a),
+                                min(max(c[1] - (1 - a) * kf[1], 0.0), a),
+                                min(max(c[2] - (1 - a) * kf[2], 0.0), a),
+                                a)
+                buf[p:p + 4 * n] = array.array("f", row)
+                p += 4 * n
+        return buf.tobytes(), ki
+
+    def _build_filter(self, key_hex):
+        raw, self.key_idx = self._cube_bytes(key_hex)
+        data = self._hold(self._msg(
+            self._cls("NSData"), "dataWithBytes:length:", raw, len(raw),
+            argtypes=(ctypes.c_char_p, ctypes.c_ulong)))
+        self._cg.CGColorSpaceCreateWithName.restype = ctypes.c_void_p
+        self._cg.CGColorSpaceCreateWithName.argtypes = [ctypes.c_void_p]
+        srgb = self._cg.CGColorSpaceCreateWithName(
+            ctypes.c_void_p.in_dll(self._cg, "kCGColorSpaceSRGB"))
+        # sRGB 로 못 박아야 큐브 격자와 캔버스 색이 어긋나지 않는다
+        # (기본 작업 색공간은 선형이라 키 색이 다른 칸으로 밀린다).
+        f = self._hold(self._msg(self._cls("CIFilter"), "filterWithName:",
+                                 self._nsstr("CIColorCubeWithColorSpace"),
+                                 argtypes=(ctypes.c_void_p,)))
+        if not f:
+            raise RuntimeError("CIColorCubeWithColorSpace 를 만들 수 없음")
+        dim = self._msg(self._cls("NSNumber"), "numberWithInt:", self.N,
+                        argtypes=(ctypes.c_int,))
+        for val, key in ((dim, "inputCubeDimension"), (data, "inputCubeData"),
+                         (srgb, "inputColorSpace")):
+            self._msg(f, "setValue:forKey:", val, self._nsstr(key),
+                      argtypes=(ctypes.c_void_p, ctypes.c_void_p))
+        return f
+
+    # ── 창에 걸기 ───────────────────────────────────────────────────────
+    def windows(self):
+        app = self._msg(self._cls("NSApplication"), "sharedApplication")
+        arr = self._msg(app, "windows")
+        n = self._msg(arr, "count", restype=ctypes.c_ulong)
+        return [self._msg(arr, "objectAtIndex:", i, argtypes=(ctypes.c_ulong,))
+                for i in range(n)]
+
+    def apply_all(self):
+        """이 앱의 모든 창에 필터를 건다.
+
+        말풍선·할 일 패널은 나중에 생기므로 주기적으로 다시 부른다. 이미 걸린 창은
+        건너뛰므로 반복 호출이 싸다. 키 색만 지우는 필터라 다른 창에 걸려도 무해하다.
+        """
+        if not self.filter:
+            return 0
+        done = 0
+        for w in self.windows():
+            try:
+                # 우클릭 메뉴·풍선도움말 창에 필터가 걸리면 배경 재질이
+                # 지워져 메뉴가 투명하게 보인다 (사가 제보). 건너뛴다.
+                cls = self._msg(self._msg(w, "className"), "UTF8String",
+                                restype=ctypes.c_char_p) or b""
+                if (b"Menu" in cls or b"Popover" in cls
+                        or b"Tooltip" in cls or b"ToolTip" in cls):
+                    continue
+                cv = self._msg(w, "contentView")
+                if not cv:
+                    continue
+                self._msg(cv, "setWantsLayer:", True, argtypes=(ctypes.c_bool,))
+                lay = self._msg(cv, "layer")
+                if not lay:
+                    continue
+                if self._msg(lay, "compositingFilter") == self.filter:
+                    continue
+                self._msg(lay, "setCompositingFilter:", self.filter,
+                          argtypes=(ctypes.c_void_p,))
+                done += 1
+            except Exception:
+                pass
+        return done
+
+    # ── 진단: 실제로 투명해졌는지 화면 합성 결과를 직접 읽는다 ──────────
+    def probe(self, want_w, pts):
+        """가로 폭이 want_w 인 창을 캡처해 지정 좌표의 ARGB 를 돌려준다.
+
+        자기 앱 창만 찍으므로 화면 녹화 권한이 필요 없다. 알파가 0 이면 진짜 투명.
+        """
+        try:
+            self._cg.CGWindowListCreateImage.restype = ctypes.c_void_p
+            self._cg.CGWindowListCreateImage.argtypes = [
+                _CGRect, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32]
+            null = _CGRect(_CGPoint(float("inf"), float("inf")), _CGSize(0, 0))
+            for w in self.windows():
+                fr = self._msg(w, "frame", restype=_CGRect)
+                if abs(fr.size.width - want_w) > 2:
+                    continue
+                wid = self._msg(w, "windowNumber", restype=ctypes.c_long)
+                img = self._cg.CGWindowListCreateImage(
+                    null, 1 << 3, ctypes.c_uint32(wid), 1)
+                if not img:
+                    return None
+                rep = self._msg(self._msg(self._cls("NSBitmapImageRep"), "alloc"),
+                                "initWithCGImage:", img, argtypes=(ctypes.c_void_p,))
+                data = self._msg(rep, "bitmapData")
+                if not data:
+                    return None
+                pw = self._msg(rep, "pixelsWide", restype=ctypes.c_long)
+                ph = self._msg(rep, "pixelsHigh", restype=ctypes.c_long)
+                row = self._msg(rep, "bytesPerRow", restype=ctypes.c_long)
+                spp = self._msg(rep, "samplesPerPixel", restype=ctypes.c_long)
+                buf = ctypes.string_at(data, row * ph)
+                sx = pw / float(fr.size.width)      # 레티나면 2
+                out = []
+                for (x, y) in pts:
+                    px, py = int(x * sx), int(y * sx)
+                    if not (0 <= px < pw and 0 <= py < ph):
+                        out.append(None)
+                        continue
+                    o = py * row + px * spp
+                    out.append(tuple(buf[o + i] for i in range(spp)))
+                return {"scale": sx, "px": out}
+        except Exception as e:
+            self.err = repr(e)
+        return None
+
+
+class _CGPoint(ctypes.Structure):
+    _fields_ = [("x", ctypes.c_double), ("y", ctypes.c_double)]
+
+
+class _CGSize(ctypes.Structure):
+    _fields_ = [("width", ctypes.c_double), ("height", ctypes.c_double)]
+
+
+class _CGRect(ctypes.Structure):
+    _fields_ = [("origin", _CGPoint), ("size", _CGSize)]
+
+
+if getattr(sys, "frozen", False) and not os.path.exists(os.path.abspath(__file__)):
+    # PyInstaller 번들 내부에서 임포트된 경우 (자동 업데이트로 받은 파일이면
+    # __file__이 실제 디스크에 존재하므로 그 폴더를 기준으로 삼는다)
+    HERE = sys._MEIPASS
+else:
+    HERE = os.path.dirname(os.path.abspath(__file__))
+if "--yt-player" in sys.argv:
+    # 음악 재생기로 넘어가는 갈림길. 얼려 배포한 exe 안에는 파이썬이 따로
+    # 없어서, 재생기를 자식으로 띄울 때 같은 실행 파일을 이 깃발로 다시 부른다.
+    # 이 파일은 자동 업데이트를 타므로 런처를 다시 굽지 않아도 길이 생긴다.
+    try:
+        if HERE not in sys.path:
+            sys.path.insert(0, HERE)
+        import youtube_player
+        youtube_player.main()
+    except Exception:
+        pass
+    sys.exit(0)
+
+TRANSPARENT = "#010203"          # 투명 키 색
+
+# 맥 전용 투명 키 색. 윈도우는 창 관리자가 색상키를 처리해 주지만 맥에는 그게 없어서
+# CoreImage 로 직접 뺀다(_MacChromaKey). 파츠 이미지와 UI 팔레트 어디에도 없는 색을
+# 골라야 캐릭터에 구멍이 뚫리지 않는다. 이 색은 파츠 전체를 훑어 고른 값으로,
+# 팔레트에서 가장 가까운 색과도 색 큐브 기준 12칸 떨어져 있다.
+# (윈도우용 #010203 을 쓸 수 없는 이유: 파츠가 순검정 외곽선을 대량으로 써서
+#  검정 근처를 키로 잡으면 눈·외곽선이 함께 지워진다.)
+MAC_KEY = "#5d0051"
+
+KEY_ROT = (-7.0, 7.0)            # 타이핑 시 손 회전(어깨 축) 범위 (도)
+PEN_KB_ROT = (-6.0, 6.0)
+SHADOW_PAD = 16                  # 그림자 이미지 여백 (가장자리 파츠 잘림 방지)
+LV_ROW = 22                      # 카드 맨 위 레벨·칭호 줄의 높이
+# 레벨 줄 아래 칸들을 이만큼 끌어올린다. 상태·시간 줄은 카드 윗변에서 20px
+# 떨어지게 짜여 있는데, 위에 레벨 줄이 생기면서 그 여백이 겹쳐 넓어 보였다
+# (실측: 글자 100/130/160% 모두 20px 안팎으로 고정).
+LV_TRIM = 5
+GOAL_ROW = 22                    # 시계형 카드에 목표 진행바가 쓰는 높이
+# 레벨을 몇 번째 판으로 세고 있는지. 이 숫자를 올리면 모두가 Lv1부터 다시
+# 시작한다 (저장된 lv_secs를 버린다). 함부로 올리지 말 것 — 친구들이 쌓은
+# 레벨이 통째로 사라진다.
+LV_EPOCH = 1
+# 한글 획은 글자 상자 안에서 아래로 쏠려 있어, 점(아이콘)과 같은 y에 놓으면
+# 1.5px 내려앉아 보인다(화면 픽셀로 실측). 그만큼 올려 눈으로 가운데를 맞춘다.
+INK_DY = -1.5
+TIMER_H = 92                     # 타이머 카드 영역 높이 (게이지형 = 준사)
+OY_CLOCK_COMPACT = 70            # 시계형 카드 접힘 (상태+시간 한 줄)
+OY_CLOCK_OPEN = 182             # 시계형 카드 펼침 (시계 + 시간)
+YT_BAR = 24                      # 음악 버튼이 카드 위에 요구하는 여백
+
+# 타이머 카드 팔레트 (준사 배색)
+CARD_BORDER = "#f2b8c6"          # 소프트 핑크
+CARD_NAVY = "#3a4a6b"
+CARD_GRAY = "#9aa7bd"
+CARD_TRACK = "#eef0f5"
+CARD_FILL = "#f2a7b3"
+DOT_ON, DOT_OFF = "#7ccf8f", "#cfcfcf"
+
+# 환경설정 기본값 (캐릭터 폴더의 .settings.json에 저장)
+# 예전 기본 작업 프로그램 목록. 이 값 그대로면 새 목록으로 갈아 준다.
+OLD_WORK_APPS = "clipstudiopaint.exe, photoshop.exe, sai2.exe, krita.exe"
+
+DEFAULT_SETTINGS = {
+    "goal_hours": 6.0,    # 목표 작업시간
+    "idle_sec": 15.0,     # 휴식 전환(초)
+    "show_timer": None,   # None = config 기본값 따름
+    "trail": False,       # 타블렛 낙서 표시
+    "topmost": True,      # 항상 위
+    "stretch_hint": 3,    # 스트레칭 알림에 '눌러 주세요' 안내를 붙일 남은 횟수
+    "day_start": 6,       # 하루가 바뀌는 시각 (0이면 달력 날짜 그대로)
+    "stretch_every": "20분마다",   # 스트레칭 알림 간격 ("끄기"면 안 뜸)
+    "pen_monitor": "자동", # 펜을 따라갈 화면 (자동 = 커서가 있는 화면)
+    "scale_pct": 100,     # 캐릭터 크기(%)
+    "card_gap": 0,        # 타이머 카드와 머리 사이 여백 보정(px, -20~60)
+    "font_pct": 100,      # 타이머·말풍선 글자 크기(%) — 100%가 가장 큼
+    "work_apps_only": True,   # 작업 프로그램이 앞에 있을 때만 시간 측정
+    "work_apps": "clipstudiopaint.exe, photoshop.exe, blender.exe, illustrator.exe, afterfx.exe, animate.exe, sai2.exe, sai.exe, krita.exe, medibangpaintpro.exe, firealpaca.exe, aseprite.exe, zbrush.exe, substance painter.exe, maya.exe, 3dsmax.exe, cinema 4d.exe",
+    "sleep_min": 10,      # 이 시간(분) 동안 무입력이면 수면 모드
+    "shadow": True,       # 캐릭터 뒤 옅은 그림자
+    "clock_open": False,  # 시계형 카드에서 시계 펼침 상태
+    "autostart": True,    # 윈도우 시작 시 자동 실행 (exe로 배포된 경우만 적용)
+    "sound": True,        # 타자 소리 (Mechvibes 팩)
+    "sound_volume": 60,   # 타자 소리 볼륨 (0~100)
+    "pen_volume": 10,     # 펜 긋는 소리 볼륨 (0~100)
+    "poke_volume": 40,    # 캐릭터를 눌렀을 때 나는 소리 볼륨 (0~100)
+    "slime_volume": 45,   # 슬라임 만지는 소리 볼륨 (0~100)
+    "slime_kind": "",     # 슬라임 종류 (sounds/slime/ 아래 폴더 이름)
+    "sound_pack": "banana split lubed",
+    "skin": "기본",        # 패션 슬롯 이름
+    "stickers_show": True,   # 바탕화면 스티커 보이기 (config의 stickers를 켠 캐릭터만)
+    "stickers_lock": False,  # 스티커 잠금 — 클릭이 스티커를 통과한다
+    "settings_h": 0,         # 환경설정 창 높이(px). 0이면 화면에 맞춰 자동
+    "settings_pos": None,    # 환경설정 창을 옮겨 둔 자리 [x, y]. 없으면 캐릭터 옆
+    "yt_url": "",            # 유튜브 노래 주소 (config의 youtube를 켠 캐릭터만)
+    "yt_volume": 55,         # 노래 볼륨 (0~100)
+    "update_h": 0,           # 업데이트 안내 창 높이(px). 0이면 적당히 자동
+    "yt_signed": False,      # 유튜브에 로그인해 둔 적이 있는가 (프리미엄 적용)
+    "yt_asked": False,       # 로그인 창을 한 번이라도 권했는가
+    "shadow_on": False,      # 그림자를 한 번 켜 준 적이 있는가
+    "room_on": True,         # 같이 작업하는 방 (기본 켜짐, 환경설정에서 끈다)
+    "stamp_share": False,    # 도장판 공개 (이번 달 도장이 친구들에게 보인다)
+    "room_seen": False,      # 처음 열 때 무엇이 오가는지 한 번 알려 줬는가
+    "room_nick": "",         # 방에서 보일 이름 (비우면 캐릭터 이름)
+    "room_code": "",         # 방 코드 (비우면 '홈')
+    "room_hide_me": False,   # 홈에서 내 캐릭터를 안 보이게
+    "room_msg": "",          # 홈에 보일 오늘 한 줄 (목표·상태)
+    "room_msg_day": "",      # 그 한 줄을 쓴 작업일 (날이 바뀌면 지운다)
+    "font_v2": False,        # 글자 크기 눈금을 새로 매긴 뒤인가
+}
+# 글자 크기 100%가 실제로 몇 배인가. 예전에는 눈금이 70~160%여서 100%인
+# 사람은 '이게 최대'라고 생각하고 더 키울 수 있는 줄 몰랐다. 그래서 예전
+# 160%(=1.6배)를 100%로 다시 매기고, 눈금을 45~100%로 바꿨다. 보이는
+# 숫자만 달라졌을 뿐 실제 크기의 폭은 그대로다.
+UI_FONT = "Malgun Gothic"     # 시작할 때 프리텐다드가 실리면 바뀐다
+
+
+def load_ui_font(char_dir):
+    """파츠에 실린 프리텐다드를 이 프로세스에만 등록한다 (설치 불필요).
+
+    글꼴 모양·자간이 맥(애플 SD 고딕 Neo)과 비슷해진다. 파일이 없거나
+    실패하면 맑은 고딕 그대로. 맥은 시스템 글꼴이 이미 그 모습이라 안 바꾼다.
+    """
+    global UI_FONT
+    if not IS_WIN:
+        return
+    try:
+        d = os.path.join(char_dir, "fonts")
+        if not os.path.isdir(d):
+            return
+        g = ctypes.WinDLL("gdi32")    # 지뢰 21 — 공용 windll 은 안 건드린다
+        g.AddFontResourceExW.argtypes = (ctypes.c_wchar_p, ctypes.c_uint32,
+                                         ctypes.c_void_p)
+        g.AddFontResourceExW.restype = ctypes.c_int
+        got = 0
+        for f in sorted(os.listdir(d)):
+            if f.lower().endswith((".ttf", ".otf")):
+                got += g.AddFontResourceExW(os.path.join(d, f),
+                                            0x10, None)      # FR_PRIVATE
+        if got:
+            UI_FONT = "Pretendard"
+    except Exception:
+        pass
+
+
+FONT_SPAN = 1.6
+FONT_MIN, FONT_MAX = 45, 100
+DOT_OTHER = "#f0b95e"     # 딴짓 중(작업앱 아님) 표시색
+
+
+class _POINT(ctypes.Structure):
+    _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+
+
+class _RECT(ctypes.Structure):
+    _fields_ = [("left", ctypes.c_long), ("top", ctypes.c_long),
+                ("right", ctypes.c_long), ("bottom", ctypes.c_long)]
+
+
+class _MONITORINFO(ctypes.Structure):
+    _fields_ = [("cbSize", ctypes.c_ulong), ("rcMonitor", _RECT),
+                ("rcWork", _RECT), ("dwFlags", ctypes.c_ulong)]
+
+
+class _LASTINPUTINFO(ctypes.Structure):
+    _fields_ = [("cbSize", ctypes.c_uint), ("dwTime", ctypes.c_uint)]
+
+
+class _SIZE(ctypes.Structure):
+    _fields_ = [("cx", ctypes.c_long), ("cy", ctypes.c_long)]
+
+
+class _BLENDFUNCTION(ctypes.Structure):
+    _fields_ = [("BlendOp", ctypes.c_byte), ("BlendFlags", ctypes.c_byte),
+                ("SourceConstantAlpha", ctypes.c_byte), ("AlphaFormat", ctypes.c_byte)]
+
+
+class _BITMAPINFOHEADER(ctypes.Structure):
+    _fields_ = [("biSize", ctypes.c_uint32), ("biWidth", ctypes.c_long),
+                ("biHeight", ctypes.c_long), ("biPlanes", ctypes.c_uint16),
+                ("biBitCount", ctypes.c_uint16), ("biCompression", ctypes.c_uint32),
+                ("biSizeImage", ctypes.c_uint32), ("biXPelsPerMeter", ctypes.c_long),
+                ("biYPelsPerMeter", ctypes.c_long), ("biClrUsed", ctypes.c_uint32),
+                ("biClrImportant", ctypes.c_uint32)]
+
+
+def _layer_api():
+    """레이어드 창에 쓸 Win32 함수들 — 인자·반환 형을 제대로 지정해서 돌려준다.
+
+    64비트에서 핸들(HDC/HWND)은 c_int로 잘린다. 실측: GetDC(0)이 형을 안
+    정하면 1291916892로, 지정하면 18446744073625737419로 나온다. 잘린 손잡이를
+    넘기면 UpdateLayeredWindow가 아무 말 없이 실패한다 — 창이 그 자리에 그대로
+    있고 그림도 안 바뀌어서, 겉으로는 '이펙트가 안 보인다'로만 보인다.
+
+    ctypes.windll은 프로세스가 공유하는 객체라 거기에 형을 지정하면 같은
+    함수를 쓰는 다른 코드까지 묶인다(스티커에서 겪은 일). 그래서 여기서만
+    쓸 핸들을 따로 연다.
+    """
+    import ctypes.wintypes as wt
+    u = ctypes.WinDLL("user32", use_last_error=True)
+    g = ctypes.WinDLL("gdi32", use_last_error=True)
+    u.GetDC.restype, u.GetDC.argtypes = wt.HDC, [wt.HWND]
+    u.ReleaseDC.restype = ctypes.c_int
+    u.ReleaseDC.argtypes = [wt.HWND, wt.HDC]
+    u.GetWindowLongW.restype = ctypes.c_long
+    u.GetWindowLongW.argtypes = [wt.HWND, ctypes.c_int]
+    u.SetWindowLongW.restype = ctypes.c_long
+    u.SetWindowLongW.argtypes = [wt.HWND, ctypes.c_int, ctypes.c_long]
+    u.ShowWindow.argtypes = [wt.HWND, ctypes.c_int]
+    u.SetWindowPos.argtypes = [wt.HWND, wt.HWND, ctypes.c_int, ctypes.c_int,
+                               ctypes.c_int, ctypes.c_int, ctypes.c_uint]
+    u.UpdateLayeredWindow.restype = wt.BOOL
+    u.UpdateLayeredWindow.argtypes = [
+        wt.HWND, wt.HDC, ctypes.POINTER(_POINT), ctypes.POINTER(_SIZE),
+        wt.HDC, ctypes.POINTER(_POINT), wt.DWORD,
+        ctypes.POINTER(_BLENDFUNCTION), wt.DWORD]
+    g.CreateCompatibleDC.restype, g.CreateCompatibleDC.argtypes = wt.HDC, [wt.HDC]
+    g.CreateDIBSection.restype = wt.HBITMAP
+    g.CreateDIBSection.argtypes = [wt.HDC, ctypes.c_void_p, ctypes.c_uint,
+                                   ctypes.POINTER(ctypes.c_void_p),
+                                   wt.HANDLE, wt.DWORD]
+    g.SelectObject.restype, g.SelectObject.argtypes = wt.HGDIOBJ, [wt.HDC,
+                                                                   wt.HGDIOBJ]
+    g.DeleteObject.argtypes = [wt.HGDIOBJ]
+    g.DeleteDC.argtypes = [wt.HDC]
+    return u, g
+
+
+_LAYER_U = _LAYER_G = None
+
+
+def layer_api():
+    """레이어드 창용 Win32 묶음 (한 번만 만든다). 윈도우가 아니면 (None, None)."""
+    global _LAYER_U, _LAYER_G
+    if _LAYER_U is None and IS_WIN:
+        try:
+            _LAYER_U, _LAYER_G = _layer_api()
+        except Exception:
+            _LAYER_U = _LAYER_G = False
+    if not _LAYER_U:
+        return None, None
+    return _LAYER_U, _LAYER_G
+
+
+class ShadowLayer:
+    """캐릭터 창 뒤에 깔리는 진짜 반투명 그림자 (per-pixel alpha 레이어 창).
+
+    색상키 투명창은 반투명을 표현할 수 없으므로, 그림자만 별도의
+    UpdateLayeredWindow 창으로 그린다. 클릭은 통과(WS_EX_TRANSPARENT).
+    """
+
+    def __init__(self, root, image, offset=(7, 9)):
+        self.offset = offset
+        self.top = tk.Toplevel(root)
+        self.top.overrideredirect(True)
+        self.top.attributes("-topmost", True)
+        self.top.update_idletasks()
+        self.hwnd = int(self.top.wm_frame(), 16)
+        u, _g = layer_api()
+        GWL_EXSTYLE = -20
+        ex = u.GetWindowLongW(self.hwnd, GWL_EXSTYLE)
+        # LAYERED | TRANSPARENT(클릭 통과) | TOOLWINDOW | NOACTIVATE
+        u.SetWindowLongW(self.hwnd, GWL_EXSTYLE,
+                         ex | 0x80000 | 0x20 | 0x80 | 0x8000000)
+        self._push(image)
+
+    def _push(self, im):
+        """BGRA 비트맵을 레이어 창에 업로드 (그림자는 검정이라 premultiply 불요).
+
+        형을 지정한 묶음을 쓴다 — 안 그러면 64비트 핸들이 잘려 이 호출이
+        조용히 실패한다(그림자가 안 보인다).
+        """
+        u, g = layer_api()
+        if u is None:
+            return
+        w, h = im.size
+        data = im.tobytes("raw", "BGRA")
+        hdc = u.GetDC(0)
+        mem = g.CreateCompatibleDC(hdc)
+        bmi = _BITMAPINFOHEADER()
+        bmi.biSize = ctypes.sizeof(_BITMAPINFOHEADER)
+        bmi.biWidth, bmi.biHeight = w, -h
+        bmi.biPlanes, bmi.biBitCount = 1, 32
+        bits = ctypes.c_void_p()
+        hbm = g.CreateDIBSection(hdc, ctypes.byref(bmi), 0,
+                                 ctypes.byref(bits), None, 0)
+        ctypes.memmove(bits, data, len(data))
+        old = g.SelectObject(mem, hbm)
+        blend = _BLENDFUNCTION(0, 0, 255, 1)  # AC_SRC_OVER, alpha 채널 사용
+        # 세 번째 인자는 '창을 옮길 새 화면 좌표'다. (0,0)을 넘기면 이미지를
+        # 바꿀 때마다 그림자 창이 화면 좌상단으로 튀어 사라진 것처럼 보인다.
+        # 위치를 바꿀 생각이 없으므로 NULL을 넘겨 그대로 둔다.
+        u.UpdateLayeredWindow(self.hwnd, hdc, None,
+                              ctypes.byref(_SIZE(w, h)), mem,
+                              ctypes.byref(_POINT(0, 0)), 0,
+                              ctypes.byref(blend), 2)  # ULW_ALPHA
+        g.SelectObject(mem, old)
+        g.DeleteObject(hbm)
+        g.DeleteDC(mem)
+        u.ReleaseDC(0, hdc)
+
+    def set_image(self, image):
+        """그림자 이미지 교체 (시계 토글로 크기가 바뀔 때)."""
+        self._push(image)
+
+    def place(self, x, y, owner_hwnd):
+        """본체 창 바로 아래 z순서로, 오프셋만큼 밀린 위치에 배치."""
+        SWP_NOSIZE, SWP_NOACTIVATE = 0x1, 0x10
+        u, _g = layer_api()
+        if u is None:
+            return
+        u.SetWindowPos(self.hwnd, owner_hwnd,
+                       x + self.offset[0], y + self.offset[1],
+                       0, 0, SWP_NOSIZE | SWP_NOACTIVATE)
+
+
+class FxLayer:
+    """파티클(음표·하트·땀…)을 진짜 반투명으로 그리는 레이어 창.
+
+    색상키 투명창은 반투명을 못 낸다. 그래서 지금까지는 옅어지는 대신 픽셀을
+    무작위로 솎아내 사라지게 했는데, 그게 '모래처럼 부서진다'는 그 모습이다.
+    그림자와 같은 UpdateLayeredWindow 창을 캐릭터 위에 하나 더 두면 알파가
+    그대로 나와 부드럽게 사라진다. 클릭은 통과한다. 윈도우 전용.
+
+    파티클이 있는 동안만 보이고, 없으면 숨겨 둔다(그때는 비용이 0이다).
+    """
+
+    def __init__(self, root):
+        self.ok = False
+        self.hwnd = 0
+        self._shown = False
+        self.top = tk.Toplevel(root)
+        self.top.overrideredirect(True)
+        self.top.attributes("-topmost", True)
+        self.top.update_idletasks()
+        self.hwnd = int(self.top.wm_frame(), 16)
+        u, _g = layer_api()
+        if u is None:
+            return
+        GWL_EXSTYLE = -20
+        ex = u.GetWindowLongW(self.hwnd, GWL_EXSTYLE)
+        # LAYERED | TRANSPARENT(클릭 통과) | TOOLWINDOW | NOACTIVATE
+        u.SetWindowLongW(self.hwnd, GWL_EXSTYLE,
+                         ex | 0x80000 | 0x20 | 0x80 | 0x8000000)
+        # 숨기지 않는다. UpdateLayeredWindow는 '숨겨진 창'에 대고 부르면
+        # 오류 87(잘못된 매개변수)로 실패한다 — 실측으로 확인했다.
+        # 대신 1x1 투명 그림을 올려 둔다. 창은 살아 있지만 아무것도 안 보인다.
+        self._shown = True
+        self.show(Image.new("RGBA", (1, 1), (0, 0, 0, 0)), 0, 0)
+        self.ok = True
+
+    @staticmethod
+    def _premul(im):
+        """알파 미리곱한 BGRA 바이트.
+
+        UpdateLayeredWindow는 색이 알파로 미리 곱해져 있다고 가정한다.
+        그냥 넘기면 반투명한 곳이 허옇게 뜬다(그림자는 검정이라 티가 안 났다).
+        """
+        from PIL import ImageChops
+        r, g, b, a = im.convert("RGBA").split()
+        # 메모리에 B,G,R,A 순으로 놓이도록 그 순서로 합친다
+        pm = Image.merge("RGBA", (ImageChops.multiply(b, a),
+                                  ImageChops.multiply(g, a),
+                                  ImageChops.multiply(r, a), a))
+        return pm.tobytes("raw", "RGBA")
+
+    def hide(self):
+        u, _g = layer_api()
+        if self._shown and self.hwnd and u is not None:
+            u.ShowWindow(self.hwnd, 0)
+            self._shown = False
+
+    def show(self, im, x, y):
+        """그림을 화면 (x, y)에 올린다. 늘 맨 앞(캐릭터 위)으로 올린다."""
+        u, g = layer_api()
+        if u is None:
+            return
+        w, h = im.size
+        if w <= 0 or h <= 0:
+            self.hide()
+            return
+        if not self._shown:
+            # 숨은 채로 UpdateLayeredWindow를 부르면 오류 87로 실패한다.
+            # 반드시 먼저 보이게 한 다음 그린다.
+            u.ShowWindow(self.hwnd, 4)           # SW_SHOWNOACTIVATE
+            self._shown = True
+        data = self._premul(im)
+        hdc = u.GetDC(0)
+        mem = g.CreateCompatibleDC(hdc)
+        bmi = _BITMAPINFOHEADER()
+        bmi.biSize = ctypes.sizeof(_BITMAPINFOHEADER)
+        bmi.biWidth, bmi.biHeight = w, -h        # 위에서 아래로
+        bmi.biPlanes, bmi.biBitCount = 1, 32
+        bits = ctypes.c_void_p()
+        hbm = g.CreateDIBSection(hdc, ctypes.byref(bmi), 0,
+                                 ctypes.byref(bits), None, 0)
+        ctypes.memmove(bits, data, len(data))
+        old = g.SelectObject(mem, hbm)
+        blend = _BLENDFUNCTION(0, 0, 255, 1)     # AC_SRC_OVER, 알파 사용
+        # 자리·크기·그림을 한 번에 — 따로 옮기면 한 프레임 어긋난다
+        u.UpdateLayeredWindow(self.hwnd, hdc, ctypes.byref(_POINT(int(x), int(y))),
+                              ctypes.byref(_SIZE(w, h)), mem,
+                              ctypes.byref(_POINT(0, 0)), 0,
+                              ctypes.byref(blend), 2)   # ULW_ALPHA
+        g.SelectObject(mem, old)
+        g.DeleteObject(hbm)
+        g.DeleteDC(mem)
+        u.ReleaseDC(0, hdc)
+        # 맨 앞으로. 둘째 인자는 '이 창 뒤에 놓아라'라는 뜻이라 캐릭터 핸들을
+        # 넘기면 파티클이 캐릭터 뒤로 가서 가려진다. 그리고 HWND_TOPMOST(-1)는
+        # 이미 '항상 위'인 창에는 아무 일도 하지 않아 순서를 못 되돌린다.
+        # HWND_TOP(0)이라야 항상 위 무리의 맨 앞으로 올라온다(말풍선과 같은 방식).
+        # 캐릭터를 누르면 그 창이 앞으로 나오므로 프레임마다 다시 올린다.
+        SWP_NOSIZE, SWP_NOMOVE, SWP_NOACTIVATE = 0x1, 0x2, 0x10
+        u.SetWindowPos(self.hwnd, 0, 0, 0, 0, 0,
+                       SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE)
+
+    def destroy(self):
+        try:
+            self.top.destroy()
+        except Exception:
+            pass
+        self.hwnd = 0
+        self.ok = False
+
+
+class _WAVEFORMATEX(ctypes.Structure):
+    _fields_ = [("wFormatTag", ctypes.c_uint16), ("nChannels", ctypes.c_uint16),
+                ("nSamplesPerSec", ctypes.c_uint32), ("nAvgBytesPerSec", ctypes.c_uint32),
+                ("nBlockAlign", ctypes.c_uint16), ("wBitsPerSample", ctypes.c_uint16),
+                ("cbSize", ctypes.c_uint16)]
+
+
+class _WAVEHDR(ctypes.Structure):
+    _fields_ = [("lpData", ctypes.c_void_p), ("dwBufferLength", ctypes.c_uint32),
+                ("dwBytesRecorded", ctypes.c_uint32), ("dwUser", ctypes.c_void_p),
+                ("dwFlags", ctypes.c_uint32), ("dwLoops", ctypes.c_uint32),
+                ("lpNext", ctypes.c_void_p), ("reserved", ctypes.c_void_p)]
+
+
+# 샘플 폭(바이트)별 정수 타입 — 볼륨을 샘플에 곱할 때 사용
+_SAMPLE_CTYPE = {1: ctypes.c_int8, 2: ctypes.c_int16, 4: ctypes.c_int32}
+
+
+def _scaled_buffer(data, gain, sampwidth):
+    """PCM 바이트에 gain을 곱한 재생 버퍼. 비트 심도(16/32bit)에 맞춰 스케일.
+
+    waveOutSetVolume이 드라이버에 무시될 수 있어 샘플 값 자체를 조절한다.
+    """
+    buf = ctypes.create_string_buffer(data, len(data))
+    ct = _SAMPLE_CTYPE.get(sampwidth)
+    if gain < 0.999 and ct is not None and len(data) >= sampwidth:
+        n = len(data) // sampwidth
+        arr = (ct * n).from_buffer(buf)
+        for i in range(n):
+            arr[i] = int(arr[i] * gain)
+    return buf
+
+
+class SoundPack:
+    """Mechvibes 사운드 팩(multi 타입: 키별 wav) 재생기.
+
+    winmm waveOut API 직접 호출 — 외부 라이브러리 불필요, 어느 스레드에서든
+    안전(메시지 펌프 불요), 재생마다 독립 장치라 동시 재생 가능.
+    (MCI는 연 스레드에 묶여 리스너 스레드에서 멈추는 문제가 있어 사용 안 함)
+    """
+
+    def __init__(self, folder, volume=60):
+        import threading
+        import wave
+        with open(os.path.join(folder, "config.json"), encoding="utf-8") as fp:
+            cfg = json.load(fp)
+        if cfg.get("key_define_type", "multi") != "multi":
+            raise ValueError("single 타입 팩 미지원 — wav 분할형 팩을 사용하세요")
+        names = []
+        for v in cfg.get("defines", {}).values():
+            if isinstance(v, str) and v and v not in names:
+                names.append(v)
+        self.raw = []             # (WAVEFORMATEX, 원본PCM, 샘플폭)
+        slot = {}                 # 파일 이름 -> raw 안에서의 번호
+        for name in names:
+            path = os.path.join(folder, name)
+            if not (name.lower().endswith(".wav") and os.path.exists(path)):
+                continue
+            with wave.open(path, "rb") as w:
+                ch, sw, fr = w.getnchannels(), w.getsampwidth(), w.getframerate()
+                data = w.readframes(w.getnframes())
+            wfx = _WAVEFORMATEX(1, ch, fr, fr * ch * sw, ch * sw, sw * 8, 0)
+            slot[name] = len(self.raw)
+            self.raw.append((wfx, data, sw))
+        if not self.raw:
+            raise ValueError("재생 가능한 wav가 없음")
+        # 팩은 스캔코드마다 쓸 음원을 config.json에 적어 둔다. 스페이스·백스페이스
+        # 처럼 소리가 다른 키를 위한 것인데, 지금까지는 이 표를 버리고 아무 음원이나
+        # 골라 썼다 (스페이스 소리가 엉뚱한 글자 키에서 났다).
+        self.by_code = {}
+        for code, fname in (cfg.get("defines") or {}).items():
+            i = slot.get(fname)
+            if i is not None:
+                self.by_code[str(code)] = i
+        self._active = []         # (핸들, WAVEHDR) — 재생 끝나면 정리
+        self._lock = threading.Lock()
+        self.set_volume(volume)
+
+    def set_volume(self, volume):
+        """볼륨(0~100)을 샘플에 곱해 재생용 버퍼 준비 (드라이버 볼륨 무시 대비)."""
+        self.volume = max(0.0, min(float(volume), 100.0))
+        gain = self.volume / 100.0
+        self.sounds = []          # (WAVEFORMATEX, 버퍼, 길이)
+        if gain <= 0.0:
+            return
+        for wfx, data, sw in self.raw:
+            self.sounds.append((wfx, _scaled_buffer(data, gain, sw), len(data)))
+
+    def play(self, key, code=None):
+        if not self.sounds:
+            return
+        i = self.by_code.get(str(code)) if code is not None else None
+        if i is None or i >= len(self.sounds):
+            i = hash(str(key)) % len(self.sounds)   # 표에 없는 키는 아무거나
+        wfx, buf, ln = self.sounds[i]
+        wm = ctypes.windll.winmm
+        h = ctypes.c_void_p()
+        if wm.waveOutOpen(ctypes.byref(h), 0xFFFFFFFF, ctypes.byref(wfx), 0, 0, 0):
+            return
+        wm.waveOutSetVolume(h, 0xFFFFFFFF)   # 앱/장치 볼륨 고정 해제 (실볼륨은 샘플로)
+        hdr = _WAVEHDR()
+        hdr.lpData = ctypes.cast(buf, ctypes.c_void_p)
+        hdr.dwBufferLength = ln
+        wm.waveOutPrepareHeader(h, ctypes.byref(hdr), ctypes.sizeof(_WAVEHDR))
+        wm.waveOutWrite(h, ctypes.byref(hdr), ctypes.sizeof(_WAVEHDR))
+        with self._lock:
+            self._active.append((h, hdr))
+            self._reap_locked(limit=24)
+
+    def reap(self):
+        """재생이 끝난 장치 정리 (주기 호출용)."""
+        with self._lock:
+            self._reap_locked(limit=24)
+
+    def _reap_locked(self, limit):
+        wm = ctypes.windll.winmm
+        keep = []
+        for h, hdr in self._active:
+            if hdr.dwFlags & 0x1:     # WHDR_DONE
+                wm.waveOutUnprepareHeader(h, ctypes.byref(hdr),
+                                          ctypes.sizeof(_WAVEHDR))
+                wm.waveOutClose(h)
+            else:
+                keep.append((h, hdr))
+        while len(keep) > limit:      # 안전판: 과도한 동시 재생 방지
+            h, hdr = keep.pop(0)
+            wm.waveOutReset(h)
+            wm.waveOutUnprepareHeader(h, ctypes.byref(hdr),
+                                      ctypes.sizeof(_WAVEHDR))
+            wm.waveOutClose(h)
+        self._active = keep
+
+    def close(self):
+        with self._lock:
+            wm = ctypes.windll.winmm
+            for h, hdr in self._active:
+                wm.waveOutReset(h)
+                wm.waveOutUnprepareHeader(h, ctypes.byref(hdr),
+                                          ctypes.sizeof(_WAVEHDR))
+                wm.waveOutClose(h)
+            self._active = []
+
+
+class PenSound:
+    """선을 긋기 시작할 때 스크리블 클립 하나를 랜덤 재생 (한 번 '슥').
+
+    짧은 선이든 긴 선이든 스트로크마다 클립 하나. 지속음(bed) 없음.
+    볼륨은 waveOutSetVolume이 드라이버에 무시될 수 있어(장치별 볼륨 미지원)
+    샘플 값 자체에 곱해 확실히 적용한다. 0이면 아예 재생하지 않는다.
+    """
+
+    def __init__(self, folder, volume=35):
+        import wave
+        self.raw = []             # (WAVEFORMATEX, 원본PCM, 샘플폭)
+        names = [f for f in sorted(os.listdir(folder)) if f.lower().endswith(".wav")]
+        clips = [f for f in names if f.lower().startswith("clip")] or names
+        for f in clips:
+            with wave.open(os.path.join(folder, f), "rb") as w:
+                ch, sw, fr = w.getnchannels(), w.getsampwidth(), w.getframerate()
+                data = w.readframes(w.getnframes())
+            wfx = _WAVEFORMATEX(1, ch, fr, fr * ch * sw, ch * sw, sw * 8, 0)
+            self.raw.append((wfx, data, sw))
+        if not self.raw:
+            raise ValueError("펜 소리 wav 없음")
+        self.set_volume(volume)
+        self._cur = None          # (핸들, WAVEHDR, 버퍼)
+
+    def set_volume(self, volume):
+        """볼륨(0~100)을 샘플에 곱해 재생용 버퍼를 준비."""
+        self.volume = max(0.0, min(float(volume), 100.0))
+        gain = self.volume / 100.0
+        self.clips = []           # (WAVEFORMATEX, 버퍼, 길이)
+        if gain <= 0.0:
+            return                # 무음이면 버퍼 안 만듦 → play()가 그냥 반환
+        for wfx, data, sw in self.raw:
+            self.clips.append((wfx, _scaled_buffer(data, gain, sw), len(data)))
+
+    def play(self):
+        """랜덤 클립 하나 재생 (선 긋기 시작 시). 볼륨 0이면 무음."""
+        if not self.clips:
+            return
+        wm = ctypes.windll.winmm
+        if self._cur is not None:
+            self._release(self._cur)
+            self._cur = None
+        wfx, buf, ln = random.choice(self.clips)
+        h = ctypes.c_void_p()
+        if wm.waveOutOpen(ctypes.byref(h), 0xFFFFFFFF, ctypes.byref(wfx), 0, 0, 0):
+            return
+        wm.waveOutSetVolume(h, 0xFFFFFFFF)   # 앱/장치 볼륨 고정 해제 (실볼륨은 샘플로)
+        hdr = _WAVEHDR()
+        hdr.lpData = ctypes.cast(buf, ctypes.c_void_p)
+        hdr.dwBufferLength = ln
+        wm.waveOutPrepareHeader(h, ctypes.byref(hdr), ctypes.sizeof(_WAVEHDR))
+        wm.waveOutWrite(h, ctypes.byref(hdr), ctypes.sizeof(_WAVEHDR))
+        self._cur = (h, hdr, buf)
+
+    def stop(self):
+        if self._cur is not None:
+            self._release(self._cur)
+            self._cur = None
+
+    @staticmethod
+    def _release(dev):
+        wm = ctypes.windll.winmm
+        h, hdr, _buf = dev
+        wm.waveOutReset(h)
+        wm.waveOutUnprepareHeader(h, ctypes.byref(hdr), ctypes.sizeof(_WAVEHDR))
+        wm.waveOutClose(h)
+
+
+class PenGrainSound:
+    """펜 긋는 소리 — 지속 재생(연속 스크레이프) 방식.
+
+    긴 스크레이프 녹음(sustain.wav)이 있으면 그중 가장 고른 구간을 골라
+    이음매 없이 무한 반복한다(실제 연필 질감 그대로). 없으면 짧은 클립들을
+    진폭 평탄화해 만든 베드로 폴백한다.
+      · 짧은 획은 짧게, 긴 획은 길게 — 소리 길이가 손을 그대로 따라간다.
+      · 한 획이 '스으으윽' 하나로 이어진다(루프가 매끄러워 회전음 없음).
+      · 획마다 피치만 살짝 달리해 반복감을 줄이고, 시작 볼륨에 속도를 싣는다.
+
+    **페이드는 전부 샘플에 미리 구워 둔다.** 재생 중 waveOutSetVolume으로
+    줄이면 드라이버에 따라 볼륨이 핸들별이 아니라 전역으로 먹어서, 직전 획의
+    페이드아웃이 방금 시작한 다음 획까지 끌어내린다(빠른 연타에서 소리가
+    10%대로 씹히던 원인). 그래서 짧은 클립은 꼬리를 구워 두고 발사 후엔
+    손대지 않고, 루프는 페이드인 머리·페이드아웃 꼬리 버퍼를 따로 재생한다.
+    """
+
+    BED_S = 1.5            # 베드 최대 길이(초) — 길수록 반복 주기가 길어짐
+    XFADE_S = 0.04         # 이음매 크로스페이드(초)
+    HEAD_S = 0.12          # 루프 페이드인 머리(초) — 짧은 클립 밑에서 올라옴
+    TAIL_S = 0.13          # 루프 페이드아웃 꼬리(초)
+    SHORT_CAP = 0.26       # 짧은 클립 최대 길이(초) — 획보다 길게 남지 않게
+    SHORT_MAX = 0.16       # 이 시간 넘게 이어지면 루프로 전환(짧은 클립과 겹침)
+    MOVE_MIN = 4.0         # 획 시작 판정(px) — 마우스 이벤트로 재므로 낮게 잡는다
+
+    def __init__(self, folder, volume=30):
+        import wave
+        names = [f for f in sorted(os.listdir(folder)) if f.lower().endswith(".wav")]
+        longs = [f for f in names if "sustain" in f.lower() or "long" in f.lower()]
+        self.fr = 44100
+
+        def read(fname):
+            with wave.open(os.path.join(folder, fname), "rb") as w:
+                if w.getsampwidth() != 2 or w.getnchannels() != 1:
+                    raise ValueError("펜 소리는 16bit 모노 wav만 지원")
+                self.fr = w.getframerate()
+                return list(memoryview(bytearray(w.readframes(w.getnframes()))).cast("h"))
+
+        if longs:                                     # 실제 긴 스크레이프 → 그대로 루프
+            flat = self._steady_bed(read(longs[0]))
+        else:                                         # 짧은 클립 → 평탄화 베드(폴백)
+            pcm = []
+            for f in ([c for c in names if c.lower().startswith("clip")] or names):
+                pcm += read(f)
+            flat = self._voiced_flat(pcm)
+        m = len(flat)
+        X = max(4, int(self.fr * self.XFADE_S))
+        Lb = min(m - X, int(self.fr * self.BED_S))
+        if Lb < 8:
+            raise ValueError("펜 소리가 너무 짧아 베드를 못 만듦")
+        # 크로스페이드 루프: loop[Lb-1] → loop[0] 이 매끄럽게 맞물리게
+        loop = (ctypes.c_int16 * Lb)()
+        for i in range(Lb):
+            if i < X:
+                w = i / X
+                loop[i] = int(flat[i] * w + flat[Lb + i] * (1.0 - w))
+            else:
+                loop[i] = flat[i]
+        self.loop_pcm = bytes(loop)
+        # 루프 머리(페이드인)·꼬리(페이드아웃) — 볼륨 API 대신 이걸 재생한다.
+        H = min(Lb, max(8, int(self.fr * self.HEAD_S)))
+        head = (ctypes.c_int16 * H)()
+        for i in range(H):
+            head[i] = int(loop[i] * (i / H))
+        self._head_pcm = bytes(head)
+        T = min(Lb, max(8, int(self.fr * self.TAIL_S)))
+        rise = max(2, int(self.fr * 0.003))       # 이음매 클릭 방지용 3ms 상승
+        tail = (ctypes.c_int16 * T)()
+        for i in range(T):
+            g = (1.0 - i / T) * (min(i, rise) / rise)
+            tail[i] = int(loop[i] * g)
+        self._tail_pcm = bytes(tail)
+        # 짧은 획용: clip_*.wav 를 원샷 재생. 길이를 SHORT_CAP으로 자르고 끝에
+        # 페이드 꼬리를 구워 둔다 — 재생 뒤엔 손대지 않아도 획 길이에 맞는다.
+        self.shorts = []
+        for f in [c for c in names if c.lower().startswith("clip")]:
+            with wave.open(os.path.join(folder, f), "rb") as w:
+                if w.getsampwidth() != 2 or w.getnchannels() != 1:
+                    continue
+                s = list(memoryview(bytearray(
+                    w.readframes(w.getnframes()))).cast("h"))
+            cap = int(self.fr * self.SHORT_CAP)
+            if len(s) > cap:
+                s = s[:cap]
+            fo = max(4, int(self.fr * 0.05))      # 끝 50ms 페이드아웃
+            if len(s) > fo:
+                for i in range(fo):
+                    s[len(s) - fo + i] = int(s[len(s) - fo + i] * (1.0 - i / fo))
+            arr = (ctypes.c_int16 * len(s))(*s)
+            self.shorts.append(bytes(arr))
+        self.shorts.sort(key=len)
+        # 마우스 콜백(후킹 스레드)과 그리기 루프(메인)가 같이 보는 것들을 지킨다
+        self._lock = threading.Lock()
+        self._short_bufs = []            # [클립][볼륨단계] 미리 구운 재생 버퍼
+        self._tail_bufs = {}             # 볼륨별 루프 꼬리 버퍼
+        self.set_volume(volume)
+        self._voice = None               # 루프 재생 (handle, WAVEHDR, buf)
+        self._playing = False            # 루프 재생 중인가
+        self._down = False               # 펜이 눌려 있는가 (마우스 콜백이 갱신)
+        self._stroke_dist = 0.0          # 이번 획에서 누적 이동(px)
+        self._stroke_fired = False       # 이번 획에서 짧은 소리를 냈는가
+        self._stroke_t = 0.0             # 짧은 소리를 낸 시각(루프 전환 기준)
+        self._moving_t = 0.0             # 마지막으로 실제 움직인 시각
+        self._cur_speed = 0.0            # 최근 이동 속도(클립 선택·볼륨용)
+        self._last_xy = None             # 직전 마우스 이벤트 좌표
+        self._last_ev = 0.0              # 직전 마우스 이벤트 시각
+        self._last_pick = -1             # 직전에 고른 클립 (연속 반복 방지)
+        self._oneshots = []              # 재생 중인 원샷들 [(h, hdr, buf)]
+        self._loop_bufs = {}             # 볼륨별 루프 버퍼 캐시 (매번 만들면 느리다)
+        self._loop_gain = 0.5            # 현재 루프의 볼륨 (꼬리를 같은 크기로)
+        self._loop_fr = self.fr          # 현재 루프의 재생 주파수 (꼬리도 같게)
+
+    def _win_rms(self, src, win):
+        return [(sum(src[i + j] * src[i + j] for j in range(win)) / win) ** 0.5
+                for i in range(0, len(src) - win, win)]
+
+    def _steady_bed(self, src):
+        """긴 녹음에서 가장 고른 구간을 골라 큰 기복만 살짝 다듬는다.
+        실제 스크레이프 질감은 최대한 남긴다(평탄화 약하게)."""
+        fr = self.fr
+        win = max(8, int(fr * 0.02))
+        need = min(len(src) - 1, int(fr * self.BED_S) + int(fr * self.XFADE_S))
+        rms = self._win_rms(src, win)
+        wc = max(1, need // win)
+        best = (1e18, 0)
+        for s in range(0, max(1, len(rms) - wc)):     # RMS 변동이 가장 작은 창
+            seg = rms[s:s + wc]
+            mean = sum(seg) / len(seg)
+            var = sum((r - mean) ** 2 for r in seg) / len(seg)
+            cv = var ** 0.5 / (mean + 1e-9)
+            if cv < best[0]:
+                best = (cv, s * win)
+        s0 = best[1]
+        seg = src[s0:s0 + need]
+        peak = max(1.0, max(abs(v) for v in seg))
+        target, floor = 0.6 * peak, 0.45 * peak       # 약한 평탄화(±완만)
+        out = []
+        for i in range(0, len(seg) - win + 1, win):
+            w2 = seg[i:i + win]
+            r = (sum(v * v for v in w2) / win) ** 0.5
+            g = min(1.8, target / max(r, floor))
+            out.extend(max(-32767, min(32767, int(v * g))) for v in w2)
+        return out
+
+    def _voiced_flat(self, src):
+        """짧은 클립용 폴백 — 소리 나는 창만 모아 강하게 평탄화한다."""
+        win = max(8, int(self.fr * 0.012))
+        rms = [(i, r) for i, r in
+               zip(range(0, len(src) - win, win), self._win_rms(src, win))]
+        if not rms:
+            raise ValueError("펜 소리가 너무 짧음")
+        peak = max(r for _, r in rms) or 1.0
+        thr = 0.25
+        voiced = [i for i, r in rms if r >= thr * peak]
+        while len(voiced) * win < self.fr * 0.25 and thr > 0.05:
+            thr -= 0.05
+            voiced = [i for i, r in rms if r >= thr * peak]
+        target, floor = 0.5 * peak, 0.30 * peak
+        out = []
+        for i in voiced:
+            seg = src[i:i + win]
+            r = (sum(v * v for v in seg) / win) ** 0.5
+            g = target / max(r, floor)
+            out.extend(max(-32767, min(32767, int(v * g))) for v in seg)
+        return out
+
+    GAIN_LEVELS = 3        # 속도별 볼륨 단계 (미리 구워 두는 가짓수)
+
+    def set_volume(self, volume):
+        """볼륨을 바꾸고, 짧은 클립 재생용 버퍼를 미리 구워 둔다.
+
+        재생 시점(마우스 콜백)에 샘플마다 볼륨을 곱하면 후킹 스레드에서
+        1만 번짜리 반복이 돌아 입력이 밀린다. 미리 만들어 두고 고르기만 한다.
+        """
+        self.volume = max(0.0, min(float(volume), 100.0))
+        base = self.volume / 100.0
+        self._short_bufs = []
+        self._tail_bufs = {}
+        if base <= 0.0:
+            return
+        for pcm in self.shorts:
+            row = []
+            for lv in range(self.GAIN_LEVELS):
+                g = base * (0.7 + 0.3 * (lv / max(1, self.GAIN_LEVELS - 1)))
+                row.append(_scaled_buffer(pcm, g, 2))
+            self._short_bufs.append(row)
+
+    def _tail_buf(self, gain):
+        """루프 꼬리 버퍼 (볼륨별 캐시). 메인 스레드에서만 만든다."""
+        key = round(gain, 2)
+        buf = self._tail_bufs.get(key)
+        if buf is None:
+            if len(self._tail_bufs) > 8:
+                self._tail_bufs.clear()
+            buf = _scaled_buffer(self._tail_pcm, key, 2)
+            self._tail_bufs[key] = buf
+        return buf
+
+    # ── 마우스 콜백에서 즉시 호출 (그리기 루프를 기다리지 않는다) ──────────
+    # 펜 소리가 그리기 루프에 묶여 있으면 프레임 간격(33~66ms)만큼 늦게 난다.
+    # 타자 소리처럼 입력 이벤트에서 바로 재생해야 '댄 순간' 느낌이 난다.
+
+    def pen_down(self, x, y, now):
+        """펜을 댄 순간 — 새 획 시작 (소리는 아직, 움직임을 봐야 탭과 구분된다)."""
+        self._down = True
+        self._stroke_dist = 0.0
+        self._stroke_fired = False
+        self._last_xy = (x, y)
+        self._last_ev = now
+
+    def pen_move(self, x, y, now):
+        """마우스가 움직일 때마다 — MOVE_MIN을 넘는 즉시 짧은 클립을 낸다."""
+        if self._last_xy is not None:
+            d = math.hypot(x - self._last_xy[0], y - self._last_xy[1])
+            dt = now - self._last_ev
+            if 0 < dt < 0.5:
+                sp = d / dt
+                self._cur_speed += (sp - self._cur_speed) * 0.5   # 살짝 평활
+            if d > 0.5:
+                self._moving_t = now
+            if self._down:
+                self._stroke_dist += d
+                if not self._stroke_fired and self._stroke_dist >= self.MOVE_MIN:
+                    self._stroke_fired = True
+                    self._stroke_t = now
+                    if self.volume > 0.0:
+                        self._play_short(self._cur_speed)
+        self._last_xy = (x, y)
+        self._last_ev = now
+
+    def pen_up(self, now):
+        """펜을 뗀 순간 — 표시만 남기고, 루프 정지는 tick(메인 스레드)에 맡긴다.
+
+        여기서 직접 장치를 닫으면 같은 프레임에 tick도 닫으려 들어 같은
+        핸들을 두 번 닫는다(access violation → 팔 구역 차단·입력 지연 사고).
+        소리 장치를 여닫는 일은 메인 스레드만 하도록 못 박는다.
+        """
+        self._down = False
+        self._stroke_fired = False
+
+    # ── 그리기 루프에서 호출 (루프 전환·정리) ──────────────────────────────
+
+    def tick(self, now, enabled=True):
+        """프레임마다 호출 — 끝난 소리를 거두고 긴 획이면 루프로 넘어간다."""
+        self._reap()
+        want = (enabled and self._down and self._stroke_fired
+                and now - self._moving_t < 0.18
+                and now - self._stroke_t > self.SHORT_MAX)
+        if want and not self._playing and self.volume > 0.0:
+            self._start()
+        elif self._playing and not want:
+            self._stop_loop(tail=True)
+
+    def _pick_short(self, speed):
+        """속도에 맞는 클립 고르기 — 빠르면 짧고 경쾌한 것, 느리면 긴 것.
+        (shorts는 길이순 정렬) 직전과 같은 것은 피해 반복감을 줄인다."""
+        n = len(self.shorts)
+        half = max(1, n // 2)
+        pool = range(0, half) if speed >= 350.0 else range(n - half, n)
+        cand = [i for i in pool if i != self._last_pick] or list(pool)
+        i = random.choice(cand)
+        self._last_pick = i
+        return i
+
+    def _oneshot(self, buf, nbytes, fr2):
+        """이미 볼륨이 반영된 버퍼를 독립 장치로 재생한다.
+
+        마우스 콜백(후킹 스레드)에서도 불리므로 무거운 계산을 하지 않는다 —
+        볼륨 곱하기는 set_volume에서 미리 구워 둔다. 후킹 스레드가 늦어지면
+        윈도우가 시스템 전체의 펜/마우스 이벤트를 지연시켜, 그림 선이
+        직선으로 이어지고 타자가 굼떠지는 사고가 난다.
+        """
+        wfx = _WAVEFORMATEX(1, 1, fr2, fr2 * 2, 2, 16, 0)
+        wm = ctypes.windll.winmm
+        h = ctypes.c_void_p()
+        if wm.waveOutOpen(ctypes.byref(h), 0xFFFFFFFF, ctypes.byref(wfx), 0, 0, 0):
+            return
+        wm.waveOutSetVolume(h, 0xFFFFFFFF)   # 장치 볼륨은 만땅 고정 — 이후 안 건드린다
+        hdr = _WAVEHDR()
+        hdr.lpData = ctypes.cast(buf, ctypes.c_void_p)
+        hdr.dwBufferLength = nbytes
+        wm.waveOutPrepareHeader(h, ctypes.byref(hdr), ctypes.sizeof(_WAVEHDR))
+        wm.waveOutWrite(h, ctypes.byref(hdr), ctypes.sizeof(_WAVEHDR))
+        with self._lock:                     # 회수 목록은 메인 스레드와 공유
+            self._oneshots.append((h, hdr, buf))
+
+    def _play_short(self, speed):
+        """짧은 클립 하나를 즉시 재생 (미리 구워 둔 버퍼를 고르기만 한다)."""
+        if not self._short_bufs:
+            return
+        i = self._pick_short(speed)
+        g = max(0.0, min(1.0, (speed - 30.0) / 500.0))
+        lv = min(self.GAIN_LEVELS - 1, int(g * self.GAIN_LEVELS))
+        fr2 = max(8000, int(self.fr * random.uniform(0.97, 1.06)))
+        self._oneshot(self._short_bufs[i][lv], len(self.shorts[i]), fr2)
+
+    def _reap(self):
+        """끝난 원샷(짧은 클립·루프 꼬리)을 회수한다 (메인 스레드 전용)."""
+        with self._lock:
+            if not self._oneshots:
+                return
+            pending, self._oneshots = self._oneshots, []
+        wm = ctypes.windll.winmm
+        keep = []
+        for h, hdr, buf in pending:
+            if hdr.dwFlags & 0x00000001:        # WHDR_DONE
+                wm.waveOutUnprepareHeader(h, ctypes.byref(hdr), ctypes.sizeof(_WAVEHDR))
+                wm.waveOutClose(h)
+            else:
+                keep.append((h, hdr, buf))
+        with self._lock:                        # 회수 중 새로 들어온 것과 합친다
+            self._oneshots = keep + self._oneshots
+
+    def _loop_buf(self, gain):
+        """볼륨별 루프 본체 버퍼 (1.5초짜리라 매번 만들면 프레임을 잡아먹는다)."""
+        key = round(gain, 2)
+        buf = self._loop_bufs.get(key)
+        if buf is None:
+            if len(self._loop_bufs) > 8:
+                self._loop_bufs.clear()
+            buf = _scaled_buffer(self.loop_pcm, key, 2)
+            self._loop_bufs[key] = buf
+        return buf
+
+    def _start(self):
+        """루프 시작 — 페이드인이 구워진 머리를 먼저, 이어서 본체를 무한 반복."""
+        g = max(0.0, min(1.0, (self._cur_speed - 30.0) / 500.0))   # 속도 0~1
+        gain = (self.volume / 100.0) * (0.6 + 0.4 * g)
+        self._loop_gain = gain
+        fr2 = max(8000, int(self.fr * random.uniform(0.95, 1.08)))  # 획마다 피치만
+        self._loop_fr = fr2
+        wfx = _WAVEFORMATEX(1, 1, fr2, fr2 * 2, 2, 16, 0)
+        wm = ctypes.windll.winmm
+        h = ctypes.c_void_p()
+        if wm.waveOutOpen(ctypes.byref(h), 0xFFFFFFFF, ctypes.byref(wfx), 0, 0, 0):
+            return
+        wm.waveOutSetVolume(h, 0xFFFFFFFF)     # 만땅 고정 — 페이드는 샘플에 있다
+        head_buf = _scaled_buffer(self._head_pcm, gain, 2)
+        hh = _WAVEHDR()                         # 1) 페이드인 머리 (한 번)
+        hh.lpData = ctypes.cast(head_buf, ctypes.c_void_p)
+        hh.dwBufferLength = len(self._head_pcm)
+        wm.waveOutPrepareHeader(h, ctypes.byref(hh), ctypes.sizeof(_WAVEHDR))
+        wm.waveOutWrite(h, ctypes.byref(hh), ctypes.sizeof(_WAVEHDR))
+        body_buf = self._loop_buf(gain)
+        hb = _WAVEHDR()                         # 2) 본체 (멈출 때까지 무한 반복)
+        hb.lpData = ctypes.cast(body_buf, ctypes.c_void_p)
+        hb.dwBufferLength = len(self.loop_pcm)
+        hb.dwFlags = 0x00000004 | 0x00000008    # WHDR_BEGINLOOP | WHDR_ENDLOOP
+        hb.dwLoops = 0xFFFFFFFF
+        wm.waveOutPrepareHeader(h, ctypes.byref(hb), ctypes.sizeof(_WAVEHDR))
+        wm.waveOutWrite(h, ctypes.byref(hb), ctypes.sizeof(_WAVEHDR))
+        with self._lock:
+            self._voice = (h, hh, hb, head_buf, body_buf)
+            self._playing = True
+
+    def _stop_loop(self, tail=True):
+        """루프를 멈춘다. tail이면 페이드아웃 꼬리를 따로 재생해 부드럽게 끝낸다.
+
+        **핸들을 먼저 꺼내 놓고(_voice=None) 그 다음에 닫는다.** 반대로 하면
+        두 곳에서 동시에 들어왔을 때 같은 핸들을 두 번 닫아 access violation이
+        난다. 꺼내기를 원자적으로 하면 두 번 닫는 일이 구조적으로 불가능하다.
+        """
+        with self._lock:
+            voice, self._voice = self._voice, None
+            self._playing = False
+        if voice is None:
+            return
+        wm = ctypes.windll.winmm
+        h, hh, hb, _hbuf, _bbuf = voice
+        try:
+            wm.waveOutReset(h)                  # 무한 반복 중단
+            for hdr in (hh, hb):
+                wm.waveOutUnprepareHeader(h, ctypes.byref(hdr),
+                                          ctypes.sizeof(_WAVEHDR))
+            wm.waveOutClose(h)
+        except Exception:
+            pass                                # 이미 닫혔어도 여기서 끝낸다
+        if tail and self.volume > 0.0:          # 꼬리는 별도 장치 — 볼륨 간섭 없음
+            buf = self._tail_buf(self._loop_gain)
+            self._oneshot(buf, len(self._tail_pcm), self._loop_fr)
+
+    def stop(self):
+        self._stop_loop(tail=False)
+
+    def close(self):
+        """캐릭터 종료 시 — 재생 중인 것을 전부 정리한다."""
+        self._stop_loop(tail=False)
+        with self._lock:
+            pending, self._oneshots = self._oneshots, []
+        wm = ctypes.windll.winmm
+        for h, hdr, _b in pending:
+            try:
+                wm.waveOutReset(h)
+                wm.waveOutUnprepareHeader(h, ctypes.byref(hdr), ctypes.sizeof(_WAVEHDR))
+                wm.waveOutClose(h)
+            except Exception:
+                pass
+
+
+class _MacSoundPool:
+    """macOS 소리 재생 — NSSound 사본을 돌려가며 겹쳐 재생한다.
+
+    winmm(waveOut)은 윈도우 전용이라 맥에서는 AppKit의 NSSound를 쓴다.
+    같은 NSSound를 연속 호출하면 이어붙지 않고 다시 시작되므로, 파일마다
+    사본을 몇 개 두고 번갈아 재생해 타자처럼 빠른 연타도 겹치게 한다.
+    """
+
+    COPIES = 3
+
+    def __init__(self, paths, volume):
+        from AppKit import NSSound
+        self.pool = []
+        for p in paths:
+            row = []
+            for _ in range(self.COPIES):
+                snd = NSSound.alloc().initWithContentsOfFile_byReference_(p, True)
+                if snd is not None:
+                    row.append(snd)
+            if row:
+                self.pool.append(row)
+        if not self.pool:
+            raise ValueError("재생 가능한 wav가 없음")
+        self._turn = [0] * len(self.pool)
+        self.set_volume(volume)
+
+    def set_volume(self, volume):
+        self.volume = max(0.0, min(float(volume), 100.0))
+        g = self.volume / 100.0
+        for row in self.pool:
+            for snd in row:
+                try:
+                    snd.setVolume_(g)
+                except Exception:
+                    pass
+
+    def _fire(self, idx):
+        if self.volume <= 0 or not self.pool:
+            return
+        row = self.pool[idx % len(self.pool)]
+        snd = row[self._turn[idx % len(self.pool)] % len(row)]
+        self._turn[idx % len(self.pool)] += 1
+        try:
+            if snd.isPlaying():
+                snd.stop()
+            snd.play()
+        except Exception:
+            pass
+
+    def _all_stop(self):
+        for row in self.pool:
+            for snd in row:
+                try:
+                    snd.stop()
+                except Exception:
+                    pass
+
+
+class MacSoundPack(_MacSoundPool):
+    """맥용 Mechvibes 팩 재생기 (SoundPack과 같은 인터페이스).
+
+    맥은 어느 키를 눌렀는지 알 수 없어(카운터만 읽는다) 키별 구분은 못 한다.
+    인자만 맞춰 두고 무시한다.
+    """
+
+    def play(self, key, code=None):
+        return super().play(key)
+
+    def __init__(self, folder, volume=60):
+        with open(os.path.join(folder, "config.json"), encoding="utf-8") as fp:
+            cfg = json.load(fp)
+        if cfg.get("key_define_type", "multi") != "multi":
+            raise ValueError("single 타입 팩 미지원")
+        names, paths = [], []
+        for v in cfg.get("defines", {}).values():
+            if isinstance(v, str) and v and v not in names:
+                names.append(v)
+        for name in names:
+            p = os.path.join(folder, name)
+            if name.lower().endswith(".wav") and os.path.exists(p):
+                paths.append(p)
+        super().__init__(paths, volume)
+
+    def play(self, key):
+        self._fire(hash(str(key)) % max(len(self.pool), 1))
+
+    def reap(self):
+        pass                      # NSSound는 스스로 정리된다
+
+    def close(self):
+        self._all_stop()
+
+
+class MacPenSound(_MacSoundPool):
+    """맥용 펜 긋는 소리 (PenSound와 같은 인터페이스)."""
+
+    def __init__(self, folder, volume=35):
+        names = [f for f in sorted(os.listdir(folder)) if f.lower().endswith(".wav")]
+        clips = [f for f in names if f.lower().startswith("clip")] or names
+        paths = [os.path.join(folder, f) for f in clips]
+        if not paths:
+            raise ValueError("펜 소리 wav 없음")
+        super().__init__(paths, volume)
+
+    def play(self):
+        self._fire(random.randrange(len(self.pool)))
+
+    def stop(self):
+        self._all_stop()
+
+
+class PokeSound:
+    """캐릭터를 눌렀을 때 나는 짧은 소리.
+
+    누르는 건 잦아서 같은 소리가 그대로 반복되면 금방 물린다. 그래서 매번
+    재생 속도를 조금씩 흔들어 음높이를 달리한다. 볼륨은 미리 곱해 두고
+    (waveOutSetVolume은 드라이버가 무시할 수 있다) 재생 때는 고르기만 한다.
+    """
+
+    def __init__(self, folder, volume=40):
+        import wave
+        names = [f for f in sorted(os.listdir(folder)) if f.lower().endswith(".wav")]
+        if not names:
+            raise ValueError("클릭 소리 wav 없음")
+        # 폴더에 여럿이면 다 읽어 두고 번갈아 낸다 (홈 반응 소리가 둘이다).
+        self.clips = []
+        for nm in names:
+            with wave.open(os.path.join(folder, nm), "rb") as w:
+                if w.getsampwidth() != 2 or w.getnchannels() != 1:
+                    continue          # 16bit 모노가 아니면 건너뛴다
+                self.clips.append((w.getframerate(),
+                                   w.readframes(w.getnframes())))
+        if not self.clips:
+            raise ValueError("클릭 소리는 16bit 모노 wav만 지원")
+        self.fr, self.pcm = self.clips[0]
+        self._voices = []
+        self.set_volume(volume)
+
+    def set_volume(self, volume):
+        self.volume = max(0.0, min(float(volume), 100.0))
+        self.bufs = ([(fr, _scaled_buffer(pcm, self.volume / 100.0, 2), len(pcm))
+                      for fr, pcm in self.clips] if self.volume > 0 else [])
+        self.buf = self.bufs[0][1] if self.bufs else None
+
+    def play(self):
+        self.reap()
+        if not getattr(self, "bufs", None):
+            return
+        fr, buf, nbytes = random.choice(self.bufs)
+        fr2 = max(8000, int(fr * random.uniform(0.92, 1.10)))
+        wfx = _WAVEFORMATEX(1, 1, fr2, fr2 * 2, 2, 16, 0)
+        wm = ctypes.windll.winmm
+        h = ctypes.c_void_p()
+        if wm.waveOutOpen(ctypes.byref(h), 0xFFFFFFFF, ctypes.byref(wfx), 0, 0, 0):
+            return
+        wm.waveOutSetVolume(h, 0xFFFFFFFF)     # 실볼륨은 샘플에 이미 반영됨
+        hdr = _WAVEHDR()
+        hdr.lpData = ctypes.cast(buf, ctypes.c_void_p)
+        hdr.dwBufferLength = nbytes
+        wm.waveOutPrepareHeader(h, ctypes.byref(hdr), ctypes.sizeof(_WAVEHDR))
+        wm.waveOutWrite(h, ctypes.byref(hdr), ctypes.sizeof(_WAVEHDR))
+        # 여기도 같은 이유로 버퍼를 함께 붙든다 (set_volume이
+        # 버퍼를 갈아 끼우는 동안 옛 소리가 재생 중일 수 있다)
+        self._voices.append((h, hdr, buf))
+
+    def reap(self):
+        wm = ctypes.windll.winmm
+        keep = []
+        for h, hdr, _b in self._voices:
+            if hdr.dwFlags & 0x00000001:        # WHDR_DONE
+                wm.waveOutUnprepareHeader(h, ctypes.byref(hdr), ctypes.sizeof(_WAVEHDR))
+                wm.waveOutClose(h)
+            else:
+                keep.append((h, hdr, _b))
+        self._voices = keep
+
+    def close(self):
+        wm = ctypes.windll.winmm
+        for h, hdr, _b in self._voices:
+            try:
+                wm.waveOutReset(h)
+                wm.waveOutUnprepareHeader(h, ctypes.byref(hdr), ctypes.sizeof(_WAVEHDR))
+                wm.waveOutClose(h)
+            except Exception:
+                pass
+        self._voices = []
+
+
+class MacPokeSound(_MacSoundPool):
+    """맥용 클릭 소리 (PokeSound와 같은 인터페이스). 피치 변주는 없다."""
+
+    def __init__(self, folder, volume=40):
+        names = [f for f in sorted(os.listdir(folder)) if f.lower().endswith(".wav")]
+        if not names:
+            raise ValueError("클릭 소리 wav 없음")
+        super().__init__([os.path.join(folder, names[0])], volume)
+
+    def play(self):
+        self._fire(0)
+
+    def close(self):
+        self._all_stop()
+
+
+class SlimeSound:
+    """슬라임을 만질 때 나는 소리 — 종류별로 여러 장을 두고 골라 낸다.
+
+    PokeSound와 같은 방식(볼륨은 샘플에 미리 곱해 두고, 재생 속도를 흔들어
+    음높이를 달리한다)이지만 누르기·늘리기·구슬처럼 종류가 여럿이다.
+    파일 이름 앞머리로 묶으므로 press1.wav / crunch2.wav 처럼 두면 된다.
+
+    끄는 세기에 따라 소리 크기가 달라져야 해서 세 단계로 미리 만들어 둔다.
+    waveOutSetVolume은 드라이버가 무시할 수 있어 믿을 수 없기 때문이다.
+    """
+
+    KINDS = ("press", "stretch", "pop", "crunch", "unroll")
+    LEVELS = (0.35, 0.62, 1.0)
+    MAX_VOICES = 4               # 동시에 나는 소리 상한 (연타해도 안 뭉개지게)
+    # 종류별 상한과 최소 간격. 누르는 소리는 종류에 따라 400ms까지 가는데,
+    # 빨리 누르면 그게 죄다 겹쳐 웅웅거린다. 한 가지 소리는 둘까지만,
+    # 그것도 이 간격은 띄우고 낸다.
+    SAME_MAX = {"press": 2, "pop": 2, "stretch": 3, "crunch": 2, "unroll": 1}
+    MIN_GAP = {"press": 0.13, "pop": 0.13, "stretch": 0.05,
+               "crunch": 0.07, "unroll": 0.40}
+
+    def __init__(self, folder, volume=45):
+        import wave
+        self.clips = {}
+        for name in sorted(os.listdir(folder)):
+            if not name.lower().endswith(".wav"):
+                continue
+            kind = os.path.splitext(name)[0].rstrip("0123456789")
+            if kind not in self.KINDS:
+                continue
+            with wave.open(os.path.join(folder, name), "rb") as w:
+                if w.getsampwidth() != 2 or w.getnchannels() != 1:
+                    continue
+                fr = w.getframerate()
+                pcm = w.readframes(w.getnframes())
+            # 재생 속도는 소리마다 따로 들고 있는다. 하나로 뭉뚱그리면 종류를
+            # 바꿨을 때(44.1kHz ↔ 48kHz) 음이 통째로 어긋난다.
+            self.clips.setdefault(kind, []).append((pcm, fr))
+        if not self.clips:
+            raise ValueError("슬라임 소리 wav 없음")
+        self._voices = []            # (핸들, 헤더, 종류)
+        self._bufs = {}
+        self._last = {}              # 종류별 마지막으로 낸 시각
+        self.set_volume(volume)
+
+    def set_volume(self, volume):
+        self.volume = max(0.0, min(float(volume), 100.0))
+        self._bufs = {}              # 볼륨이 바뀌면 미리 만든 것을 버린다
+
+    def _buf(self, kind, idx, level):
+        key = (kind, idx, level)
+        hit = self._bufs.get(key)
+        if hit is None:
+            pcm, fr = self.clips[kind][idx]
+            g = self.volume / 100.0 * self.LEVELS[level]
+            hit = (_scaled_buffer(pcm, g, 2), len(pcm), fr)
+            self._bufs[key] = hit
+        return hit
+
+    def has(self, kind):
+        return kind in self.clips
+
+    def play(self, kind, pitch=1.0, level=2):
+        self.reap()
+        if self.volume <= 0 or kind not in self.clips:
+            return
+        if len(self._voices) >= self.MAX_VOICES:
+            return
+        # 같은 소리가 겹쳐 웅웅거리지 않게 — 간격과 개수를 함께 막는다
+        now = time.time()
+        if now - self._last.get(kind, 0.0) < self.MIN_GAP.get(kind, 0.08):
+            return
+        if (sum(1 for v in self._voices if v[2] == kind)
+                >= self.SAME_MAX.get(kind, 2)):
+            return
+        self._last[kind] = now
+        idx = random.randrange(len(self.clips[kind]))
+        buf, ln, fr = self._buf(kind, idx,
+                                max(0, min(len(self.LEVELS) - 1, int(level))))
+        fr2 = max(8000, int(fr * pitch * random.uniform(0.94, 1.07)))
+        wfx = _WAVEFORMATEX(1, 1, fr2, fr2 * 2, 2, 16, 0)
+        wm = ctypes.windll.winmm
+        h = ctypes.c_void_p()
+        if wm.waveOutOpen(ctypes.byref(h), 0xFFFFFFFF, ctypes.byref(wfx), 0, 0, 0):
+            return
+        wm.waveOutSetVolume(h, 0xFFFFFFFF)     # 실볼륨은 샘플에 이미 반영됨
+        hdr = _WAVEHDR()
+        hdr.lpData = ctypes.cast(buf, ctypes.c_void_p)
+        hdr.dwBufferLength = ln
+        wm.waveOutPrepareHeader(h, ctypes.byref(hdr), ctypes.sizeof(_WAVEHDR))
+        wm.waveOutWrite(h, ctypes.byref(hdr), ctypes.sizeof(_WAVEHDR))
+        # 버퍼를 voice에 함께 담아 둔다. 헤더는 날 포인터만 들고 있어서,
+        # 재생 중에 _bufs가 비워지면(볼륨 변경·종류 교체) 드라이버가
+        # 이미 없는 메모리를 읽어 프로세스가 통째로 죽는다.
+        self._voices.append((h, hdr, kind, buf))
+
+    def reap(self):
+        wm = ctypes.windll.winmm
+        keep = []
+        for h, hdr, kind, buf in self._voices:
+            if hdr.dwFlags & 0x00000001:        # WHDR_DONE
+                wm.waveOutUnprepareHeader(h, ctypes.byref(hdr), ctypes.sizeof(_WAVEHDR))
+                wm.waveOutClose(h)
+            else:
+                keep.append((h, hdr, kind, buf))
+        self._voices = keep
+
+    def close(self):
+        wm = ctypes.windll.winmm
+        for h, hdr, _k, _b in self._voices:
+            try:
+                wm.waveOutReset(h)
+                wm.waveOutUnprepareHeader(h, ctypes.byref(hdr), ctypes.sizeof(_WAVEHDR))
+                wm.waveOutClose(h)
+            except Exception:
+                pass
+        self._voices = []
+
+
+class MacSlimeSound(_MacSoundPool):
+    """맥용 슬라임 소리 (SlimeSound와 같은 인터페이스). 음높이 변주는 없다."""
+
+    # 아래에서 SlimeSound라는 이름 자체를 이 클래스로 바꿔 끼우므로, 메서드
+    # 안에서 SlimeSound.KINDS를 찾으면 자기 자신을 보게 된다. 클래스를 만드는
+    # 지금(아직 윈도우용을 가리킬 때) 붙잡아 둔다.
+    KINDS = SlimeSound.KINDS
+
+    def __init__(self, folder, volume=45):
+        names = [f for f in sorted(os.listdir(folder)) if f.lower().endswith(".wav")]
+        self.idx = {}
+        paths = []
+        for name in names:
+            kind = os.path.splitext(name)[0].rstrip("0123456789")
+            if kind not in self.KINDS:
+                continue
+            self.idx.setdefault(kind, []).append(len(paths))
+            paths.append(os.path.join(folder, name))
+        if not paths:
+            raise ValueError("슬라임 소리 wav 없음")
+        super().__init__(paths, volume)
+
+    def has(self, kind):
+        return kind in self.idx
+
+    def play(self, kind, pitch=1.0, level=2):
+        row = self.idx.get(kind)
+        if row:
+            self._fire(random.choice(row))
+
+    def close(self):
+        self._all_stop()
+
+
+if IS_MAC:                        # 맥에서는 같은 이름으로 맥 구현을 쓴다
+    SoundPack, PenSound, PokeSound = MacSoundPack, MacPenSound, MacPokeSound
+    SlimeSound = MacSlimeSound
+
+
+if IS_WIN:
+    ctypes.windll.user32.MonitorFromPoint.argtypes = [_POINT, ctypes.c_uint32]
+    ctypes.windll.user32.MonitorFromPoint.restype = ctypes.c_void_p
+
+_TK_ROOT = None                  # 맥에서 커서·화면 크기를 Tk로 얻기 위한 참조
+
+
+class MacInput:
+    """맥 입력 감지 — 리스너 스레드 대신 CoreGraphics 카운터를 매 프레임 읽는다.
+
+    운영체제가 세어 둔 이벤트 개수를 그냥 조회하는 방식이라
+      · 백그라운드 스레드가 없고 (크래시 원인 제거)
+      · 손쉬운 사용 권한이 필요 없으며
+      · 어느 스레드에서 불러도 안전하다.
+    어떤 키가 눌렸는지는 알 수 없지만, 이 프로그램은 '몇 번 눌렸는가'만 쓴다.
+    """
+
+    HID = 1                      # kCGEventSourceStateHIDSystemState (실제 하드웨어)
+    KEY_DOWN = 10
+    MOVED, L_DRAG, R_DRAG = 5, 6, 7
+
+    def __init__(self):
+        cg = _MAC_CG
+        if cg is None:
+            raise RuntimeError("CoreGraphics 없음")
+        cg.CGEventSourceCounterForEventType.restype = ctypes.c_uint32
+        cg.CGEventSourceCounterForEventType.argtypes = [ctypes.c_uint32,
+                                                        ctypes.c_uint32]
+        cg.CGEventSourceButtonState.restype = ctypes.c_bool
+        cg.CGEventSourceButtonState.argtypes = [ctypes.c_uint32, ctypes.c_uint32]
+        self.cg = cg
+        self.keys = self._count(self.KEY_DOWN)
+        self.moves = self._moves()
+
+    def _count(self, ev):
+        return int(self.cg.CGEventSourceCounterForEventType(self.HID, ev))
+
+    def _moves(self):
+        return sum(self._count(e) for e in (self.MOVED, self.L_DRAG, self.R_DRAG))
+
+    def read(self):
+        """(눌린 키 수, 커서 움직임 수, 왼쪽 버튼 눌림) — 지난 호출 이후 변화량."""
+        keys, moves = self._count(self.KEY_DOWN), self._moves()
+        dk, self.keys = max(keys - self.keys, 0), keys
+        dm, self.moves = max(moves - self.moves, 0), moves
+        return dk, dm, bool(self.cg.CGEventSourceButtonState(self.HID, 0))
+
+
+def cursor_pos():
+    if IS_WIN:
+        pt = _POINT()
+        ctypes.windll.user32.GetCursorPos(ctypes.byref(pt))
+        return pt.x, pt.y
+    if _TK_ROOT is not None:      # 맥: Tk가 전역 커서 좌표를 알려준다
+        try:
+            return _TK_ROOT.winfo_pointerxy()
+        except Exception:
+            pass
+    return 0, 0
+
+
+def idle_seconds():
+    """마지막 입력(마우스·키보드·펜) 이후 경과 초."""
+    try:
+        if IS_WIN:
+            info = _LASTINPUTINFO()
+            info.cbSize = ctypes.sizeof(_LASTINPUTINFO)
+            ctypes.windll.user32.GetLastInputInfo(ctypes.byref(info))
+            return max(ctypes.windll.kernel32.GetTickCount() - info.dwTime, 0) / 1000.0
+        if _MAC_CG is not None:
+            # kCGEventSourceStateCombinedSessionState=0, kCGAnyInputEventType=0xFFFFFFFF
+            return float(_MAC_CG.CGEventSourceSecondsSinceLastEventType(
+                0, 0xFFFFFFFF))
+    except Exception:
+        pass
+    return 0.0
+
+
+def foreground_process():
+    """앞에 떠 있는 창의 프로세스 실행파일 이름 (소문자). 실패 시 ''."""
+    try:
+        if IS_WIN:
+            u, k = ctypes.windll.user32, ctypes.windll.kernel32
+            hwnd = u.GetForegroundWindow()
+            pid = ctypes.c_ulong()
+            u.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+            h = k.OpenProcess(0x1000, False, pid.value)  # QUERY_LIMITED_INFO
+            if not h:
+                return ""
+            try:
+                buf = ctypes.create_unicode_buffer(260)
+                size = ctypes.c_ulong(260)
+                if k.QueryFullProcessImageNameW(h, 0, buf, ctypes.byref(size)):
+                    return os.path.basename(buf.value).lower()
+            finally:
+                k.CloseHandle(h)
+        elif IS_MAC:
+            return _mac_front_app()
+    except Exception:
+        pass
+    return ""
+
+
+def _mac_front_app():
+    """맨 앞 앱 이름 (소문자). PyObjC가 있으면 그걸로, 없으면 빈 문자열."""
+    try:
+        from AppKit import NSWorkspace
+        app = NSWorkspace.sharedWorkspace().frontmostApplication()
+        if app is None:
+            return ""
+        name = app.localizedName() or app.bundleIdentifier() or ""
+        return str(name).lower()
+    except Exception:
+        return ""
+
+
+def mac_monitors():
+    """맥에 붙어 있는 화면들의 사각형 목록.
+
+    파이썬 추가 설치 없이 CoreGraphics를 직접 불러 쓴다. 실패하면 빈 목록을
+    돌려주고, 부르는 쪽이 예전처럼 주 화면 하나로 넘어간다.
+    """
+    out = []
+    if not IS_MAC:
+        return out
+
+    class _CGPoint(ctypes.Structure):
+        _fields_ = [("x", ctypes.c_double), ("y", ctypes.c_double)]
+
+    class _CGSize(ctypes.Structure):
+        _fields_ = [("w", ctypes.c_double), ("h", ctypes.c_double)]
+
+    class _CGRect(ctypes.Structure):
+        _fields_ = [("origin", _CGPoint), ("size", _CGSize)]
+
+    for path in ("/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics",
+                 "/System/Library/Frameworks/ApplicationServices.framework"
+                 "/ApplicationServices"):
+        try:
+            cg = ctypes.cdll.LoadLibrary(path)
+            n = ctypes.c_uint32(0)
+            ids = (ctypes.c_uint32 * 16)()
+            cg.CGGetActiveDisplayList.argtypes = [
+                ctypes.c_uint32, ctypes.POINTER(ctypes.c_uint32 * 16),
+                ctypes.POINTER(ctypes.c_uint32)]
+            if cg.CGGetActiveDisplayList(16, ctypes.byref(ids),
+                                         ctypes.byref(n)) != 0:
+                continue
+            cg.CGDisplayBounds.argtypes = [ctypes.c_uint32]
+            cg.CGDisplayBounds.restype = _CGRect
+            got = []
+            for i in range(min(n.value, 16)):
+                r = cg.CGDisplayBounds(ids[i])
+                x, y = int(round(r.origin.x)), int(round(r.origin.y))
+                w, h = int(round(r.size.w)), int(round(r.size.h))
+                if w > 0 and h > 0:
+                    got.append((x, y, x + w, y + h))
+            if got:
+                out = got
+                break
+        except Exception:
+            continue
+    return out
+
+
+def list_monitors():
+    """붙어 있는 화면들의 사각형 목록 — 왼쪽 위부터 차례로.
+
+    듀얼 모니터에서 '어느 화면의 마우스를 따라갈지' 고르게 하려고 쓴다.
+    """
+    out = []
+    if IS_WIN:
+        try:
+            proto = ctypes.WINFUNCTYPE(ctypes.c_int, ctypes.c_void_p,
+                                       ctypes.c_void_p,
+                                       ctypes.POINTER(_RECT), ctypes.c_double)
+
+            def cb(hmon, hdc, lprc, data):
+                mi = _MONITORINFO()
+                mi.cbSize = ctypes.sizeof(_MONITORINFO)
+                if ctypes.windll.user32.GetMonitorInfoW(hmon, ctypes.byref(mi)):
+                    r = mi.rcMonitor
+                    out.append((r.left, r.top, r.right, r.bottom))
+                return 1
+            ctypes.windll.user32.EnumDisplayMonitors(None, None, proto(cb), 0)
+        except Exception:
+            pass
+    elif IS_MAC:
+        out.extend(mac_monitors())
+    if not out:
+        out.append(monitor_at(0, 0))
+    out.sort(key=lambda r: (r[1], r[0]))
+    return out
+
+
+def monitor_at(x, y):
+    if IS_WIN:
+        try:
+            hmon = ctypes.windll.user32.MonitorFromPoint(_POINT(x, y), 2)
+            mi = _MONITORINFO()
+            mi.cbSize = ctypes.sizeof(_MONITORINFO)
+            if ctypes.windll.user32.GetMonitorInfoW(hmon, ctypes.byref(mi)):
+                r = mi.rcMonitor
+                return r.left, r.top, r.right, r.bottom
+        except Exception:
+            pass
+        u = ctypes.windll.user32
+        return 0, 0, u.GetSystemMetrics(0), u.GetSystemMetrics(1)
+    if IS_MAC:                    # 맥: 점이 들어 있는 화면을 찾는다
+        for r in mac_monitors():
+            if r[0] <= x < r[2] and r[1] <= y < r[3]:
+                return r
+    if _TK_ROOT is not None:      # 못 찾으면 주 화면 기준
+        try:
+            return (0, 0, _TK_ROOT.winfo_screenwidth(),
+                    _TK_ROOT.winfo_screenheight())
+        except Exception:
+            pass
+    return 0, 0, 1920, 1080
+
+
+def monitor_work(x, y):
+    """그 점이 놓인 화면의 '작업 영역' (작업표시줄 제외). 창 자리 계산용."""
+    if IS_WIN:
+        try:
+            hmon = ctypes.windll.user32.MonitorFromPoint(_POINT(x, y), 2)
+            mi = _MONITORINFO()
+            mi.cbSize = ctypes.sizeof(_MONITORINFO)
+            if ctypes.windll.user32.GetMonitorInfoW(hmon, ctypes.byref(mi)):
+                r = mi.rcWork
+                return r.left, r.top, r.right, r.bottom
+        except Exception:
+            pass
+    return monitor_at(x, y)
+
+
+OWNER = "rlfqjxm0-create"        # 배포 레포 주인
+
+# ── 캐릭터 한 표 ─────────────────────────────────────────────────────
+# **캐릭터를 늘릴 때 손대는 곳은 여기 하나다.**
+# 예전에는 같은 이름을 여섯 군데(UPDATE_REPOS·ROOM_ART·ROOM_ALL·ROOM_TINT·
+# ROOM_NAME 과 make_manifest 의 배포 목록)에 적어야 했고, 실제로 멸종·프고가
+# UPDATE_REPOS 에서 빠진 채 지냈다 — 그 둘만 '업데이트 소식'이 비고
+# (news.json 을 안 받아 옴) 반쪽 업데이트를 스스로 못 고쳤다(repair_parts).
+#
+#   slot  파츠 폴더 이름. 방에서의 자리 이름이기도 하다.
+#   repo  배포 레포 이름 (OWNER/<repo>)
+#   name  방에 보여 줄 이름
+#   tint  방 카드 색. 남의 config.json 은 친구 컴퓨터에 없어서 여기 적는다.
+#   mac   맥 앱인가 (윈도우 전용 꾸러미를 안 보낸다)
+#   gift  선물본인가. 소스로 도는 내 도로롱만 False —
+#         업데이트 확인을 원격이 아니라 제 폴더의 .version.json 으로 한다(지뢰 29).
+#   art   앉은 모습을 받아 올 폴더가 slot 과 다를 때만 (내 도로롱)
+#   size  방에서 그리는 크기 배율. 얼굴이 넓적한 캐릭터만 줄인다.
+CHARS = [
+    {"slot": "parts_junsa", "repo": "junsa-mascot", "name": "준사",
+     "tint": "#4a4a52"},
+    {"slot": "parts_dog", "repo": "dog-mascot", "name": "개",
+     "tint": "#555555"},
+    {"slot": "parts_quincy", "repo": "quincy-mascot", "name": "퀸시",
+     "tint": "#3c5488", "mac": True},
+    {"slot": "parts_dororong_gift", "repo": "dororong-mascot", "name": "도로롱",
+     "tint": "#f2a7c5"},
+    {"slot": "parts_saga", "repo": "saga-mascot", "name": "사가",
+     "tint": "#f486b6", "mac": True},
+    {"slot": "parts_gippo", "repo": "gippo-mascot", "name": "기뽀",
+     "tint": "#7fb436"},
+    {"slot": "parts_myeoljong", "repo": "myeoljong-mascot", "name": "멸종",
+     "tint": "#ba2028"},
+    {"slot": "parts_peugo", "repo": "peugo-mascot", "name": "프고",
+     "tint": "#4f9d3f", "size": 0.84},   # 초록 (수트 파랑은 그림이 맡는다)
+    {"slot": "parts_hambugi", "repo": "hambugi-mascot", "name": "햄북이",
+     "tint": "#c9954a"},
+    {"slot": "parts_yeoneo", "repo": "yeoneo-mascot", "name": "연어",
+     "tint": "#e08a6a"},
+    # 소스로 도는 내 도로롱 — 자리는 선물본 쪽 그림을 빌려 쓴다
+    {"slot": "parts_dororong", "repo": "dororong-mascot", "name": "도로롱",
+     "tint": "#f2a7c5", "gift": False, "art": "parts_dororong_gift"},
+]
+
+
+def char_info(slot):
+    """그 캐릭터의 표 한 줄 (모르는 이름이면 None)."""
+    for c in CHARS:
+        if c["slot"] == slot:
+            return c
+    return None
+
+
+# 아래는 전부 위 표에서 뽑은 것이다. 손으로 고치지 말 것.
+UPDATE_REPOS = dict(                 # 선물 캐릭터 자동 업데이트 배포 레포
+    (c["slot"], "%s/%s" % (OWNER, c["repo"]))
+    for c in CHARS if c.get("gift", True))
+
+
+# 지난 안내(news.json)를 받아 올 곳. 배포 레포가 없는 캐릭터(소스로 도는
+# 내 도로롱)도 같은 캐릭터의 배포 레포에서 소식만 받아 본다.
+NEWS_REPOS = dict((c["slot"], "%s/%s" % (OWNER, c["repo"])) for c in CHARS)
+
+UPDATE_FLAG = ".updated"          # 업데이트 알림 신호 파일
+
+
+def _save_json_text(path, text):
+    """글자 파일도 임시 파일에 쓰고 갈아 끼운다 (지뢰 35와 같은 이유)."""
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8", newline="\n") as fp:
+        fp.write(text)
+    os.replace(tmp, path)
+
+
+def _save_json(path, data, **kw):
+    """중간에 꺼져도 파일이 반쪽으로 남지 않게 — 임시 파일에 쓰고 갈아 끼운다.
+
+    open(path, "w")는 여는 순간 내용을 지운다. 그 직후에 프로세스가 사라지면
+    (윈도우 종료·강제 종료·정전·업데이트 재시작) 0바이트 파일이 남는데,
+    읽는 쪽은 예외를 삼키고 기본값으로 돌아가므로 작업 기록·할 일·설정이
+    아무 말 없이 통째로 사라진다. os.replace는 윈도우에서도 원자적이라
+    갈아 끼우기 전까지 옛 파일이 그대로 남아 있다.
+    """
+    kw.setdefault("ensure_ascii", False)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fp:
+        json.dump(data, fp, **kw)
+        fp.flush()
+        os.fsync(fp.fileno())
+    os.replace(tmp, path)
+
+
+def mark_updated(state_dir, restart, notes=None):
+    """업데이트 사실을 남긴다. restart=True면 껐다 켜야 반영되는 경우.
+
+    notes는 version.json에 실려 온 '이번에 바뀐 것' 목록(문자열 리스트).
+    """
+    try:
+        items = [str(s).strip() for s in (notes or []) if str(s).strip()]
+        _save_json(os.path.join(state_dir, UPDATE_FLAG),
+                   {"restart": bool(restart), "notes": items[:6]})
+    except Exception:
+        pass
+
+
+def _take_update_flag(state_dir):
+    """신호를 읽고 지운다 — 한 번만 알리기 위해. (말풍선 문구, 변경목록)."""
+    p = os.path.join(state_dir, UPDATE_FLAG)
+    if not os.path.exists(p):
+        return None, []
+    restart, notes = False, []
+    try:
+        with open(p, encoding="utf-8") as fp:
+            d = json.load(fp)
+        restart = bool(d.get("restart"))
+        notes = [str(s) for s in (d.get("notes") or []) if str(s).strip()]
+    except Exception:
+        pass
+    try:
+        os.remove(p)
+    except Exception:
+        pass
+    msg = ("업데이트 됐어요! 껐다 켜주세요" if restart
+           else "새 버전으로 업데이트 됐어요!")
+    return msg, notes
+
+
+SEEN_FILE = ".seen_version"       # 마지막으로 알린 버전
+
+
+def update_notice(char_dir, state_dir):
+    """업데이트 직후인지 판단해 (말풍선 문구, 바뀐 점 목록)을 돌려준다.
+
+    런처(exe에 구워진 코드)가 남기는 .updated 신호를 먼저 본다. 다만 런처는
+    자동 업데이트 대상이 아니라서 옛 exe는 notes를 못 남긴다. 그래서
+    version.json의 버전 변화를 여기서 직접 본다 — mascot.py는 자동 업데이트로
+    갱신되므로, 친구에게 exe를 다시 보내지 않아도 이 경로는 동작한다.
+    """
+    msg, notes = _take_update_flag(state_dir)
+    ver, vnotes, silent, link = None, [], False, None
+    try:
+        # 선물본은 부모 폴더의 version.json(런처가 받아 둔 것),
+        # 소스로 돌리는 캐릭터는 제 폴더의 .version.json 을 본다.
+        p = os.path.join(char_dir, ".version.json")
+        if not os.path.exists(p):
+            p = os.path.join(os.path.dirname(char_dir), "version.json")
+        with open(p, encoding="utf-8") as fp:
+            man = json.load(fp)
+        ver = man.get("version")
+        vnotes = [str(s) for s in (man.get("notes") or []) if str(s).strip()]
+        # 조용한 배포 — 알릴 만한 변화가 아니라 팝업을 띄우지 않는다.
+        # 런처(exe)는 자동 갱신이 안 돼서 늘 신호를 남기므로, 여기서 막는다.
+        silent = bool(man.get("silent"))
+        # 새 프로그램을 받아야 하는 변경이면 받는 곳을 같이 알려 준다.
+        # https 로 시작하는 주소만 받아들인다.
+        got = man.get("link") or {}
+        url = str(got.get("url") or "")
+        if url.startswith("https://"):
+            link = {"url": url, "label": str(got.get("label") or "새 버전 받기")}
+    except Exception:
+        pass
+    if ver is None:
+        return (None, [], None) if silent else (msg, notes, None)
+    seen_path = os.path.join(state_dir, SEEN_FILE)
+    seen = None
+    try:
+        with open(seen_path, encoding="utf-8") as fp:
+            seen = json.load(fp).get("version")
+    except Exception:
+        pass
+    if seen != ver:
+        try:
+            _save_json(seen_path, {"version": ver})
+        except Exception:
+            pass
+        if seen is not None and not silent:   # 설치 후 첫 실행은 알릴 '변경'이 없다
+            msg = msg or "새 버전으로 업데이트 됐어요!"
+            notes = notes or vnotes
+        if not silent:
+            _update_log_add(state_dir, ver, vnotes or notes, link)
+    return (None, [], None) if silent else (msg, notes, link)
+
+
+UPDATE_LOG = ".update_log.json"   # 지난 업데이트 안내 보관 (최근 20개)
+UPDATE_READ = ".update_read"      # 어디까지 읽었는지 (빨간 점 판단용)
+
+
+def _update_log_add(state_dir, ver, notes, link=None):
+    """이번 안내를 기록에 남긴다. 못 보고 지나가도 나중에 되짚어 볼 수 있게."""
+    notes = [str(x) for x in (notes or []) if str(x).strip()]
+    if not notes:
+        return
+    path = os.path.join(state_dir, UPDATE_LOG)
+    try:
+        try:
+            with open(path, encoding="utf-8") as fp:
+                log = json.load(fp)
+            log = log if isinstance(log, list) else []
+        except Exception:
+            log = []
+        entry = {"ver": ver, "notes": notes}
+        if link:
+            entry["link"] = link
+        if log and log[-1].get("ver") == ver:
+            log[-1] = entry                   # 같은 버전이면 갱신만
+        else:
+            log.append(entry)
+        _save_json(path, log[-20:])
+    except Exception:
+        pass
+
+
+def _parts_broken(char_dir):
+    """layout.json과 실제 PNG가 어긋나 있는지 = 업데이트가 중간에 끊긴 상태.
+
+    기본 파츠뿐 아니라 패션 슬롯(skins/*) 폴더도 함께 확인한다.
+    """
+    dirs = [char_dir]
+    skins = os.path.join(char_dir, "skins")
+    if os.path.isdir(skins):
+        dirs += [os.path.join(skins, d) for d in os.listdir(skins)
+                 if os.path.isdir(os.path.join(skins, d))]
+    for d in dirs:
+        try:
+            with open(os.path.join(d, "layout.json"), encoding="utf-8") as fp:
+                layout = json.load(fp)
+        except Exception:
+            return True
+        for name, info in layout.items():
+            if not isinstance(info, dict) or "size" not in info:
+                continue
+            p = os.path.join(d, f"{name}.png")
+            if not os.path.exists(p):
+                return True
+            try:
+                with Image.open(p) as im:
+                    if list(im.size) != list(info["size"]):
+                        return True
+            except Exception:
+                return True
+    # config가 슬라임을 켜 뒀는데 소리 폴더가 없으면 그것도 '끊긴 상태'다.
+    # 업데이트가 반쪽만 적용되면 동그란 기본 모양에 소리도 안 나는 채로
+    # 굳는데(준사 제보), PNG만 보면 멀쩡해 보여 복구가 안 걸렸다.
+    try:
+        with open(os.path.join(char_dir, "config.json"), encoding="utf-8") as fp:
+            sl = json.load(fp).get("slime")
+        if isinstance(sl, dict) and sl.get("kinds"):
+            base = os.path.join(char_dir, "sounds", "slime")
+            for kind in sl["kinds"]:
+                d = os.path.join(base, kind)
+                if not os.path.isdir(d) or not any(
+                        f.lower().endswith(".wav") for f in os.listdir(d)):
+                    return True
+    except Exception:
+        pass
+    return False
+
+
+def _manifest_stale(base_dir):
+    """런처가 받아 둔 version.json 과 실제 파일이 어긋나 있는가.
+
+    반쪽 업데이트 중에는 '옛 판끼리 맞물린' 상태가 생긴다 — 옛 layout.json
+    에 옛 PNG 라 크기는 서로 맞아서 `_parts_broken` 이 정상으로 본다
+    (프고 팔 사건). 번호는 이미 최신이라 런처도 다시 안 받는다.
+    매니페스트의 해시와 대조하면 이 상태가 잡힌다. 로컬만 읽는다.
+    """
+    import hashlib
+    try:
+        with open(os.path.join(base_dir, "version.json"),
+                  encoding="utf-8") as fp:
+            files = json.load(fp).get("files") or {}
+        if not files:
+            return True
+        for rel, want in files.items():
+            p = os.path.join(base_dir, rel.replace("/", os.sep))
+            with open(p, "rb") as fp:
+                if hashlib.sha256(fp.read()).hexdigest() != want:
+                    return True
+        return False
+    except Exception:
+        return True         # 매니페스트나 파일을 못 읽으면 섞인 것으로 본다
+
+
+def repair_parts(char_dir, state_dir=None):
+    """파츠가 섞여 있으면 배포 레포에서 다시 받아 맞춘다 (선물 exe 전용).
+
+    자동 업데이트가 파일 하나씩 덮어쓰는 방식이라, 도중에 네트워크가 끊기면
+    새 PNG + 옛 layout.json 처럼 섞인 상태로 남아 캐릭터가 깨져 보인다.
+    실행할 때마다 정합성을 확인하고, 어긋나 있으면 여기서 복구한다.
+    """
+    repo = UPDATE_REPOS.get(os.path.basename(char_dir))
+    if not (repo and getattr(sys, "frozen", False)):
+        return                              # 개발 환경에서는 건드리지 않는다
+    base_dir = os.path.dirname(char_dir)
+    done = os.path.exists(os.path.join(base_dir, "version.json"))
+    if done and not _parts_broken(char_dir) and not _manifest_stale(base_dir):
+        return                              # 정상 — 네트워크 접근 없음
+    import hashlib
+    import urllib.parse
+    import urllib.request
+    base = base_dir
+
+    def fetch(rel):
+        # 공백이 든 음원 폴더 경로 때문에 URL 인코딩이 필요하다
+        url = (f"https://raw.githubusercontent.com/{repo}/main/"
+               f"{urllib.parse.quote(rel, safe='/')}")
+        req = urllib.request.Request(url, headers={"User-Agent": "mascot-repair"})
+        for i in range(3):
+            try:
+                with urllib.request.urlopen(req, timeout=20,
+                                            context=_ssl_ctx()) as r:
+                    return r.read()
+            except Exception:
+                if i == 2:
+                    raise
+                time.sleep(1.0)
+
+    changed = []
+    try:
+        man = json.loads(fetch("version.json").decode("utf-8"))
+        for rel, want in man.get("files", {}).items():
+            p = os.path.join(base, rel.replace("/", os.sep))
+            try:
+                with open(p, "rb") as fp:
+                    if hashlib.sha256(fp.read()).hexdigest() == want:
+                        continue
+            except Exception:
+                pass
+            data = fetch(rel)
+            if hashlib.sha256(data).hexdigest() != want:
+                return                      # 내려받은 게 손상 — 다음 실행에 재시도
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            with open(p, "wb") as fp:
+                fp.write(data)
+            changed.append(rel)
+        with open(os.path.join(base, "version.json"), "w", encoding="utf-8") as fp:
+            json.dump(man, fp)
+        if changed:
+            # mascot.py는 이미 메모리에 올라와 있어 껐다 켜야 반영된다
+            mark_updated(state_dir or char_dir, "mascot.py" in changed,
+                         man.get("notes"))
+    except Exception:
+        pass                                # 오프라인이면 있는 그대로 실행
+
+
+class TodoPanel:
+    """캐릭터 왼쪽에 붙는 할 일 말풍선 창.
+
+    본체 창은 캐릭터 크기에 맞춰져 있어 옆으로 그릴 자리가 없다. 그래서
+    같은 색상키 투명을 쓰는 별도 창을 왼쪽에 두고 본체를 따라다니게 한다.
+    말풍선을 우클릭하면 수정 / 완료 / 꼬리 방향 바꾸기를 고를 수 있다.
+    """
+
+    # 좁고 글자는 크게 — 화면을 덜 가리면서 잘 읽히게.
+    # 맥은 같은 크기라도 글자가 더 넓게 그려져 조금 더 좁게 잡는다.
+    W = 150 if IS_MAC else 160   # 패널 폭 (96DPI 기준)
+    FS = 12                      # 글자 크기 (캐릭터 글자 크기 설정과는 무관)
+    TAIL_W, TAIL_H = 17, 13      # 말풍선 꼬리 크기 (캐릭터 말풍선과 동일)
+    PAD = TAIL_H + 8             # 간격 (꼬리가 다음 칸을 안 침범하게)
+
+    # 우클릭 메뉴에서 고를 수 있는 배율 (%)
+    ZOOMS = (60, 70, 80, 90, 100, 120, 140)
+
+    def __init__(self, master, card, bg, on_done, on_move, on_edit=None,
+                 offset=None, flip=False, on_flip=None, ui_k=1.0,
+                 zoom=100, on_zoom=None, on_delete=None):
+        # 화면 배율 반영 — 비율은 그대로 두고 통째로 키운다. 배율이 큰 화면에서
+        # 폭·글자를 안 키우면 물리적으로 너무 작게 보인다. 다만 얼마나 커야
+        # 편한지는 사람마다 달라서, 우클릭 메뉴에서 다시 조절할 수 있게 했다.
+        self.ui_k = max(1.0, min(3.0, float(ui_k)))
+        self.zoom = self._near_zoom(zoom)
+        self.on_zoom = on_zoom
+        self._scale()
+        self.card = card
+        self.on_done = on_done
+        self.on_move = on_move
+        self.on_edit = on_edit
+        self.on_delete = on_delete   # 완료로 치지 않고 그냥 지우기
+        self.on_flip = on_flip
+        # 꼬리 방향 — 패널을 캐릭터 오른쪽에 두면 꼬리도 왼쪽을 봐야 한다
+        self.flip = bool(flip)
+        # 본체 창 왼쪽 위 모서리 기준 상대 위치 (끌어서 옮기면 갱신·저장).
+        # 캐릭터 창과 겹치면 겹친 구간의 우클릭이 캐릭터한테 가서 설정 창이
+        # 뜬다. 그래서 기본값은 딱 붙되 겹치지 않는 자리로 둔다.
+        self._moved_by_user = bool(offset)
+        self.offset = tuple(offset) if offset else (-(self.W + 4), 0)
+        self.items = []          # [(말풍선 좌표, 할 일 인덱스)]
+        self._hwnd_cache = None  # 창 핸들 (z순서 조정용)
+        self._mcache = {}        # 글자 폭·높이 캐시 (구간별 꾸밈 줄바꿈용)
+        self.top = tk.Toplevel(master)
+        self.top.overrideredirect(True)
+        self.top.attributes("-topmost", True)
+        if IS_MAC:
+            try:
+                self.top.attributes("-transparent", True)
+            except Exception:
+                pass
+        else:
+            self.top.attributes("-transparentcolor", bg)
+        self.top.config(bg=bg)
+        self.canvas = tk.Canvas(self.top, width=self.W, height=10, bg=bg,
+                                highlightthickness=0)
+        self.canvas.pack()
+        self.canvas.bind("<Button-1>", self._press)
+        self.canvas.bind("<B1-Motion>", self._drag)
+        self.canvas.bind("<ButtonRelease-1>", self._release)
+        self.canvas.bind("<Button-3>", self._menu)
+        self.top.withdraw()
+        self._pressed = None
+        self._moved = False
+
+    @classmethod
+    def _near_zoom(cls, pct):
+        """저장된 값이 이상해도 고를 수 있는 단계 중 가장 가까운 것으로."""
+        try:
+            pct = int(pct)
+        except Exception:
+            return 100
+        return min(cls.ZOOMS, key=lambda z: abs(z - pct))
+
+    def _scale(self):
+        """화면 배율 × 사용자가 고른 배율로 치수를 다시 잡는다.
+
+        인스턴스 값이 아니라 클래스에 적힌 기준값에서 매번 새로 계산한다.
+        (인스턴스 값에서 다시 곱하면 배율을 바꿀 때마다 눈덩이처럼 커진다.)
+        """
+        k = self.k = self.ui_k * self.zoom / 100.0
+        c = TodoPanel
+        self.W = round(c.W * k)
+        self.PAD = round(c.PAD * k)
+        self.TAIL_W = round(c.TAIL_W * k)
+        self.TAIL_H = round(c.TAIL_H * k)
+        self.FS = max(7, round(c.FS * k))
+        self.MENU_FS = max(7, round(9 * self.ui_k))   # 메뉴는 화면 배율만 따른다
+
+    def set_zoom(self, pct):
+        """할 일 목록만 키우거나 줄인다 (캐릭터·카드 크기와는 무관)."""
+        pct = self._near_zoom(pct)
+        if pct == self.zoom:
+            return
+        self.zoom = pct
+        self._scale()
+        try:
+            self.canvas.config(width=self.W)
+        except Exception:
+            pass
+        # 직접 옮긴 적이 없으면 폭이 바뀐 만큼 붙는 자리도 따라간다
+        if not self._moved_by_user:
+            self.offset = (-(self.W + 4), self.offset[1])
+        if self.on_zoom is not None:
+            self.on_zoom(self.zoom)
+
+    def _rrect(self, x0, y0, x1, y1, r, **kw):
+        """그냥 둥근 사각형 — 꼬리 때문에 모양이 일그러지지 않게 따로 그린다."""
+        pts = []
+        for cx, cy, a0, a1 in ((x1 - r, y0 + r, -90, 0), (x1 - r, y1 - r, 0, 90),
+                               (x0 + r, y1 - r, 90, 180), (x0 + r, y0 + r, 180, 270)):
+            for i in range(7):
+                a = math.radians(a0 + (a1 - a0) * i / 6)
+                pts.extend((cx + math.cos(a) * r, cy + math.sin(a) * r))
+        return self.canvas.create_polygon(pts, smooth=True, **kw)
+
+    def _tail(self, x0, x1, y1, r, fill, outline=None, dx=0, dy=0):
+        """아래를 향한 날카로운 세모 꼬리. flip이면 왼쪽 아래를 본다.
+
+        밑변을 말풍선 테두리 안쪽까지 덮어 그 구간의 테두리를 지우고,
+        양 옆 빗변만 테두리 색으로 그어 이음새가 없게 만든다.
+        """
+        c = self.canvas
+        tw, th = self.TAIL_W, self.TAIL_H
+        s = -1 if self.flip else 1           # 꼬리가 향하는 쪽
+        base = (x0 + r if self.flip else x1 - r) + dx   # 밑변의 바깥쪽 끝
+        bin_ = base - tw * s                              # 밑변의 안쪽 끝
+        by = y1 + dy
+        tipx, tipy = base + th * 0.7 * s, by + th
+        c.create_polygon(bin_, by - 2, tipx, tipy, base, by - 2,
+                         fill=fill, outline="")
+        if outline:
+            c.create_line(bin_, by, tipx, tipy, fill=outline, width=2)
+            c.create_line(tipx, tipy, base, by, fill=outline, width=2)
+
+
+    MEAS_MAX = 600               # 글자 폭 캐시 상한 (지뢰 18)
+    # 맑은 고딕에는 보통과 굵게 사이의 두께가 없다. 살짝 어긋나게 두 번 그려
+    # 그 중간 두께를 만든다 (실측 비교로 고른 값). 굵게도 같이 두 번 그려
+    # 두 단계가 구분되게 둔다. 두 글꼴의 글자 폭이 같아 자리는 안 밀린다.
+    HEAVY = 0.6
+
+    def _ptext(self, x, y, **kw):
+        """말풍선 글자 — 두 번 그려 조금 더 두껍게. 그린 것들을 돌려준다."""
+        return (self.canvas.create_text(x, y, **kw),
+                self.canvas.create_text(x + self.HEAVY, y, **kw))
+
+    def _meas(self, text, font):
+        """글자 폭·높이 — 캔버스로 재고 캐시한다."""
+        key = (text, font)
+        got = self._mcache.get(key)
+        if got is None:
+            t = self.canvas.create_text(-4000, -4000, text=text or "가",
+                                        anchor="nw", font=font)
+            x0, y0, x1, y1 = self.canvas.bbox(t)
+            self.canvas.delete(t)
+            got = (0 if not text else x1 - x0, y1 - y0)
+            if len(self._mcache) > self.MEAS_MAX:
+                for old in list(self._mcache)[:self.MEAS_MAX // 2]:
+                    del self._mcache[old]
+            self._mcache[key] = got
+        return got
+
+    def _lay_runs(self, segs, base, size, max_w):
+        """구간별 꾸밈이 섞인 글을 폭에 맞춰 줄로 나눈다.
+
+        Tk 캔버스 글자는 한 덩어리에 한 글꼴뿐이라, 굵은 부분과 보통 부분을
+        따로 그려 이어 붙여야 한다. 그래서 줄바꿈도 직접 계산한다.
+        반환: ([[(글자, 글꼴, 폭)], ...], 줄 높이 목록)
+        """
+        lines, cur = [], []
+        cw, ch = 0.0, 0.0
+        heights = []
+
+        def newline():
+            lines.append(cur[:])
+            heights.append(ch)
+            del cur[:]
+
+        for text, b, i in segs:
+            font = run_font(b, i, base, size)
+            _w0, h0 = self._meas("", font)
+            for tok in wrap_tokens(text):
+                if tok == "\n":
+                    ch = max(ch, h0)
+                    newline()
+                    cw, ch = 0.0, 0.0
+                    continue
+                w, _h = self._meas(tok, font)
+                if w > max_w:                    # 한 낱말이 너무 길다 — 글자로
+                    for chx in tok:
+                        wc, _ = self._meas(chx, font)
+                        if cw + wc > max_w and cur:
+                            newline()
+                            cw, ch = 0.0, 0.0
+                        cur.append((chx, font, wc))
+                        cw += wc
+                        ch = max(ch, h0)
+                    continue
+                if cw + w > max_w and cur:
+                    newline()
+                    cw, ch = 0.0, 0.0
+                cur.append((tok, font, w))
+                cw += w
+                ch = max(ch, h0)
+        if cur or not lines:
+            ch = max(ch, self._meas("", run_font(False, False, base, size))[1])
+            newline()
+        return lines, heights
+
+    def render(self, todos, tints=None):
+        """항목을 위에서 아래로 쌓아 그린다. 창 높이도 함께 맞춘다.
+
+        tints를 주면 그 항목의 테두리·글자 색을 바꾼다 (마감이 급할 때 등).
+        """
+        c, cd = self.canvas, self.card
+        c.delete("all")
+        self.items = []
+        if not todos:
+            self.top.withdraw()
+            return
+        tw = self.W - round(30 * self.k)   # 글자가 들어갈 폭
+        heights = []                          # 먼저 줄바꿈 높이를 잰다
+        # 높이도 그 칸의 글꼴로 재야 한다 — 굵은 글씨는 폭이 넓어서
+        # 보통 글꼴로 재면 말풍선이 한 줄 모자라게 나온다
+        lays = []                             # 섞인 꾸밈이면 미리 줄을 나눠 둔다
+        for item in todos:
+            segs = todo_runs(item)
+            if len(segs) > 1:                 # 한 칸 안에서 꾸밈이 바뀐다
+                _b, _i, sz = todo_style(item)
+                lines, hs = self._lay_runs(segs, self.FS, sz, tw)
+                lays.append((lines, hs))
+                heights.append(max(sum(hs) + round(20 * self.k),
+                                   round(32 * self.k)))
+                continue
+            lays.append(None)
+            t = c.create_text(0, 0, anchor="nw", text=todo_text(item), width=tw,
+                              font=todo_font(item, self.FS))
+            bb = c.bbox(t)
+            heights.append(max(bb[3] - bb[1] + round(20 * self.k),
+                               round(32 * self.k)))
+            c.delete(t)
+
+        y = self.PAD
+        x0, x1 = round(8 * self.k), self.W - round(6 * self.k)
+        for i, (item, h) in enumerate(zip(todos, heights)):
+            text = todo_text(item)
+            r = round(13 * self.k)
+            self._rrect(x0 + 2, y + 3, x1 + 2, y + h + 3, r,
+                        fill="#e6e2e8", outline="")      # 그림자
+            self._tail(x0 + 2, x1 + 2, y + h, r, "#e6e2e8", dx=0, dy=3)
+            tint = (tints[i] if tints and i < len(tints) and tints[i]
+                    else None)
+            self._rrect(x0, y, x1, y + h, r, fill="#ffffff",
+                        outline=tint or cd["border"], width=2)
+            self._tail(x0, x1, y + h, r, "#ffffff", tint or cd["border"])
+            mid = y + h / 2
+            if lays[i] is not None:           # 꾸밈이 섞인 칸 — 조각을 이어 그린다
+                lines, hs = lays[i]
+                ty = mid - sum(hs) / 2
+                ids = []
+                for ln, lh in zip(lines, hs):
+                    total = sum(w for _t, _f, w in ln)
+                    tx = (x0 + x1) / 2 - total / 2
+                    for seg, font, w in ln:
+                        ids += self._ptext(tx, ty + lh / 2, anchor="w",
+                                           text=seg, font=font,
+                                           fill=tint or cd["text"])
+                        tx += w
+                    ty += lh
+                # 줄 높이를 더해 놓은 자리는 글자 상자 기준이라 위아래 여백이
+                # 어긋난다. 실제로 그려진 것을 재서 말풍선 한가운데로 맞춘다.
+                tb = c.bbox(*ids) if ids else None
+                if tb:
+                    dy = round(mid - (tb[1] + tb[3]) / 2)
+                    for it in ids:
+                        c.move(it, 0, dy)
+            else:
+                ids = self._ptext((x0 + x1) / 2, mid, text=text, width=tw,
+                                  font=todo_font(item, self.FS),
+                                  fill=tint or cd["text"], justify="center")
+                tb = c.bbox(ids[0])  # 실제 그려진 높이로 세로 중앙을 다시 맞춘다
+                if tb:
+                    dy = round(mid - (tb[1] + tb[3]) / 2) - 1
+                    for it in ids:               # 겹쳐 그린 두 장을 같이 옮긴다
+                        c.move(it, 0, dy)
+            self.items.append(((x0, y, x1, y + h), i))   # 우클릭 영역 = 말풍선
+            y += h + self.PAD
+        self.canvas.config(height=y)
+        self.top.geometry(f"{self.W}x{int(y)}")
+        self.top.deiconify()
+        # 크기 변경이 실제로 반영된 뒤에 올린다 (바로 부르면 변경이 버려진다)
+        self.top.after_idle(self.raise_above)
+
+    def _press(self, e):
+        self._pressed = (e.x, e.y, e.x_root, e.y_root)
+        self._moved = False
+
+    def _drag(self, e):
+        """꾹 눌러 끌면 원하는 자리로 옮긴다."""
+        if self._pressed is None:
+            return
+        px, py, prx, pry = self._pressed
+        if not self._moved and abs(e.x_root - prx) + abs(e.y_root - pry) < 4:
+            return
+        self._moved = True
+        self.top.geometry(f"+{e.x_root - px}+{e.y_root - py}")
+
+    def _release(self, e):
+        if self._pressed is None:
+            return
+        if self._moved:
+            self.top.update_idletasks()      # 옮긴 좌표가 반영된 뒤 읽는다
+            self.on_move(self.top.winfo_rootx(), self.top.winfo_rooty())
+        # 왼쪽 버튼은 옮기기 전용 — 지우기는 우클릭 메뉴로만 (실수 방지)
+        self._pressed = None
+
+    def _at(self, x, y):
+        """그 자리에 있는 할 일 번호 (없으면 None)."""
+        for (x0, y0, x1, y1), idx in self.items:
+            if x0 <= x <= x1 and y0 <= y <= y1:
+                return idx
+        return None
+
+    def _menu(self, e):
+        """말풍선 우클릭 — 수정 / 완료 / 삭제 / 꼬리 방향."""
+        idx = self._at(e.x, e.y)
+        if idx is None:
+            return
+        m = tk.Menu(self.top, tearoff=0,
+                    font=(UI_FONT, self.MENU_FS))
+        if self.on_edit is not None:
+            m.add_command(label="수정", command=lambda: self.on_edit(idx))
+        m.add_command(label="완료", command=lambda: self.on_done(idx))
+        if self.on_delete is not None:
+            # 완료와 다르다 — 축하도 기록도 없이 목록에서만 뺀다
+            m.add_command(label="삭제", command=lambda: self.on_delete(idx))
+        m.add_separator()
+        m.add_command(label="꼬리 오른쪽으로" if self.flip else "꼬리 왼쪽으로",
+                      command=self._toggle_flip)
+        sub = tk.Menu(m, tearoff=0, font=(UI_FONT, self.MENU_FS))
+        for z in self.ZOOMS:
+            sub.add_command(label=("● " if z == self.zoom else "    ") + f"{z}%",
+                            command=lambda p=z: self.set_zoom(p))
+        m.add_cascade(label="크기 조절", menu=sub)
+        self._menu_ref = (m, sub)       # 파이썬이 메뉴를 먼저 치우지 않게
+        try:
+            m.tk_popup(e.x_root, e.y_root)
+        finally:
+            m.grab_release()
+
+    def _toggle_flip(self):
+        """꼬리 방향만 뒤집는다 — 글자는 그대로다(뒤집으면 읽을 수 없으니)."""
+        self.flip = not self.flip
+        if self.on_flip is not None:
+            self.on_flip(self.flip)
+
+    def _hwnd(self):
+        """이 창의 윈도우 핸들 (한 번 구해 두고 재사용)."""
+        if self._hwnd_cache is None:
+            try:
+                self._hwnd_cache = (int(self.top.wm_frame(), 16)
+                                    if IS_WIN else 0)
+            except Exception:
+                self._hwnd_cache = 0
+        return self._hwnd_cache
+
+    def raise_above(self):
+        """캐릭터 창보다 위로 올린다.
+
+        말풍선 창과 캐릭터 창이 둘 다 '항상 위'라, 캐릭터를 누르거나 창 순서가
+        한 번 뒤집히면 캐릭터가 말풍선을 덮어 할 일이 안 보인다. 그래서 자리를
+        잡을 때마다 다시 맨 앞으로 올려 둔다.
+        """
+        try:
+            if IS_WIN:
+                h = self._hwnd()
+                if h:
+                    # HWND_TOP(0), NOSIZE | NOMOVE | NOACTIVATE
+                    ctypes.windll.user32.SetWindowPos(
+                        h, 0, 0, 0, 0, 0, 0x1 | 0x2 | 0x10)
+                    return
+            self.top.lift()
+        except Exception:
+            pass
+
+    def place(self, x, y):
+        """본체 창 기준 저장된 자리에 붙인다 (끌어서 옮긴 위치)."""
+        if self._moved and self._pressed is not None:
+            return                      # 끄는 중에는 건드리지 않는다
+        try:
+            dx, dy = self.offset
+            self.top.geometry(f"+{int(x + dx)}+{int(y + dy)}")
+        except Exception:
+            pass
+        # 여기서 raise_above를 부르면 안 된다. Tk는 위치 변경을 미뤄 두었다가
+        # 나중에 적용하는데, 그 전에 SetWindowPos로 창을 직접 건드리면 미뤄 둔
+        # 이동이 버려져 말풍선이 캐릭터를 따라오지 못한다. z순서는 그리기
+        # 루프가 주기적으로 맞춘다.
+
+    def destroy(self):
+        try:
+            self.top.destroy()
+        except Exception:
+            pass
+
+
+def todo_text(item):
+    """할 일 한 칸의 글자. 예전 파일은 글자만 들어 있어서 둘 다 받는다."""
+    if isinstance(item, dict):
+        return str(item.get("t", ""))
+    return str(item)
+
+
+def todo_style(item):
+    """그 칸의 글자 꾸밈 — 굵기·기울임·크기 차이."""
+    if isinstance(item, dict):
+        try:
+            return (bool(item.get("b")), bool(item.get("i")),
+                    max(-4, min(8, int(item.get("s", 0) or 0))))
+        except (TypeError, ValueError):
+            return False, False, 0
+    return False, False, 0
+
+
+def todo_pack(text, bold, italic, size, runs=None):
+    """저장할 모양으로 만든다. 꾸밈이 없으면 예전처럼 글자만 남긴다.
+
+    runs는 [[글자수, 표시], ...] — 표시는 1=굵게, 2=기울임을 더한 값.
+    한 칸 안에서 일부만 굵게 한 경우에 쓴다. 통째로 같은 꾸밈이면 안 넣는다
+    (옛 버전에서도 읽히도록).
+    """
+    text = str(text)[:200]
+    runs = [[int(n), int(f)] for n, f in (runs or []) if int(n) > 0]
+    mixed = len({f for _n, f in runs}) > 1
+    if not (bold or italic or size or mixed):
+        return text
+    out = {"t": text, "b": bool(bold), "i": bool(italic), "s": int(size)}
+    if mixed:
+        out["r"] = runs
+    return out
+
+
+def todo_runs(item):
+    """[(글자, 굵게, 기울임)] — 구간별 꾸밈. 나뉘어 있지 않으면 한 덩어리."""
+    text = todo_text(item)
+    bold, italic, _s = todo_style(item)
+    if isinstance(item, dict) and item.get("r"):
+        out, i = [], 0
+        try:
+            for n, fl in item["r"]:
+                n, fl = int(n), int(fl)
+                seg = text[i:i + n]
+                i += n
+                if seg:
+                    out.append((seg, bool(fl & 1), bool(fl & 2)))
+            if i < len(text):                 # 저장된 길이가 모자라면 나머지
+                out.append((text[i:], bold, italic))
+            if out:
+                return out
+        except (TypeError, ValueError):
+            pass
+    return [(text, bold, italic)] if text else []
+
+
+def runs_pack(segs):
+    """[(글자, 굵게, 기울임)] → 저장용 [[글자수, 표시], ...] (같은 것끼리 합침)."""
+    out = []
+    for s, b, i in segs:
+        if not s:
+            continue
+        fl = (1 if b else 0) | (2 if i else 0)
+        if out and out[-1][1] == fl:
+            out[-1][0] += len(s)
+        else:
+            out.append([len(s), fl])
+    return out
+
+
+def run_font(bold, italic, base, size=0, k=1.0):
+    """구간 하나를 그릴 글꼴."""
+    name = ("bold " if bold else "") + ("italic" if italic else "")
+    return (UI_FONT, max(6, round((base + size) * k)),
+            name.strip() or "")
+
+
+def todo_font(item, base, k=1.0):
+    """그 칸을 그릴 글꼴."""
+    bold, italic, size = todo_style(item)
+    return run_font(bold, italic, base, size, k)
+
+
+def wrap_tokens(s):
+    """줄바꿈에 쓸 조각들 — 공백은 앞 낱말에 붙이고, 개행은 따로 낸다."""
+    out, buf = [], ""
+    for ch in s:
+        if ch == "\n":
+            if buf:
+                out.append(buf)
+            out.append("\n")
+            buf = ""
+        elif ch == " ":
+            out.append(buf + ch)
+            buf = ""
+        else:
+            buf += ch
+    if buf:
+        out.append(buf)
+    return out
+
+
+def _arc(center, point, deg):
+    """point를 center를 축으로 deg만큼 돌린 자리 (팔 길이는 그대로)."""
+    a = math.radians(deg)
+    vx, vy = point[0] - center[0], point[1] - center[1]
+    return (center[0] + vx * math.cos(a) - vy * math.sin(a),
+            center[1] + vx * math.sin(a) + vy * math.cos(a))
+
+
+class TrayIcon:
+    """윈도우 알림 영역(트레이)에 캐릭터 머리 아이콘을 올린다.
+
+    창이 테두리 없는 창이라 작업 표시줄에 안 잡히는데, 그러면 캐릭터를
+    화면 밖으로 밀어 놓았을 때 되찾을 방법이 없다. 트레이에 두면 언제든
+    부를 수 있다.
+
+    메시지 창과 메시지 루프는 별도 스레드에서 돈다. Tk 쪽 일은 직접
+    건드리지 않고 큐에 넣어, 그리기 루프가 꺼내 처리한다(다른 스레드에서
+    Tk를 만지면 터진다).
+    """
+    _CLASS = "EnaMascotTrayWnd"
+    _SEQ = 0                     # 한 프로세스에 여러 캐릭터가 떠도 안 겹치게
+    WM_TRAY = 0x0400 + 42        # WM_APP+42
+
+    def __init__(self, ico_path, tip, on_click, on_menu):
+        self.ok = False
+        if not IS_WIN:
+            return
+        self._ico, self._tip = ico_path, (tip or "")[:120]
+        self._on_click, self._on_menu = on_click, on_menu
+        self._hwnd = None
+        self._added = False
+        self._stop = False
+        self._t = threading.Thread(target=self._run, daemon=True)
+        self._t.start()
+        for _ in range(50):          # 창이 만들어질 때까지 잠깐 기다린다
+            if self._hwnd or self._stop:
+                break
+            time.sleep(0.02)
+        self.ok = bool(self._hwnd)
+
+    # ── 트레이 스레드 ────────────────────────────────────────────────
+    def _run(self):
+        import ctypes.wintypes as wt
+        u = ctypes.windll.user32
+        self._taskbar_msg = u.RegisterWindowMessageW("TaskbarCreated")
+
+        # 64비트에서는 반환값·핸들이 c_long에 안 들어간다. 형을 안 정하면
+        # DefWindowProc에 넘길 때 OverflowError가 나고 창이 먹통이 된다.
+        LRESULT = ctypes.c_ssize_t
+        WNDPROC = ctypes.WINFUNCTYPE(LRESULT, wt.HWND, wt.UINT,
+                                     wt.WPARAM, wt.LPARAM)
+        u.DefWindowProcW.argtypes = [wt.HWND, wt.UINT, wt.WPARAM, wt.LPARAM]
+        u.DefWindowProcW.restype = LRESULT
+        u.CreateWindowExW.restype = wt.HWND
+        u.RegisterClassW.restype = ctypes.c_ushort
+
+        def proc(hwnd, msg, wp, lp):
+            if msg == self.WM_TRAY:
+                low = lp & 0xFFFF
+                if low in (0x0202, 0x0203):          # 왼쪽 클릭 / 더블클릭
+                    self._safe_call(self._on_click)
+                elif low in (0x0205, 0x007B):        # 오른쪽 클릭
+                    self._safe_call(self._on_menu)
+                return 0
+            if msg == self._taskbar_msg:             # 탐색기가 다시 뜸
+                self._added = False
+                self._add()
+                return 0
+            if msg == 0x0002:                        # WM_DESTROY
+                u.PostQuitMessage(0)
+                return 0
+            return u.DefWindowProcW(hwnd, msg, wp, lp)
+
+        self._proc = WNDPROC(proc)                   # 참조를 붙잡아 둔다
+
+        class WNDCLASS(ctypes.Structure):
+            _fields_ = [("style", wt.UINT), ("lpfnWndProc", WNDPROC),
+                        ("cbClsExtra", ctypes.c_int),
+                        ("cbWndExtra", ctypes.c_int),
+                        ("hInstance", wt.HINSTANCE), ("hIcon", wt.HICON),
+                        ("hCursor", wt.HANDLE), ("hbrBackground", wt.HBRUSH),
+                        ("lpszMenuName", wt.LPCWSTR), ("lpszClassName", wt.LPCWSTR)]
+
+        try:
+            hinst = ctypes.windll.kernel32.GetModuleHandleW(None)
+            TrayIcon._SEQ += 1
+            name = f"{self._CLASS}{os.getpid()}_{TrayIcon._SEQ}"
+            wc = WNDCLASS()
+            wc.lpfnWndProc = self._proc
+            wc.hInstance = hinst
+            wc.lpszClassName = name
+            if not u.RegisterClassW(ctypes.byref(wc)):
+                # 1410 = 이미 등록된 클래스. 그 경우는 그대로 써도 된다.
+                if ctypes.windll.kernel32.GetLastError() != 1410:
+                    self._stop = True
+                    return
+            self._hwnd = u.CreateWindowExW(0, name, name, 0, 0, 0, 0, 0,
+                                           None, None, hinst, None)
+            if not self._hwnd:
+                self._stop = True
+                return
+            self._add()
+            msg = wt.MSG()
+            while u.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
+                u.TranslateMessage(ctypes.byref(msg))
+                u.DispatchMessageW(ctypes.byref(msg))
+        except Exception:
+            self._stop = True
+
+    def _safe_call(self, fn):
+        try:
+            fn()
+        except Exception:
+            pass
+
+    def _nid(self):
+        import ctypes.wintypes as wt
+
+        class NID(ctypes.Structure):
+            _fields_ = [("cbSize", wt.DWORD), ("hWnd", wt.HWND),
+                        ("uID", wt.UINT), ("uFlags", wt.UINT),
+                        ("uCallbackMessage", wt.UINT), ("hIcon", wt.HICON),
+                        ("szTip", wt.WCHAR * 128), ("dwState", wt.DWORD),
+                        ("dwStateMask", wt.DWORD), ("szInfo", wt.WCHAR * 256),
+                        ("uVersion", wt.UINT), ("szInfoTitle", wt.WCHAR * 64),
+                        ("dwInfoFlags", wt.DWORD),
+                        ("guidItem", ctypes.c_byte * 16),
+                        ("hBalloonIcon", wt.HICON)]
+        n = NID()
+        n.cbSize = ctypes.sizeof(NID)
+        n.hWnd = self._hwnd
+        n.uID = 1
+        return n
+
+    def _add(self):
+        u = ctypes.windll.user32
+        try:
+            hicon = u.LoadImageW(None, self._ico, 1, 0, 0, 0x00000010 | 0x00008000)
+            n = self._nid()
+            n.uFlags = 0x01 | 0x02 | 0x04            # MESSAGE | ICON | TIP
+            n.uCallbackMessage = self.WM_TRAY
+            n.hIcon = hicon
+            n.szTip = self._tip
+            if ctypes.windll.shell32.Shell_NotifyIconW(0, ctypes.byref(n)):
+                self._added = True
+        except Exception:
+            pass
+
+    def close(self):
+        if not (IS_WIN and self._hwnd):
+            return
+        try:
+            if self._added:
+                ctypes.windll.shell32.Shell_NotifyIconW(2, ctypes.byref(self._nid()))
+                self._added = False
+            ctypes.windll.user32.PostMessageW(self._hwnd, 0x0010, 0, 0)  # WM_CLOSE
+        except Exception:
+            pass
+
+
+def _end_anchors(im):
+    """팔 그림의 위·아래 접합점 (가장 위/아래 불투명 줄의 가로 한가운데)."""
+    a = im.split()[3]
+    bb = a.getbbox()
+    if not bb:
+        return (im.width / 2, 0.0), (im.width / 2, float(im.height))
+
+    def mid(y0, y1):
+        r = a.crop((0, y0, im.width, y1)).getbbox()
+        return (r[0] + r[2]) / 2 if r else im.width / 2
+
+    top, bot = bb[1], bb[3] - 1
+    return ((mid(top, min(top + 3, im.height)), float(top)),
+            (mid(max(top, bot - 2), bot + 1), float(bot)))
+
+
+ROLLOVER_HOURS = 6           # 작업일 경계 기본값 — 새벽 6시 이전은 전날로 친다
+
+
+def _workday(ts=None, hour=ROLLOVER_HOURS):
+    """그 시각이 속한 작업일 (YYYY-MM-DD).
+
+    hour 이전이면 전날로 친다. 0으로 두면 달력 날짜 그대로.
+    """
+    t = time.localtime((ts if ts is not None else time.time()) - hour * 3600)
+    return time.strftime("%Y-%m-%d", t)
+
+
+def screen_dpi():
+    """주 화면의 가로 DPI. 그린 픽셀을 미터로 바꿀 때 쓴다. 실패하면 96."""
+    if not IS_WIN:
+        return 96
+    try:
+        u = ctypes.windll.user32
+        hdc = u.GetDC(0)
+        dpi = ctypes.windll.gdi32.GetDeviceCaps(hdc, 88)   # LOGPIXELSX
+        u.ReleaseDC(0, hdc)
+        return dpi or 96
+    except Exception:
+        return 96
+
+
+def _screen_scale(root=None):
+    """화면 배율 (150% 화면이면 1.5).
+
+    Tk의 winfo_fpixels로 재면 두 가지에 걸린다 — scaling을 고정한 뒤에는 그
+    값이 되돌아오고, 한 프로세스에서 창을 두 번째로 만들면 앞서 고정한 값이
+    새어 96으로 나온다. 그래서 윈도우에 직접 물어본다.
+    """
+    if IS_WIN:
+        u = ctypes.windll.user32
+        try:                                  # 창이 놓인 모니터 기준 (가장 정확)
+            if root is not None:
+                hwnd = int(root.wm_frame(), 16)
+                dpi = u.GetDpiForWindow(hwnd)
+                if dpi:
+                    return max(1.0, min(3.0, dpi / 96.0))
+        except Exception:
+            pass
+        try:
+            dpi = u.GetDpiForSystem()
+            if dpi:
+                return max(1.0, min(3.0, dpi / 96.0))
+        except Exception:
+            pass
+    try:
+        if root is not None:
+            return max(1.0, min(3.0, root.winfo_fpixels("1i") / 96.0))
+    except Exception:
+        pass
+    return 1.0
+
+
+HELLO_FILE = ".hello"        # 두 번째로 실행됐다는 신호 (먼저 뜬 캐릭터가 읽는다)
+
+
+def already_running(char):
+    """같은 캐릭터가 이미 떠 있으면 True. 실패하면 False(그냥 실행).
+
+    이 프로세스가 이미 자물쇠를 쥐고 있으면 False다. 안 그러면 같은
+    프로세스에서 두 번 물었을 때 자기 자신을 보고 '이미 떠 있다'고 답한다.
+    """
+    if not IS_WIN:
+        return False
+    if globals().get("_INSTANCE_LOCK"):
+        return False
+    try:
+        name = "ena-mascot-" + str(char)
+        k = ctypes.windll.kernel32
+        k.CreateMutexW.restype = ctypes.c_void_p
+        h = k.CreateMutexW(None, False, name)
+        if not h:
+            return False
+        if k.GetLastError() == 183:        # ERROR_ALREADY_EXISTS
+            return True
+        globals()["_INSTANCE_LOCK"] = h    # 프로세스가 살아 있는 동안 유지
+    except Exception:
+        return False
+    return False
+
+
+def release_instance_lock():
+    """중복 실행 자물쇠를 놓는다 — 스스로 다시 켤 때만 쓴다.
+
+    안 놓고 새 프로세스를 띄우면, 새 쪽이 '이미 떠 있다'고 보고 물러난 뒤
+    이쪽이 닫혀서 캐릭터가 통째로 사라진다.
+    """
+    h = globals().pop("_INSTANCE_LOCK", None)
+    if not h:
+        return
+    try:
+        ctypes.windll.kernel32.CloseHandle(ctypes.c_void_p(h))
+    except Exception:
+        pass
+
+
+def say_hello(state_dir):
+    """이미 떠 있는 캐릭터에게 '나를 또 눌렀어'라고 알린다.
+
+    바로가기를 두 번 누르는 일이 잦은데, 조용히 꺼지면 사람은 '안 켜졌다'고
+    보고 계속 누른다. 먼저 뜬 캐릭터가 이 파일을 보고 대답하게 한다.
+    """
+    try:
+        _save_json(os.path.join(state_dir, HELLO_FILE), {"ts": time.time()})
+    except Exception:
+        pass
+
+
+# ── 같이 작업하는 방 (홈) ─────────────────────────────────────────────
+# 이 열쇠는 공개를 전제로 만들어진 것이다(publishable). 표를 직접 만지는 길은
+# 서버에서 막아 두었고, 부를 수 있는 것은 함수 네 개뿐이다.
+ROOM_URL = "https://cfoweblkseqhastxidrm.supabase.co"
+ROOM_KEY = "sb_publishable_yjqS78ZmLj2VrWS2P49L8w__XRf_GLI"
+ROOM_HOME = "ena-mascot-home-2026"   # 코드를 안 넣었을 때 들어가는 '홈'
+ROOM_MAX = 12                        # 한 방에 보여 줄 최대 인원
+
+
+def _rgb_to_hls(r, g, b):
+    """RGB(0~1) → 색상·밝기·선명도.
+
+    colorsys 를 부르지 않는다. 선물본(exe·맥 앱)은 굳혀 만들기 때문에
+    굳힐 당시 아무도 안 부르던 표준 모듈은 안 들어간다 — hmac 이 없어
+    사가의 맥 앱이 아예 안 켜진 일이 있었다. 계산식은 colorsys 와 같아
+    결과도 같다.
+    """
+    hi, lo = max(r, g, b), min(r, g, b)
+    ll = (hi + lo) / 2.0
+    if hi == lo:
+        return 0.0, ll, 0.0
+    d = hi - lo
+    sat = d / (hi + lo) if ll <= 0.5 else d / (2.0 - hi - lo)
+    rc, gc, bc = (hi - r) / d, (hi - g) / d, (hi - b) / d
+    if r == hi:
+        h = bc - gc
+    elif g == hi:
+        h = 2.0 + rc - bc
+    else:
+        h = 4.0 + gc - rc
+    return (h / 6.0) % 1.0, ll, sat
+
+
+def _hls_v(m1, m2, hue):
+    hue = hue % 1.0
+    if hue < 1.0 / 6.0:
+        return m1 + (m2 - m1) * hue * 6.0
+    if hue < 0.5:
+        return m2
+    if hue < 2.0 / 3.0:
+        return m1 + (m2 - m1) * (2.0 / 3.0 - hue) * 6.0
+    return m1
+
+
+def _hls_to_rgb(h, ll, sat):
+    """색상·밝기·선명도 → RGB(0~1). colorsys 와 같은 계산식."""
+    if sat == 0.0:
+        return ll, ll, ll
+    m2 = ll * (1.0 + sat) if ll <= 0.5 else ll + sat - (ll * sat)
+    m1 = 2.0 * ll - m2
+    return (_hls_v(m1, m2, h + 1.0 / 3.0), _hls_v(m1, m2, h),
+            _hls_v(m1, m2, h - 1.0 / 3.0))
+
+
+_JOSA_PAIR = {"이/가": ("이", "가"), "은/는": ("은", "는"),
+              "을/를": ("을", "를"), "과/와": ("과", "와"),
+              "아/야": ("아", "야"), "으로/로": ("으로", "로")}
+
+# 숫자를 읽었을 때 받침이 남는가 (영·일·삼·육·칠·팔)
+_JOSA_NUM = {"0": True, "1": True, "2": False, "3": True, "4": False,
+             "5": False, "6": True, "7": True, "8": True, "9": False}
+
+# 영문을 옮겨 적었을 때 끝소리가 받침이 되는 글자 (cat→캣, book→북)
+_JOSA_ABC = set("bcdfgjklmnpqstvxz")
+
+
+def _josa_bat(word):
+    """마지막 글자에 받침이 있는가 — (받침 있음, ㄹ 받침) 을 돌려준다.
+
+    이모지·괄호처럼 소리를 알 수 없는 글자는 건너뛰고 앞으로 간다.
+    끝까지 못 가리면 받침 없는 쪽으로 둔다 ('가·를' 이 덜 어색하다).
+    """
+    for ch in reversed((word or "").strip()):
+        o = ord(ch)
+        if 0xAC00 <= o <= 0xD7A3:              # 한글 음절
+            jong = (o - 0xAC00) % 28
+            return (jong != 0, jong == 8)
+        if ch in _JOSA_NUM:
+            return (_JOSA_NUM[ch], ch in "178")   # 일·칠·팔은 ㄹ 받침
+        low = ch.lower()
+        if "a" <= low <= "z":
+            return (low in _JOSA_ABC, low == "l")
+    return (False, False)
+
+
+def _josa(word, kind="이/가"):
+    """이름에 조사를 붙여 돌려준다. 빈 이름이면 그대로 둔다.
+
+    '도로롱가 콕 찔렀어요' 처럼 받침을 안 보고 붙이면 어색하다.
+    """
+    word = "" if word is None else str(word)
+    if not word.strip():
+        return word
+    withb, nob = _JOSA_PAIR.get(kind, ("이", "가"))
+    bat, rieul = _josa_bat(word)
+    if rieul and kind == "으로/로":            # '서울로' — ㄹ 뒤에는 '로'
+        bat = False
+    return word + (withb if bat else nob)
+
+
+def _hmac_sha256(key, msg):
+    """HMAC-SHA256 — hashlib 만으로 만든다.
+
+    파이썬에 들어 있는 hmac 모듈을 쓰면 안 된다. 선물본(exe·맥 앱)은
+    PyInstaller 로 굳혀 만드는데, 굳힐 당시에 아무도 안 부르던 모듈은
+    아예 안 들어간다. 홈 기능에서 처음 hmac 을 부르자 사가의 맥 앱이
+    'No module named hmac' 으로 **켜지지도 않았다** (맥 런처는 코드를
+    읽어 들이는 단계를 감싸지 않아 창조차 안 뜬다).
+
+    표준 규격 그대로라 결과 바이트는 hmac 모듈과 똑같다.
+    """
+    if len(key) > 64:
+        key = hashlib.sha256(key).digest()
+    key = key + b"\x00" * (64 - len(key))
+    inner = hashlib.sha256(bytes(b ^ 0x36 for b in key) + msg).digest()
+    return hashlib.sha256(bytes(b ^ 0x5C for b in key) + inner).digest()
+
+
+def _ct_eq(a, b):
+    """길이·내용을 시간차 없이 견준다 (hmac.compare_digest 대신)."""
+    if len(a) != len(b):
+        return False
+    diff = 0
+    for x, y in zip(a, b):
+        diff |= x ^ y
+    return diff == 0
+
+
+_SSL_CTX = [None]
+
+
+def _ssl_ctx():
+    """HTTPS 규칙 — 굳힌 맥 앱에는 시스템 인증서 묶음이 없다.
+
+    PyInstaller 로 만든 앱은 인증서를 못 찾아 모든 https 요청이
+    `CERTIFICATE_VERIFY_FAILED` 로 막힌다. 런처(`*_mac.py`)는 certifi 를
+    명시적으로 쓰는데 여기에는 그 처리가 없어서, **자동 업데이트는 되는데
+    홈만 안 되는** 상태였다 (사가가 몇 시간 동안 아무에게도 안 보인 원인).
+
+    certifi 가 없으면(윈도우 exe) 기본값을 쓴다 — 윈도우는 시스템 인증서가
+    있어서 그대로 잘 된다. 한 번 만들어 두고 계속 쓴다.
+    """
+    if _SSL_CTX[0] is None:
+        import ssl
+        try:
+            import certifi
+            _SSL_CTX[0] = ssl.create_default_context(cafile=certifi.where())
+        except Exception:
+            try:
+                _SSL_CTX[0] = ssl.create_default_context()
+            except Exception:
+                _SSL_CTX[0] = False        # 만들지 못함 — 그냥 기본값으로
+    return _SSL_CTX[0] or None
+
+
+def _room_keys(code):
+    """방 코드에서 '방 번호'와 '자물쇠'를 따로 뽑는다.
+
+    둘 다 코드에서 나오지만 서로 역산이 안 된다. 서버에는 방 번호만 가므로
+    코드 자체는 서버에 없다.
+    """
+    raw = str(code or ROOM_HOME).strip().encode("utf-8")
+    rid = _b64.urlsafe_b64encode(
+        _hmac_sha256(raw, b"room-id")).decode()[:22]
+    key = _hmac_sha256(raw, b"room-key")
+    return rid, key
+
+
+def _room_seal(key, obj):
+    """내용을 잠근다. 서버는 알아볼 수 없는 덩어리만 받는다.
+
+    잠그는 방식은 **표준 라이브러리 하나뿐이다.** 예전에는 cryptography 가
+    깔려 있으면 AES-GCM 을 쓰고 없으면 이 방식으로 물러났는데, 선물본 exe
+    에는 그 꾸러미가 안 들어 있어 형식이 두 갈래로 갈렸다. 그러면 서로의
+    덩어리를 못 열어, 같은 방에 앉아 있어도 '아직 안 켰어요'로 보인다.
+    쓰는 사람마다 환경이 다르므로 통신 형식은 늘 있는 것으로만 만든다.
+
+    잠그고 나서 서명한다(encrypt-then-MAC): 키스트림과 XOR 한 뒤,
+    nonce+본문에 HMAC-SHA256 을 찍어 앞 16바이트를 붙인다.
+    """
+    raw = json.dumps(obj, ensure_ascii=False, separators=(",", ":")).encode()
+    nonce = os.urandom(12)
+    ct = _room_xor(key, nonce, raw)
+    tag = _hmac_sha256(key, nonce + ct)[:16]
+    return _b64.b64encode(nonce + ct + tag).decode()
+
+
+def _room_open_blob(key, blob):
+    """잠긴 내용을 연다. 못 열면 None (남의 방 것이거나 코드가 다르다).
+
+    옛 판이 AES-GCM 으로 잠가 둔 것도 열 수 있게 두 방식을 다 해 본다.
+    아직 안 고쳐진 프로그램이 방에 남아 있을 수 있기 때문이다.
+    """
+    try:
+        data = _b64.b64decode(blob)
+        nonce, body = data[:12], data[12:]
+        ct, tag = body[:-16], body[-16:]
+        want = _hmac_sha256(key, nonce + ct)[:16]
+        if _ct_eq(tag, want):
+            return json.loads(_room_xor(key, nonce, ct).decode("utf-8"))
+        try:
+            from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+            raw = AESGCM(key).decrypt(nonce, body, None)
+        except Exception:
+            return None
+        return json.loads(raw.decode("utf-8"))
+    except Exception:
+        return None
+
+
+def _room_xor(key, nonce, data):
+    """cryptography 가 없을 때 쓰는 대체 — HMAC 키스트림과 XOR."""
+    out = bytearray()
+    i = 0
+    while len(out) < len(data):
+        out += _hmac_sha256(key, nonce + i.to_bytes(4, "big"))
+        i += 1
+    return bytes(a ^ b for a, b in zip(data, out))
+
+
+class RoomNet:
+    """방 서버와 주고받는 층 — 별도 스레드에서 돈다.
+
+    그리는 쪽은 절대 기다리지 않는다. 인터넷이 느려도 캐릭터는 그대로 돈다.
+    받은 것은 큐에 쌓아 두고 그리기 루프가 꺼내 간다. 큐를 새 목록으로
+    갈아 끼우면 스레드가 옛 목록에 계속 넣어 그때부터 한 줄도 안 들어온다
+    (지뢰 26) — 반드시 앞에서 꺼내 비운다.
+    """
+
+    BEAT = 5.0        # 내 자리를 알리는 간격 (서버는 3초에 한 번만 받는다)
+    LIST = 6.0        # 방 사람들을 받아 오는 간격
+    TAKE = 2.0        # 신호를 받아 오는 간격
+    # 홈 창이 닫혀 있을 때 쓰는 간격. 명단은 창이 떠 있을 때만 보는데도
+    # 6초마다 받아 오고 있었고, 그것이 전송량의 대부분이었다(실측 96%).
+    # 자리는 90초 안에만 알리면 남에게 보이고, 신호(콕·응원)는 늦으면
+    # 티가 나므로 조금만 늦춘다.
+    IDLE_BEAT = 30.0
+    IDLE_LIST = 120.0
+    IDLE_TAKE = 5.0   # 신호는 번호로 가져오니 늦어도 안 놓친다 (2분 남음).
+    # 8초였는데, 홈이 닫힌 채 받는 것이 대부분이라 체감 지연의 대부분이
+    # 여기였다. 5초로 줄이면 시간당 요청이 450 → 720번이지만 실측 통신량이
+    # 0.32MB/시간이라 여유가 크다.
+
+    def __init__(self, slot, code=None, state=None):
+        # 보낼 값은 **만들 때 같이 받는다.** 스레드가 __init__ 끝에서 바로
+        # 출발해 첫 바퀴를 돌기 때문에, 만든 뒤에 push 하면 이미 늦다.
+        # 첫 바퀴를 빈손으로 흘려보내면 그 바퀴가 멈췄을 때(맥 주소 조회)
+        # 두 번째 기회가 영영 안 온다 — 사가가 이 상태였다.
+        self.slot = str(slot)[:40]
+        self.room, self.key = _room_keys(code)
+        self._state = dict(state or {})
+        self._out = []            # 보낼 신호
+        self._done = []           # 서버가 받아 준 신호 (보낸 쪽 확인용)
+        self._roster = []         # 받은 사람들
+        self._events = []         # 받은 신호
+        self._lock = threading.Lock()
+        self._stop = False
+        self._after = 0
+        self.err = None           # 마지막 오류 (설정 화면에서 보여 준다)
+        self.ok_at = 0.0          # 마지막으로 성공한 시각
+        self.born = time.time()   # 언제 시작했나 (멈춤 판정에 쓴다)
+        self.idle = True          # 홈 창이 닫혀 있는가 (열면 바로 빨라진다)
+        self._wake = True         # 다음 바퀴에 곧바로 한 번씩 부른다
+        self._kick = False        # 보낼 신호가 생기면 잠을 깨운다
+        self.calls = 0            # 지금까지 서버를 부른 횟수 (검사·진단용)
+        self.fails = 0            # 그중 실패한 횟수
+        # 왜 방에 못 붙는지 사람이 알 수 있게 — 요청마다 결과를 적어 둔다.
+        # 요청이 성공하는데 자리가 0개면 방 번호가 다른 것이고, 자리는
+        # 받았는데 못 읽으면 코드가 다른 것이다. 그 둘을 갈라 준다.
+        self.stat = {"beat": "아직", "list": "아직", "take": "아직",
+                     "rows": 0, "read": 0, "mine": None}
+        self._th = threading.Thread(target=self._loop, daemon=True)
+        self._th.start()
+
+    # ── 바깥에서 부르는 것 ────────────────────────────────────────────
+    def push(self, state):
+        """내 상태를 갈아 끼운다 (보내는 것은 스레드가 알아서)."""
+        with self._lock:
+            self._state = dict(state)
+
+    def send(self, to_slot, kind, extra=None):
+        """콕 찌르기 같은 한 번짜리 신호. 다음 바퀴를 기다리지 않는다."""
+        with self._lock:
+            if len(self._out) < 8:
+                self._out.append((str(to_slot)[:40], str(kind)[:16], extra))
+        self._kick = True         # 바퀴 사이 잠(최대 1초)을 깨워 바로 보낸다
+
+    def take_sent(self):
+        """서버가 받아 준 신호를 꺼내 간다 (앞에서 꺼내 비운다 — 지뢰 26)."""
+        out = []
+        with self._lock:
+            while self._done:
+                out.append(self._done.pop(0))
+        return out
+
+    def drain(self):
+        """쌓인 것을 꺼내 간다 — (사람들, 신호들)."""
+        with self._lock:
+            people = list(self._roster)
+            evs = []
+            while self._events:
+                evs.append(self._events.pop(0))
+        return people, evs
+
+    def wake(self):
+        """홈을 열었을 때 — 기다리지 말고 곧바로 한 바퀴 돈다."""
+        self._wake = True
+
+    def close(self):
+        self._stop = True
+
+    # ── 스레드 ────────────────────────────────────────────────────────
+    def _rpc(self, fn, args, timeout=10):
+        # 갈아 끼운 뒤 옛 스레드가 멈춤에서 풀리면, 남은 요청을 마저 보내
+        # 옛 상태를 덮어쓴다. 닫힌 뒤에는 한 번도 더 부르지 않는다.
+        if self._stop:
+            raise RuntimeError("닫힘")
+        self.calls += 1
+        req = urllib.request.Request(
+            "%s/rest/v1/rpc/%s" % (ROOM_URL, fn),
+            data=json.dumps(args).encode("utf-8"),
+            headers={"apikey": ROOM_KEY,
+                     "Authorization": "Bearer " + ROOM_KEY,
+                     "Content-Type": "application/json",
+                     "User-Agent": "mascot-room"})
+        with urllib.request.urlopen(req, timeout=timeout,
+                                    context=_ssl_ctx()) as r:
+            body = r.read().decode("utf-8")
+        return json.loads(body) if body.strip() else None
+
+    def _loop(self):
+        t_beat = t_list = t_take = 0.0
+        while not self._stop:
+            now = time.time()
+            if self.idle:
+                i_beat, i_list, i_take = (self.IDLE_BEAT, self.IDLE_LIST,
+                                          self.IDLE_TAKE)
+            else:
+                i_beat, i_list, i_take = self.BEAT, self.LIST, self.TAKE
+            if self.stat.get("beat") != "보냄":
+                # 아직 한 번도 자리를 못 알렸다. 남에게는 안 켠 것으로
+                # 보이는 상태라, 느린 간격(30초)을 기다리지 않는다.
+                i_beat = min(i_beat, 5.0)
+            if self._wake:            # 홈을 막 열었다 — 기다리지 않는다
+                self._wake = False
+                t_beat = t_list = t_take = 0.0
+            before = self.calls          # 이 바퀴에서 실제로 뭔가 했는가
+            try:
+                if now - t_beat >= i_beat:
+                    t_beat = now
+                    with self._lock:
+                        st = dict(self._state)
+                    if st:
+                        self._rpc("room_beat",
+                                  {"p_room": self.room, "p_slot": self.slot,
+                                   "p_blob": _room_seal(self.key, st)})
+                        self.stat["beat"] = "보냄"
+                    else:
+                        self.stat["beat"] = "보낼 값이 아직 없음"
+                with self._lock:
+                    out, self._out[:] = list(self._out), []
+                for to, kind, extra in out:
+                    self._rpc("room_send",
+                              {"p_room": self.room, "p_to": to,
+                               "p_blob": _room_seal(
+                                   self.key, {"f": self.slot, "k": kind,
+                                              "x": extra})})
+                    # 서버가 받아 준 것만 적는다 — 눌렀다고 세면 '갔는지'를
+                    # 확인하는 뜻이 없어진다.
+                    with self._lock:
+                        if len(self._done) < 60:
+                            self._done.append((to, kind))
+                if now - t_list >= i_list:
+                    t_list = now
+                    rows = self._rpc("room_list", {"p_room": self.room}) or []
+                    got = []
+                    for r in rows:
+                        d = _room_open_blob(self.key, r.get("blob", ""))
+                        if not isinstance(d, dict):
+                            continue      # 코드가 다른 사람 — 못 읽는 게 맞다
+                        d["slot"] = r.get("slot", "")
+                        d["age"] = int(r.get("age_sec") or 0)
+                        got.append(d)
+                    self.stat["rows"] = len(rows)
+                    self.stat["read"] = len(got)
+                    # 서버는 조건이 안 맞으면 아무 일도 안 하고 성공으로
+                    # 돌아온다. 내 자리가 명단에 있는지 봐야 진짜 알 수 있다.
+                    self.stat["mine"] = any(r.get("slot") == self.slot
+                                            for r in rows)
+                    self.stat["list"] = ("%d자리 받아서 %d개 읽음"
+                                         % (len(rows), len(got)))
+                    with self._lock:
+                        self._roster = got[:ROOM_MAX]
+                if now - t_take >= i_take:
+                    t_take = now
+                    rows = self._rpc("room_take",
+                                     {"p_room": self.room, "p_slot": self.slot,
+                                      "p_after": self._after}) or []
+                    self.stat["take"] = "%d개" % len(rows)
+                    for r in rows:
+                        self._after = max(self._after, int(r.get("id") or 0))
+                        d = _room_open_blob(self.key, r.get("blob", ""))
+                        if isinstance(d, dict) and d.get("f") != self.slot:
+                            with self._lock:
+                                if len(self._events) < 30:
+                                    self._events.append(d)
+                # **한 번이라도 실제로 통했을 때만** 성공으로 친다.
+                # 아무 일도 안 한 바퀴까지 성공으로 치면, 다 실패하고 있어도
+                # 화면에는 '방금 통했다'로 보인다 (사가 사례 — 75번 실패하는
+                # 동안 계속 '통신 0초'였다).
+                if self.calls > before:
+                    self.err = None
+                    self.ok_at = now
+            except Exception as e:
+                self.fails += 1
+                self.err = "%s: %s" % (type(e).__name__, str(e)[:80])
+            for _ in range(10):           # 0.1초씩 나눠 자야 빨리 닫힌다
+                if self._stop:
+                    return
+                if self._kick:            # 보낼 신호가 생겼다 — 바로 일어난다
+                    self._kick = False
+                    break
+                time.sleep(0.1)
+
+
+class Mascot:
+    # 타이머 카드가 잘리지 않는 최소 창 폭 (카드 200 + 그림자·여백)
+    CARD_MIN_W = 210
+
+    def __init__(self, char_dir="parts", preview=False, state_dir=None):
+        self.ox = 0.0                # 창이 카드 때문에 넓어진 만큼 캐릭터를 민다
+        self.char_arg = char_dir
+        self.dir = os.path.join(HERE, char_dir)
+        self.char = os.path.basename(char_dir)
+        # 설정·타이머 기록 저장 위치 (자동 업데이트로 교체되지 않는 곳으로 분리 가능)
+        self.state_dir = state_dir or self.dir
+        os.makedirs(self.state_dir, exist_ok=True)
+        _CRASH_DIR[0] = self.state_dir      # 여기서부터는 기록을 남길 수 있다
+        self._boot_step("시작")
+        # 같은 캐릭터가 이미 떠 있으면 여기서 물러난다. 둘이 같이 뜨면 두
+        # 프로세스가 같은 기록 파일에 번갈아 써서 작업 시간·할 일이 서로를
+        # 덮어쓴다 (나중에 닫힌 쪽이 이긴다). 그냥 꺼지면 사람은 안 켜진 줄
+        # 알므로, 먼저 뜬 쪽이 대답하도록 신호를 남기고 끝낸다.
+        if not preview and already_running(self.char):
+            say_hello(self.state_dir)
+            raise SystemExit(0)
+        # 업데이트가 끊겨 파츠가 섞였으면 복구 (알림 신호도 여기서 남는다).
+        # 인터넷·파일 문제로 터져도 프로그램은 떠야 한다 — 런처는
+        # Mascot(...) 을 감싸지 않아서, 여기서 터지면 아무것도 안 뜬다.
+        try:
+            repair_parts(self.dir, self.state_dir)
+        except Exception:
+            self._log_boot("repair_parts")
+        self._boot_step("파츠 복구 지남")
+        with open(os.path.join(self.dir, "config.json"), encoding="utf-8") as fp:
+            self.cfg = json.load(fp)
+        self._boot_step("config 읽음")
+        # 글꼴은 창을 만들기 전에 등록해야 한다 (파츠에 실려 자동 배포됨)
+        load_ui_font(self.dir)
+
+        # 사용자 환경설정 (config 기본값 위에 덮어씀)
+        tcfg = self.cfg.get("timer") or {}
+        self.us = dict(DEFAULT_SETTINGS)
+        self.us["idle_sec"] = float(tcfg.get("idle_sec", self.us["idle_sec"]))
+        self.settings_path = os.path.join(self.state_dir, ".settings.json")
+        self._font_pct_saved = False
+        try:
+            with open(self.settings_path, encoding="utf-8") as fp:
+                saved = json.load(fp)
+            self._font_pct_saved = "font_pct" in saved
+            self.us.update(saved)
+            # 목록을 손대지 않고 예전 기본값 그대로 쓰던 사람은 새 목록으로.
+            # 직접 고친 사람은 건드리지 않는다.
+            if str(self.us.get("work_apps", "")).strip() == OLD_WORK_APPS:
+                self.us["work_apps"] = DEFAULT_SETTINGS["work_apps"]
+            self._font_v2_needed = ("font_pct" in saved
+                                    and not saved.get("font_v2"))
+        except Exception:
+            pass
+        # 설정 때문에 못 켜지는 일은 없어야 한다. 한 번 터지면 다음에 켜도
+        # 같은 파일을 또 읽어 영영 안 켜진다 (런처에 되돌릴 길이 없다).
+        try:
+            self._font_migrate()
+            self._sanitize_settings()
+        except Exception:
+            self._log_boot("settings")
+            keep = self.us.get("room_nick"), self.us.get("room_code")
+            self.us = dict(DEFAULT_SETTINGS)
+            if isinstance(keep[0], str):
+                self.us["room_nick"] = keep[0]
+            if isinstance(keep[1], str):
+                self.us["room_code"] = keep[1]
+        # 그림자는 켜 둔 모습이 기본이다. 예전에 꺼 둔 채로 저장된 사람도
+        # 한 번은 켜 준다 — 딱 한 번만이라, 그 뒤에 다시 끄면 꺼진 채로 둔다.
+        if not self.us.get("shadow_on"):
+            self.us["shadow_on"] = True
+            self.us["shadow"] = True
+            self._save_settings()
+
+        # 패션(스킨) 슬롯 — 파츠만 다른 폴더에서 읽고 설정·기록은 그대로 공유
+        self.skins = self.cfg.get("skins") or [{"name": "기본", "dir": ""}]
+        self.skin_names = [s.get("name") or f"슬롯 {i + 1}"
+                           for i, s in enumerate(self.skins)]
+        want = self.us.get("skin")
+        idx = self.skin_names.index(want) if want in self.skin_names else 0
+        sub = (self.skins[idx].get("dir") or "").strip()
+        self.skin_name = self.skin_names[idx]
+        self.parts_dir = os.path.join(self.dir, *sub.split("/")) if sub else self.dir
+        if not os.path.exists(os.path.join(self.parts_dir, "layout.json")):
+            self.parts_dir, self.skin_name = self.dir, self.skin_names[0]
+        self.us["skin"] = self.skin_name
+        with open(os.path.join(self.parts_dir, "layout.json"), encoding="utf-8") as fp:
+            self.layout = json.load(fp)
+        # 파츠 자리 미세 보정 (캔버스 px). layout.json은 PSD에서 다시 뽑을 때마다
+        # 덮어써지므로, 손으로 맞춘 값은 config에 둬야 남는다.
+        for name, off in (self.cfg.get("part_offsets") or {}).items():
+            spot = self.layout.get(name)
+            if isinstance(spot, dict) and spot.get("pos"):
+                spot["pos"] = [spot["pos"][0] + off[0], spot["pos"][1] + off[1]]
+        # 펜이 닿는 영역은 책상 그림에 붙은 값이라, 옷마다 책상 자리가
+        # 조금 다르면 옷별로 따로 둬야 한다 (안 그러면 그 옷에서만 펜이 밀린다).
+        # skins 항목의 screen_quad가 있으면 그것을 쓰고, 없으면 공용 값.
+        self._quad_src = (self.skins[idx].get("screen_quad")
+                          if self.skin_name == self.skin_names[idx] else None) \
+            or self.cfg["screen_quad"]
+
+        s = self.s = float(self.cfg.get("scale", 1.0)) * self.us["scale_pct"] / 100.0
+        self.timer_on = bool(tcfg.get("enabled")) \
+            if self.us["show_timer"] is None else bool(self.us["show_timer"])
+        self.idle_thr = float(self.us["idle_sec"])
+        self._settings_win = None
+
+        # 타이머 카드 테마 (캐릭터별 config의 card 섹션)
+        cc = self.cfg.get("card") or {}
+        self.card = {
+            "bg": cc.get("bg", "#ffffff"), "border": cc.get("border", CARD_BORDER),
+            "text": cc.get("text", CARD_NAVY), "sub": cc.get("sub", CARD_GRAY),
+            "track": cc.get("track", CARD_TRACK), "fill": cc.get("fill", CARD_FILL),
+            "deco": cc.get("deco", "panda"),
+            # 설정·브리핑 창 배경 (캐릭터 테마에 맞춰 바꿀 수 있게)
+            "panel": cc.get("panel", "#fffdfe"),
+            "soft": cc.get("soft", "#fbf3f7"),
+            "line": cc.get("line", "#f0e6ec"),
+        }
+
+        # 워크스페이스 워크타이머 연동 (config의 workspace_timer = 라이브 파일 경로)
+        # 연동 모드 = 게이지 대신 시계 토글 카드. 비연동(준사) = 목표 게이지 카드.
+        ws = self.cfg.get("workspace_timer")
+        self.ws_path = os.path.normpath(os.path.join(HERE, ws)) if ws else None
+        self._ws_data = None
+        self._ws_read = 0.0
+        self._ws_lost = False        # 기존 타이머가 꺼져 자체 측정으로 넘어갔는지
+        self._solo_from = 0.0        # 혼자 재기 시작한 시점의 누적 시간
+        # ── 스트레칭 알림 (누를 때까지 안 꺼진다) ────────────────────────
+        self.stretch_pending = False # 알림이 아직 살아 있는가
+        self.stretch_shown = 0.0     # 화면에 실제로 보인 시간 (안 보이면 안 흐름)
+        self.stretch_replay = 0.0    # 다음으로 기지개를 다시 켤 시각
+        self._stretch_line = ""      # 알림 말풍선 문구
+        self._stretch_last = 0.0     # 지난 프레임 시각 (보인 시간 계산용)
+        self._stretch_hover = False  # 커서가 캐릭터 위에 있는가
+        self._settings_open = None   # 환경설정에서 펼쳐 놓은 목록의 키
+        self._fb_msg = ""            # 건의 보내기 결과 문구
+        self._fb_last = 0.0          # 마지막으로 보낸 시각 (연타 방지)
+        self.zero_at = 0.0           # 작업 종료를 누른 시점의 누적 — 여기서부터 다시 센다
+        self.day_key = ""            # 지금 세고 있는 작업일
+        self.day_base = 0.0          # 그 작업일이 시작될 때의 누적
+        self._day_at = 0.0           # 마지막으로 날짜를 확인한 시각
+        self.lv_secs = 0.0           # 레벨용 누적 작업 시간 (줄어들지 않는다)
+        self._lv_seen = 0            # 마지막으로 알린 레벨 (0이면 아직 모름)
+        self._lv_work = None         # 직전 프레임의 누적 작업 시간 (증가분만 셈)
+        self._lv_save_at = 0.0       # 레벨을 마지막으로 저장한 시각
+        self.goal_cheered = ""       # 목표 달성을 축하한 작업일
+        # ── 마감 목록 (할 일 목록과 같은 말풍선 구조, 여러 개 등록) ──────
+        self.dues = []               # [{"name": ..., "date": "YYYY-MM-DD"}]
+        self.due_pos = None
+        self.due_flip = False
+        self.due_zoom = 100
+        self.due_panel = None
+        self._due_shown = ""         # 마지막으로 그린 날짜 (자정 넘으면 다시 그림)
+        self._beat_t = 0.0           # 살아있음 알림을 마지막으로 쓴 시각
+        self._pid_written = False    # PID 파일을 남겼는가
+        self._hello_at = 0.0         # 또 실행됐는지 마지막으로 살핀 시각
+        self._upd_q = []             # 새 소식 확인 스레드가 넣는다 (앞에서 꺼냄)
+        self._upd_at = 0.0           # 마지막으로 확인한 시각 (0이면 아직)
+        self._upd_start = time.time()   # 첫 확인은 켠 뒤 조금 있다가
+        self._upd_busy = False       # 확인하는 중인가
+        self._upd_restart = False    # 받아야 할 새 버전이 올라와 있는가
+        self._upd_etag = ""          # 지난번에 받은 표 (바뀐 것만 받으려고)
+        self._news_etag = ""         # 지난 안내 목록의 표
+        self._fs_at = 0.0            # 전체화면 여부를 마지막으로 물어본 시각
+        self._fs_hidden = False      # 전체화면 프로그램 때문에 비켜 있는가
+        self.has_clock = self.timer_on and self.ws_path is not None
+        self.clock_open = bool(self.us.get("clock_open")) if self.has_clock else False
+
+        self.font_k = 1.0        # 창을 만든 뒤 화면 배율을 보고 다시 정한다
+        self.oy = self._timer_oy()                  # 캐릭터 전체 y 오프셋
+        cw, ch = self.layout["canvas"]
+        self.cw_px, self.ch_px = round(cw * s), round(ch * s)
+        # 타이머 카드는 글자 크기 때문에 폭이 고정(200px)이라, 캐릭터를 작게
+        # 줄이면 창이 카드보다 좁아져 카드 양옆이 잘린다. 창을 카드가 들어갈
+        # 만큼은 넓혀 두고, 남는 폭만큼 캐릭터를 가운데로 민다(ox).
+        self.W = max(self.cw_px, self.CARD_MIN_W if self.timer_on else 0)
+        self.ox = (self.W - self.cw_px) / 2
+        self.H = self.ch_px + self.oy
+
+        self.root = tk.Tk()
+        globals()["_TK_ROOT"] = self.root      # 커서·화면 크기 조회용
+        # 글자 크기를 화면 배율과 무관하게 고정한다. Tk는 포인트로 지정한
+        # 글꼴을 화면 DPI에 맞춰 키우는데, 이 프로그램의 카드·말풍선·패널은
+        # 전부 픽셀 단위로 짜여 있어서 배율이 높은 화면에서는 글자만 커져
+        # 서로 겹친다(175%부터 '딴짓 중'과 시간이 포개짐). 96DPI 기준으로
+        # 못 박아 어느 화면에서도 설계한 그대로 나오게 한다.
+        self.ui_k = _screen_scale(self.root)
+        try:
+            self.root.tk.call("tk", "scaling", 96.0 / 72.0)
+        except Exception:
+            pass
+        # 처음 켜는 사람은 가장 큰 크기(100%)로 시작한다. 화면 배율에 맞춰
+        # 작게 시작하면 '더 키울 수 있다'는 것을 아예 모르고 쓰게 된다.
+        if not self._font_pct_saved:
+            self.us["font_pct"] = FONT_MAX
+        self.font_k = max(FONT_MIN / 100.0 * FONT_SPAN, min(
+            FONT_SPAN,
+            float(self.us.get("font_pct", 100)) / 100.0 * FONT_SPAN))
+        self._boot_step("설정·창 준비됨")
+        self.root.overrideredirect(True)
+        self.root.attributes("-topmost", bool(self.us["topmost"]))
+        # 투명 배경: 윈도우는 색상키, 맥은 Tk의 진짜 투명 속성
+        bg = TRANSPARENT
+        if IS_MAC:
+            bg = self._setup_mac_window()
+        else:
+            self.root.attributes("-transparentcolor", TRANSPARENT)
+        self.canvas_bg = bg
+        sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
+        self.ui_prefs_path = os.path.join(self.state_dir, ".ui_prefs.json")
+        self.win_pos = self._load_win_pos(sw, sh)
+        wx, wy = self.win_pos
+        self.root.geometry(f"{self.W}x{self.H}+{wx}+{wy}")
+
+        kw = {"bg": bg} if bg else {}
+        self.canvas = tk.Canvas(self.root, width=self.W, height=self.H,
+                                highlightthickness=0, **kw)
+        self.canvas.pack()
+        self._boot_step("캔버스 만듦")
+        if IS_MAC:                            # 제목 표시줄 제거 후 위치 재적용
+            self._mac_borderless()
+            self.root.geometry(f"{self.W}x{self.H}+{wx}+{wy}")
+
+        self._tw_cache = {}          # 상태 텍스트 폭 캐시 (캔버스로 측정)
+
+        # ── 할 일 메모 (config의 "todo") ─────────────────────────────────
+        self.todo_on = bool(self.cfg.get("todo"))
+        self.todos = []
+        self.todo_pos = None         # 본체 기준 패널 위치 (끌어서 옮긴 자리)
+        self.todo_flip = False       # 말풍선 꼬리가 왼쪽을 보는가
+        self.todo_zoom = 100         # 할 일 목록만의 배율 (우클릭 → 크기 조절)
+        self.todo_panel = None
+        self.todo_path = os.path.join(self.state_dir, ".todos.json")
+        if self.todo_on:
+            self._todo_load()
+            self.todo_panel = TodoPanel(self.root, self.card, bg,
+                                        self._todo_done, self._todo_moved,
+                                        self._todo_edit, self.todo_pos,
+                                        self.todo_flip, self._todo_flipped,
+                                        self.ui_k, self.todo_zoom,
+                                        self._todo_zoomed,
+                                        on_delete=self._todo_delete)
+            self.root.after(250, self._todo_refresh)   # 창 위치가 잡힌 뒤 배치
+
+        # ── 마감 목록 (config의 "deadline_on") ───────────────────────────
+        if self.cfg.get("deadline_on"):
+            self._due_load()
+            self.due_panel = TodoPanel(
+                self.root, self.card, bg, self._due_remove, self._due_moved,
+                self._due_edit,
+                self.due_pos or (self.W + 4, 0),   # 기본은 캐릭터 오른쪽
+                self.due_flip, self._due_flipped, self.ui_k, self.due_zoom,
+                self._due_zoomed)
+            self.due_panel._moved_by_user = bool(self.due_pos)
+            self.root.after(280, self._due_refresh)
+
+        # ── 귀여운 이벤트 (선물 캐릭터 전용 — config의 "fun") ────────────
+        self.fun = bool(self.cfg.get("fun"))
+        # 말풍선·클릭 반응만 따로 켤 수 있게 (fun을 켜면 자동 포함)
+        self.can_talk = bool(self.fun or self.cfg.get("poke")
+                             or self.cfg.get("records"))
+        self.can_cheer = bool(self.fun or self.cfg.get("records"))
+        self.bubble = None           # (텍스트, 사라질 시각)
+        self.particles = []          # 폭죽 조각 [x, y, vx, vy, 색, 수명]
+        self.hat_until = 0.0         # 고깔모자 표시 종료 시각
+        self.smile_until = 0.0       # 웃는 표정 종료 시각
+        self.celebrate_until = 0.0   # 축하 연출 종료 시각
+        # ── 제스처 (config의 "gestures") ──────────────────────────────────
+        # 값은 전부 여기서 초기화한다. 조건문 뒤에서 처음 만들면 draw() 중에
+        # 없는 이름을 찾다 예외가 나고, 캐릭터가 사라지고 그림자만 남는다.
+        self.gestures_on = bool(self.cfg.get("gestures"))
+        self.gest = None             # 진행 중인 동작 이름
+        self.gest_t0 = 0.0           # 시작 시각
+        self.gest_dur = 0.0          # 동작 길이(초)
+        self._g_dy = 0.0             # 이번 프레임 몸 전체 상하 이동
+        self._g_hdy = 0.0            # 이번 프레임 머리만 상하 이동 (끄덕임)
+        self._g_tilt = 0.0           # 이번 프레임 머리 기울기(도)
+        self._g_hands = None         # 이번 프레임 손 이동량 (없으면 평소대로)
+        self._g_eyes_shut = False    # 이번 프레임 눈을 감고 있는가 (기지개)
+        self._g_smile = False        # 이번 프레임 웃는 얼굴인가 (리듬 타기)
+        self.gest_groove_next = 0.0  # 다음 리듬 타기 시각
+        self.gest_stretch_next = 0.0 # 다음 기지개 시각
+        self.gest_wave_next = 0.0    # 작업 시작 인사 쿨다운
+        self._last_state = "idle"    # 지난 프레임의 타이머 상태
+        self.notes = []              # 음표 [x, y, vx, vy, 종류, 남은프레임, 총]
+        self._note_next = 0.0        # 다음 음표가 튀어나올 시각
+        self._note_left = 0          # 이번 리듬 타기에 남은 음표 수
+        self.fx_imgs = {}            # 종류별 파티클 그림 (음표·하트·땀…)
+        # 파티클을 진짜 반투명으로 그릴 수 있는가. 되면 부드럽게 옅어지고,
+        # 안 되면(맥) 픽셀을 솎아내는 옛 방식으로 돌아간다.
+        self._fx_soft = IS_WIN
+        self._fx = None              # 파티클 레이어 창 (처음 쓸 때 만든다)
+        self._doze_woke = False      # 이번 꾸벅에서 이미 깼는가
+        self._yawn_next = 0.0        # 다음 하품을 볼 수 있는 시각
+        self._doze_next = 0.0        # 다음 꾸벅
+        self._think_next = 0.0       # 다음 생각
+        self._sway_next = 0.0        # 다음 좌우 흔들기
+        self._heart_next = 0.0       # 다음 하트 (작업 중에만)
+        self._fail = {}              # 구역별 실패 횟수 (3회면 그 구역만 끔)
+        self._fail_at = {}           # 구역별 마지막 실패 시각 (한참 지나면 재시도)
+        self._sleeping = False       # 자는 중이면 프레임을 줄인다
+        # 기록 갱신 축하 — '오늘'의 기준은 시각이 아니라 한 세션
+        # (작업 시작 ~ '작업 종료' 버튼). 종료하면 새 세션으로 다시 센다.
+        self.rec = {"strokes": [], "focus": 0.0}
+        self._rec_prev_run = 0.0
+        self._rec_armed = True       # 이번 집중 구간에서 아직 축하 안 함
+        self._rec_next = 0.0         # 축하 쿨다운 (연달아 뜨지 않게)
+        (self._update_msg, self._update_notes,
+         self._update_link) = update_notice(self.dir,
+                                                             self.state_dir)
+        self._update_win = None      # 업데이트 안내 팝업 (한 번만)
+        self._dot_btn = None         # 안 본 업데이트 점 자리 (x, y, 반지름)
+        self._read_ver = None        # 어디까지 읽었는지 (파일에서 한 번만 읽음)
+        if not self._update_notes and not os.path.exists(
+                os.path.join(self.state_dir, UPDATE_READ)):
+            # 설치 직후 — 지난 소식을 '못 본 것'으로 세우지 않는다
+            self._safe("update_read", self._update_mark_read)
+        # 펜 추적 진단 (config의 pen_diag를 켠 캐릭터만). 어느 화면으로
+        # 판단하는지 파일에 남긴다 — 맥 다중 모니터 문제를 보려는 것.
+        self._diag_left = self.PEN_DIAG_MAX if self.cfg.get("pen_diag") else 0
+        self._diag_last = None       # 마지막으로 기록한 화면 사각형
+        # 머리 자리 진단 (config의 head_diag를 켠 캐릭터만)
+        self._hd_left = self.HEAD_DIAG_MAX if self.cfg.get("head_diag") else 0
+        self._hd_head = False        # 첫머리를 남겼는가
+        self._hd_at = 0.0
+        self._diag_at = 0.0          # 마지막으로 기록한 시각
+        self._room_born = time.time()   # 언제 켰나 (방 진단에 적는다)
+        self._room_retry = 0            # 통신층을 다시 시작한 횟수
+        self._room_retry_at = 0.0       # 마지막으로 다시 시작한 시각
+        self._diag_hist = []            # 방 진단 최근 기록 (흐름을 본다)
+        self.shadow_img_type = None  # 타자 자세용 그림자 (깃펜 없음)
+        self._shadow_base = None
+        self._shadow_typing = False
+        self._shadow_want = False    # 바꾸고 싶은 상태 (아직 확정 전)
+        self._shadow_since = 0.0     # 그 상태가 유지된 시각
+        self._shadow_swap = 0.0      # 마지막으로 실제 교체한 시각
+        self._pen_draw = None        # 펜 손을 머리 뒤에 그릴 때 쓰는 임시 보관
+        self._pet_drawn = []         # 이번 프레임에 그린 반려동물 (그림자용)
+        self._tick_after = None      # 예약해 둔 다음 프레임 (종료할 때 취소)
+        self._pet_sh_cache = {}
+        self._pet_sh_on = False
+        self._pet_sh_t = 0.0
+        self.click_bounce = 0.0      # 클릭 반응 튀어오름 종료 시각
+        self.pet_t0 = 0.0            # 반려동물 등장 시작(0=쉬는 중)
+        _now = time.time()
+        self.next_talk = _now + random.uniform(120, 300)
+        self._recent_talk = []       # 최근에 한 말 (연달아 반복 방지)
+        self.next_pet = _now + random.uniform(30, 80)   # 첫 인사는 좀 이르게
+        # 하루 브리핑용 집계
+        self.stat = {"work": 0.0, "other": 0.0, "idle": 0.0, "keys": 0,
+                     "strokes": 0, "best": 0.0, "_run": 0.0,
+                     "first": 0.0, "last": 0.0,
+                     # 작업 흔적 — 브리핑의 시계·거리 칸이 쓰는 값
+                     "clicks": 0,     # 끌지 않고 그냥 누른 횟수
+                     "undo": 0,       # Ctrl+Z
+                     "px": 0.0,       # 끌면서 지나간 픽셀 (거리로 환산)
+                     "runs": 0,       # 집중 구간 수
+                     "mins": [],      # 작업한 분(0~1439) — 시계에 칠할 자리
+                     "day": ""}       # mins가 가리키는 작업일
+        self._act = set()            # 위 mins의 작업용 사본 (빠른 추가)
+        self._drag_px = 0.0          # 지금 끌고 있는 획의 길이
+        self._drag_at = None         # 마지막 커서 자리
+        self._ctrl_on = False        # Ctrl을 누르고 있는가 (되돌리기 판정)
+
+        self.prop_name = None        # 이번 실행에 뽑힌 소품 (_load_parts가 채움)
+        self.prop_dir = self.parts_dir   # 소품 PNG를 읽을 폴더
+        self._prop_layout = self.layout  # 소품 좌표가 든 layout
+        self._back_cache = {}        # 몸 뒤 파츠 움직임 프레임 (칸별로만 만든다)
+        # 파츠별 움직임 상태 — 기뽀처럼 기본 날개와 소품 날개가 같이 있을 때
+        # 서로 다른 박자로 움직이도록 이름별로 따로 든다
+        self._back_st = {}
+        self._prop_back_cfg = {}     # 뽑힌 소품의 뒤쪽 조각 움직임 설정
+        self._load_parts()
+
+        # 상태 변수는 한곳에 모아 둔다. 새 값을 넣을 자리를 헤매지
+        # 않도록, 그리고 '반드시 __init__ 에서 초기화'(지뢰 14)를
+        # 지키기 쉽도록.
+        self._init_state()
+        # ── 창 드래그 이동 / 카드 클릭 토글 / 우클릭 메뉴 ────────────────
+        self._press = None
+        self._dragged = False
+        self.canvas.bind("<Button-1>", self._on_press)
+        self.canvas.bind("<B1-Motion>", self._on_drag)
+        self.canvas.bind("<ButtonRelease-1>", self._on_release)
+        menu = tk.Menu(self.root, tearoff=0, font=self._uf(9))
+        # 작업 종료는 카드에서 뺐으므로 여기가 유일한 통로다. 맨 위에 두고
+        # 색과 굵기로 다른 항목과 구분한다 — 하루를 끝내는, 되돌릴 수 없는
+        # 동작이라 다른 것과 같은 모양이면 눈에 안 들어온다.
+        if self.timer_on:
+            # 파스텔 테마에서도 흰 글자가 읽히도록 카드색을 조금 어둡게 쓴다
+            _bg = self._shade(self.card["fill"], 0.22)
+            menu.add_command(label="  작업 종료  ", command=self._end_workday,
+                             font=self._uf(9, True),
+                             foreground="#ffffff", background=_bg,
+                             activeforeground="#ffffff",
+                             activebackground=self._shade(_bg, 0.25))
+            menu.add_separator()
+        if self.todo_on:
+            menu.add_command(label="할 일 추가", command=self.add_todo)
+        if self.cfg.get("deadline_on"):
+            menu.add_command(label="마감 추가", command=self.add_due)
+        if self._yt_on():
+            menu.add_command(label="유튜브 노래", command=self.add_music)
+        if self.cfg.get("slime"):
+            # 꺼내기/치우기와 종류 고르기를 '슬라임' 하나로 모은다.
+            # 켬/끔은 체크 표시로, 종류는 라디오로 지금 상태가 보이게.
+            sub = tk.Menu(menu, tearoff=0, font=self._uf(9))
+            self._slime_on_var = tk.BooleanVar(value=False)
+            sub.add_checkbutton(label="꺼내 놓기", variable=self._slime_on_var,
+                                command=self._slime_toggle)
+            if len(self.slime_kinds) > 1:
+                sub.add_separator()
+                self._slime_kind_var = tk.StringVar(
+                    value=self.us.get("slime_kind") or "")
+                for _k in self.slime_kinds:
+                    # 기본 인자로 지금 값을 붙잡는다 (안 그러면 마지막 것만 걸린다)
+                    sub.add_radiobutton(
+                        label=_k, value=_k, variable=self._slime_kind_var,
+                        command=lambda n=_k: self._slime_set_kind(n))
+            menu.add_cascade(label="슬라임", menu=sub)
+            self._slime_menu = sub
+        if self.todo_on or self.cfg.get("deadline_on") or self._yt_on():
+            menu.add_separator()
+        if ROOM_URL and ROOM_KEY:
+            # 작업 종료처럼 색을 깔아 눈에 띄게 둔다. 다만 한 단계 옅게 —
+            # 되돌릴 수 없는 '작업 종료'가 여전히 가장 세 보여야 한다.
+            _hb = self._tint(self.card["fill"], 0.62)
+            menu.add_command(label="  홈  ", command=self._room_toggle,
+                             font=self._uf(9, True),
+                             foreground=self._shade(self.card["fill"], 0.35),
+                             background=_hb,
+                             activeforeground="#ffffff",
+                             activebackground=self._shade(
+                                 self.card["fill"], 0.22))
+        menu.add_command(label="환경설정", command=self.open_settings)
+        if self.cfg.get("update_dot"):
+            menu.add_command(label="업데이트 소식", command=self.open_update_news)
+        if self.has_clock:
+            menu.add_command(label="시계 펼치기 / 접기", command=self._toggle_clock)
+        if (self.timer_on and self.ws_path is None
+                and self.cfg.get("reset_menu", False)):
+            # 초기화는 기본 숨김 — 작업 종료의 '새로 시작'과 겹친다.
+            # 필요한 캐릭터만 config 의 reset_menu 로 켠다.
+            menu.add_command(label="타이머 초기화", command=self._timer_reset)
+        if self.timer_on and self.ws_path is None:
+            # 복구는 남긴다 — 실수로 날린 기록을 되살리는 길
+            menu.add_command(label="타이머 복구",
+                             command=lambda: self._safe(
+                                 "unreset", self._timer_unreset))
+        menu.add_separator()
+        menu.add_command(label="종료", command=self.close)
+        self._menu = menu            # 트레이 아이콘에서도 같은 메뉴를 쓴다
+        # grab_release를 안 하면 메뉴를 닫은 뒤에도 마우스를 붙잡고 있어
+        # 다음 클릭이 엉뚱하게 먹힌다
+        def _pop(e):
+            # 메뉴는 켤 때 한 번만 만든다. 지금 상태(꺼내 놨는지·어떤 종류인지)는
+            # 띄우기 직전에 맞춰 준다 — 안 그러면 처음 값에 굳어 있다.
+            self._safe("slime_menu_sync", self._slime_menu_sync)
+            self._menu_popup(e.x_root, e.y_root)
+
+        self.canvas.bind("<Button-3>", _pop)
+        self.tray = None
+        self._tray_q = []            # 트레이 스레드가 넣고 그리기 루프가 뺀다
+        self._safe("tray", self._tray_setup)
+        self._safe("winicon", self._set_win_icon)
+        # 바탕화면 스티커 — 저장해 둔 것을 띄운다 (안 쓰는 캐릭터면 그냥 지나감)
+        self._stk = None
+        self._stk_after = None
+        if self._stickers_on():
+            # 예약해 둔 것은 닫을 때 거둔다 — 없어진 창을 불러
+            # 'invalid command name'이 뜨는 것을 막는다 (지뢰 20)
+            self._stk_after = self.root.after(
+                400, lambda: self._safe("stickers", self._sticker_app))
+        # 유튜브 음악 — 재생기는 버튼을 누를 때 비로소 뜬다 (안 쓰면 비용 0)
+        self._yt_proc = None
+        self._yt_q = []              # 재생기 스레드가 넣고 그리기 루프가 뺀다
+        self._yt = {}                # 마지막 상태 (재생 중인지·제목)
+        self._yt_want = False        # 사람이 재생을 원하는가
+        self._yt_err = 0             # 마지막으로 알린 오류 (같은 말 반복 방지)
+        self._yt_idle = 0.0          # 멈춘 채로 지낸 시각
+        self._yt_btn = None          # 버튼 자리 (x, y, 반지름)
+        self._yt_note = None         # 지금 떠 있는 음악 음표 (하나만 띄운다)
+        self._yt_note_at = 0.0       # 다음 음표를 띄울 시각
+        self._yt_note_side = 1       # 다음은 반대쪽 — 처음 뒤집혀 왼쪽부터
+
+        # ── 타자 소리 / 펜 소리 ──────────────────────────────────────────
+        self.sndpack = None
+        self.pensnd = None
+        self.pokesnd = None
+        self.roomsnd = None          # 홈에서 남이 눌러 줬을 때 (평소와 다른 소리)
+        self.sparksnd = None         # 스페셜 컵케이크의 '샤라랑'
+        self.snacksnd = None         # 간식을 먹을 때 (오물오물)
+        self._pen_playing = False
+        self._pen_release_t = None
+        # 그레인 펜 소리 — 획 감지·재생은 마우스 콜백(_on_click/_on_move)에서,
+        # 페이드 진행과 루프 전환은 그리기 루프의 tick()에서 한다.
+        self._pen_grain = False
+        self.sound_packs = self._list_packs()
+        self._init_sound()
+
+        # ── 전역 입력 리스너 ──────────────────────────────────────────────
+        self._held = set()
+        self._key_times = {}          # 키별 마지막 눌림 시각 (다이얼 연타 감지)
+        self._kb = self._ms = self._macin = None
+        if keyboard is not None:                  # 윈도우: 전역 후킹 리스너
+            self._kb = keyboard.Listener(on_press=self._on_key,
+                                         on_release=self._on_key_release)
+            self._ms = mouse.Listener(on_click=self._on_click,
+                                      on_move=self._on_move)
+            self._kb.daemon = self._ms.daemon = True
+            self._kb.start()
+            self._ms.start()
+        else:                                     # 맥: 매 프레임 카운터 폴링
+            try:
+                self._macin = MacInput()
+            except Exception:
+                self._macin = None
+
+        # ── 그림자 레이어 창 ─────────────────────────────────────────────
+        self.root.update_idletasks()
+        self._main_hwnd = int(self.root.wm_frame(), 16) if IS_WIN else 0
+        self.shadow = None
+        self._z_check = 0.0
+        self._panel_z = 0.0          # 말풍선 창을 다시 올린 시각
+        self._z_pin_at = 0.0         # 캐릭터가 맨 앞인지 마지막으로 본 시각
+        if self.shadow_img is not None and IS_WIN:
+            # 그림자 이미지가 P만큼 여백을 두므로, 창을 (offset - P)에 놓아 정렬
+            self.shadow = ShadowLayer(self.root, self.shadow_img,
+                                      offset=(7 - SHADOW_PAD, 9 - SHADOW_PAD))
+            self.shadow.place(self.root.winfo_rootx(), self.root.winfo_rooty(),
+                              self._main_hwnd)
+        self._last_pos = None
+
+        self._apply_autostart()          # exe 배포본이면 시작프로그램 등록
+        self._pen_diag_head()            # config의 pen_diag가 켜졌을 때만
+
+        if os.environ.get("MASCOT_DEBUG") == "1":
+            self.root.after(4000, self._dump_debug)
+
+        if preview:
+            self.root.after(600, self._preview_shots)
+        else:
+            self.tick()
+
+    # ── 파츠 로드 (모든 좌표는 표시 배율 + y 오프셋 적용) ─────────────────
+    # 밑그림 위에만 놓이는지 검사할 파츠들 (얼굴 위에 얹히는 것들)
+    COVER_CHECK = ("pupils", "lashes", "eyes_closed", "hair", "smile")
+
+
+    def _init_state(self):
+        """프레임마다 바뀌는 값들의 처음 상태.
+
+        새 상태 변수는 **반드시 여기에** 넣는다. 조건문 뒤쪽에서
+        처음 만들면 단락 평가 때문에 검사에서 안 걸리고 몇 분 뒤에
+        터진다 (지뢰 14 — celebrate_until 사건).
+        """
+        # ── 상태 ──────────────────────────────────────────────────────────
+        self.key_events = 0
+        self._seen_keys = 0
+        self.squash_until = 0.0
+        self.mouse_pressed = False
+        self.last_drag = 0.0
+        self.last_pointer = 0.0
+        self.last_key = 0.0
+        self.tap_side = False
+        self.key_ang_t = 0.0
+        self.key_ang = 0.0
+        self.left_down_until = 0.0
+        self.pen_ang_t = 0.0
+        self.pen_ang = 0.0
+        self.pen_down_until = 0.0
+        self.strokes = []
+        self._new_stroke = True
+        self.blink_until = 0.0
+        self.next_blink = time.time() + random.uniform(2.5, 5.5)
+        self._pen_xy = list(self.pen_base_tip)
+        self._force = {}
+
+        # ── 타이머 상태 ───────────────────────────────────────────────────
+        self.work_secs = 0.0
+        self._t_last = time.time()
+        self._t_save = 0.0
+        self._fg_checked = 0.0
+        self._fg_work = False
+        self.state_path = os.path.join(self.state_dir, ".timer_state.json")
+        if self.timer_on:
+            if self.ws_path is None:
+                self._timer_load()
+            else:
+                self._lv_load()      # 연동 중이면 레벨만 (기록은 에이전트 몫)
+        self._lv_seen = self._level()
+        # 혼자 재는 캐릭터는 지금 누적을 기준으로 잡아 둔다 — 안 그러면 켤
+        # 때마다 첫 프레임 몫을 한 번씩 흘린다. 연동 중이면 첫 틱에 에이전트
+        # 누적이 통째로 들어오므로 그때 기준을 잡는다(None으로 둔다).
+        if self.ws_path is None:
+            self._lv_work = float(self.work_secs)
+
+        # ── 슬라임(책상 위 말랑이) ───────────────────────────────────────
+        # 그리는 도중에 쓰는 값은 하나도 빠짐없이 여기서 만들어 둔다. 조건문
+        # 뒤쪽에서 처음 만들면 단락 평가 때문에 몇 분 뒤에 터진다 (지뢰 13).
+        self.slime = None            # 꺼내 놓은 슬라임 (없으면 None)
+        self._slime_grab = None      # 지금 잡고 있는 자리 (없으면 None)
+        self._slime_snd = None       # 만질 때 나는 소리
+        self._slime_step = 0.0       # 물리 계산을 마지막으로 돌린 시각
+        self._slime_grain = 0.0      # 끄는 소리를 마지막으로 낸 시각
+        self._slime_px = 0.0         # 끈 거리 (소리 간격을 거리로 재려고)
+        self._slime_hand = None      # 슬라임을 만지는 손이 지금 있는 자리
+        self._sl_touched = False     # 꺼낸 뒤 한 번이라도 만졌나
+        # ── 같이 작업하는 방 ─────────────────────────────────────────
+        self.room_net = None         # 서버와 주고받는 층 (없으면 꺼진 것)
+        self.room_win = None         # 방 창
+        self.room_cv = None
+        self.room_people = []        # 방에 있는 사람들
+        self._room_job = None        # 방 창 다시 그리기 예약
+        self._room_push = 0.0        # 내 상태를 마지막으로 올린 시각
+        self._room_hit = []          # 방 창에서 누를 수 있는 자리
+        self._room_flash = {}        # 신호를 주고받아 반짝일 사람
+        self._room_img_cache = {}    # 앉은 모습 그림 (상한 있음)
+        self._room_head_cache = {}   # 앉은 그림의 머리 자리 (작은 튜플)
+        self._room_hat_cache = {}    # 방 카드용 고깔모자 그림 (상한 있음)
+        self._room_page = 0          # 홈 페이지 (9명씩)
+        self._room_pages = 1
+        self._room_page_btn = []     # 페이지 화살표 자리
+        self._bubble_cache = {}      # 매끈한 말풍선 그림 (상한 있음)
+        self._room_deco_cache = {}   # 홈 꾸미기 그림 (상한 있음)
+        self._room_deco_ver = 0      # 꾸미기를 바꾸면 올라간다 (배경 다시)
+        self._room_deco_btn = None   # 꾸미기 단추 자리
+        self._deco_win = None        # 꾸미기 창 (떠 있으면 드래그 조절)
+        self._deco_drag_st = None    # 드래그 시작점
+        self._deco_dims = {}         # 그림 실제 크기 (드래그 환산용)
+        self._cd_mem = None          # 내 방 칸 그림의 작은 사본 (mtime 기억)
+        self._cd_push = True         # 켠 직후 첫 신호에 그림을 실어 보냄
+        self._cd_n = 0               # 그림을 이따금만 싣는 셈
+        self._room_peer_hash = None  # 남의 방 칸 그림 해시 (첫 사용 때 읽음)
+        self._room_tone_cache = {}
+        self._room_pastel_cache = {}
+        self._room_pal_cache = {}
+        self._room_art_bad = set()   # 그림을 못 받은 자리 (다시 안 조른다)
+        self._room_art_th = None
+        self._photo_after = None     # 단체사진 안내 예약
+        self._room_ask_win = None    # 홈에 처음 들어갈 때 묻는 창
+        self._room_pick = None       # 방에서 고른 사람 (없으면 방 전체)
+        self._room_cur = ""          # 지금 방 창 커서 (같은 값을 다시 넣으면 깜빡)
+        self._room_rows = 2          # 방 창에 들어가는 줄 수
+        self._room_cols = 3          # 방 창에 들어가는 칸 수 (창 크기에 따라)
+        self._room_size = (0, 0)     # 마지막으로 배치한 창 크기
+        self._room_toast = None      # '보냈어요' 알림 (글, 시각)
+        self._msg_win = None         # 오늘 한 줄 적는 창
+        self._inbox = None           # 오늘 받은 반응 (첫 사용 때 읽는다)
+        self._inbox_open = False     # 목록이 펼쳐져 있나
+        self._inbox_scroll = 0       # 목록에서 몇 번째부터 보이나
+        self._away_got = []          # 자리 비운 사이에 온 것 (돌아오면 알린다)
+        self._room_inbox_hit = None  # 배지를 누를 수 있는 자리
+        self._room_inbox_panel = None    # 펼쳐진 목록의 자리
+        self._room_inbox_card = None     # 내 칸의 자리 (목록을 그 아래에 붙인다)
+        self._room_msg_box = None        # 내 칸 '오늘 한 줄' 말풍선이 쓴 자리
+        self._snack_list = None          # 간식 그림 이름들 (첫 사용 때 읽는다)
+        self._fail_why = {}              # 구역별 마지막 실패 이유
+        self._told_off = set()            # 꺼졌다고 이미 말한 구역
+        self._health_at = 0.0             # .health.txt 를 마지막으로 쓴 시각
+        self._born_at = time.time()       # 켠 시각 (얼마나 돌았나)
+        self._snack_cache = {}           # 크기별로 만들어 둔 간식 그림
+        self._hand_cache = {}            # 쓰담 손 그림 (크기·각도별)
+        self._snack_on = None            # 책상에 놓인 간식 (눌러야 없어진다)
+        self._snack_box = None           # 그 간식을 누를 수 있는 자리
+        self._room_btn_hit = []      # 아래 단추 자리
+        self._room_sent = None
+        self._room_note = None       # 방금 보낸 것 (칸 위에 잠깐 띄운다)
+        self._poke_times = []        # 최근에 콕을 보낸 시각들 (연타 제한)
+        self._lv_glow = 0.0          # 레벨업 테두리 반짝임이 시작된 시각
+        self._room_goal_done = False # 오늘 다 같이 24시간을 채웠는가
+        self._fx_scale = 1.0         # zzZ·콧방울 배율 (앉은 모습 구울 때 확대)
+        self._sky_img = None         # 타이틀 하늘 그림 (시간대별로 구워 둠)
+        self._sky_key = None
+        self._room_cal_btn = None    # 홈 타이틀의 달력 아이콘 자리
+        self._room_seen = None       # 오늘 마지막으로 본 남들의 시간·게이지
+        self._room_seen_at = 0.0
+        self._stamp_win = None       # 도장판 창
+        self._stamp_off = 0          # 보고 있는 달 (0 = 이번 달)
+        self._stamp_pick = None      # 눌러서 자세히 보는 날
+        self._stamp_slot = None      # 남의 도장판을 보는 중이면 그 자리
+        self._stamp_txt = None       # 일기 입력칸 (내 도장판에서만)
+        self._stamp_share_hit = None
+        self._stamp_pack_at = 0.0    # 공개용 꾸러미 캐시
+        self._stamp_pack_v = None
+        self._room_cal_btns = {}     # 남의 카드 달력 아이콘 자리
+        self._room_cal_data = {}     # 남이 공개한 도장 (slot → cal)
+        self._room_song_hits = {}    # 노래 말풍선 자리 (slot → (상자, 주소))
+        self._room_song_box = {}     # 말풍선 그대로의 상자 (마퀴용)
+        self._song_hover = None      # 커서가 올라간 노래 말풍선
+        self._song_liked = {}        # (slot, 주소) → 마지막으로 보낸 시각
+        self._mq_cache = {}          # 마퀴 글자 띠 (상한 있음)
+        self._mq_img = None          # 지금 프레임의 마퀴 그림
+        self._room_song_slots = set()  # 노래가 걸린 카드 (음표 연출용)
+        self._bubble_born = 0.0      # 지금 말풍선이 뜬 시각 (톡 등장용)
+        self._bubble_text_last = None
+        self._room_meta = {}         # 캐릭터별 책상 높이
+        self._room_bg = None
+        self._room_body = []
+        self._room_key_last = None
+        self._room_fx = []           # 지금 보이는 연출
+        self._char_fx = []           # 캐릭터 창에서 터지는 연출 (남이 눌러 줬을 때)         # 배경을 그려 둔 상태 (크기·색이 그대로면 다시 안 그린다)
+        self._room_body = []         # 숨쉬며 움직이는 몸 그림
+        self._room_key_last = None
+        self._sl_fg = 0.0            # 앞 창을 마지막으로 확인한 시각
+        # 물성은 종류마다 다르다. 꺼낼 때 정하지만 여기서도 만들어 둔다
+        # (조건문 뒤쪽에서 처음 만들면 몇 분 뒤에 터진다 — 지뢰 13).
+        self._sl_shape, self._sl_damp = self.SL_SHAPE, self.SL_DAMP
+        self._sl_area, self._sl_step = self.SL_AREA, self.SL_STEP
+        self._sl_edge, self._sl_stretch = self.SL_EDGE, self.SL_STRETCH
+        self._sl_reach, self._sl_stiff = self.SL_REACH, 0.0
+        self._sl_pin, self._sl_pitch = 1.0, 1.0
+        # 종류 목록 = sounds/slime/ 아래 wav가 든 폴더들
+        self.slime_kinds = self._list_slime_kinds()
+        if self.slime_kinds and self.us.get("slime_kind") not in self.slime_kinds:
+            self.us["slime_kind"] = self.slime_kinds[0]
+
+    def _find_covered_parts(self):
+        """'밑그림에 완전히 덮이는' 파츠 이름들.
+
+        캐릭터마다 그림이 달라서 사람이 정하지 않고 실제 픽셀로 확인한다.
+        한 픽셀이라도 밑그림 밖으로 나가면 그 파츠는 배경과 닿으므로 제외한다.
+        """
+        if not self.cfg.get("soft_overlay"):
+            return set()
+        from PIL import ImageChops
+        try:
+            base = "head" if (self.has_part("head")) else "body_open"
+            cw, ch = self.layout["canvas"]
+
+            def mask(name, thr):
+                path = os.path.join(self.parts_dir, f"{name}.png")
+                a = Image.open(path).convert("RGBA").getchannel("A")
+                sheet = Image.new("L", (cw, ch), 0)
+                sheet.paste(a.point(lambda v: 255 if v >= thr else 0),
+                            tuple(self.layout[name]["pos"]))
+                return sheet
+
+            solid = mask(base, 250)
+            out = set()
+            for n in self.COVER_CHECK:
+                if not self.has_part(n) or n == base:
+                    continue
+                outside = ImageChops.subtract(mask(n, 1), solid)
+                if outside.getbbox() is None:
+                    out.add(n)
+            return out
+        except Exception:
+            self._log_error("cover_check")
+            return set()
+
+    def _covered_by_base(self, lay, path):
+        """그 그림이 밑그림(머리/몸통) 안에만 들어가는가 — 소품처럼 파일 경로로."""
+        if not self.cfg.get("soft_overlay"):
+            return False
+        from PIL import ImageChops
+        try:
+            base = "head" if self.has_part("head") else "body_open"
+            cw, ch = self.layout["canvas"]
+            solid = Image.new("L", (cw, ch), 0)
+            ba = Image.open(os.path.join(self.parts_dir,
+                                         f"{base}.png")).convert("RGBA")
+            solid.paste(ba.getchannel("A").point(lambda v: 255 if v >= 250 else 0),
+                        tuple(self.layout[base]["pos"]))
+            mine = Image.new("L", (cw, ch), 0)
+            ia = Image.open(path).convert("RGBA")
+            mine.paste(ia.getchannel("A").point(lambda v: 255 if v else 0),
+                       tuple(lay["pos"]))
+            return ImageChops.subtract(mine, solid).getbbox() is None
+        except Exception:
+            return False
+
+    def has_part(self, name):
+        """그 파츠의 PNG와 layout이 둘 다 있는가 (파츠 불러오기 전에도 쓴다)."""
+        return (name in self.layout
+                and os.path.exists(os.path.join(self.parts_dir, f"{name}.png")))
+
+    def _hard(self, im):
+        """반투명 가장자리 픽셀 이분화 — 색상키 투명의 어두운 테두리(fringe) 방지.
+
+        밝은 캐릭터가 어두운 배경에서 회색 테두리가 지는 문제를, 가장자리 알파를
+        50% 기준으로 켜고 끄는 이분화로 없앤다(부드럽진 않지만 테두리가 안 생김).
+        """
+        if not self.cfg.get("hard_alpha"):
+            return im
+        from PIL import ImageChops, ImageFilter
+        im = self._avoid_key(im)
+        a = im.getchannel("A")
+        solid = a.point(lambda v: 255 if v >= 128 else 0)
+        # 반투명하게 그려진 '내부 선'(옅은 음영 등)은 살린다 — 주변이 대부분
+        # 불투명하면 실루엣 안쪽이라는 뜻. 알파 0인 진짜 빈틈은 건드리지 않는다.
+        im = im.copy()
+        if not self.cfg.get("soft_inner"):
+            # 기본: 알파만 이분화한다. 반투명·투명한 안쪽을 억지로 불투명하게
+            # 만들면 그 자리의 어두운 색이 드러나 검은 얼룩이 된다
+            # (도로롱 머리카락 사건). 구멍 메우기도 같은 이유로 하지 않는다.
+            im.putalpha(solid)
+            return im
+        near = solid.filter(ImageFilter.GaussianBlur(2))
+        inner = ImageChops.multiply(
+            a.point(lambda v: 255 if 0 < v < 128 else 0),
+            near.point(lambda v: 255 if v >= 150 else 0))
+        if inner.getbbox():
+            # 그냥 불투명하게 만들면 옅게 그린 어두운 색이 진하게 드러나
+            # 검은 얼룩이 된다(도로롱 머리카락 사건). 주변 색 위에 그 알파로
+            # 얹은 결과로 바꿔, 원래 눈에 보이던 색을 유지한다.
+            rgb = im.convert("RGB")
+            base = rgb.filter(ImageFilter.GaussianBlur(4))
+            blended = Image.composite(rgb, base, a)
+            fixed = Image.composite(blended, rgb, inner)
+            im = Image.merge("RGBA", (*fixed.split(), im.getchannel("A")))
+        im.putalpha(self._fill_holes(ImageChops.lighter(solid, inner)))
+        return im
+
+    @staticmethod
+    def _avoid_key(im):
+        """투명 색상키와 똑같은 색의 픽셀을 1만큼 비껴 놓는다.
+
+        창 투명화는 이 색을 통째로 뚫으므로, 그림 안에 우연히 같은 색이 있으면
+        그 점만 배경이 비쳐 흰 점처럼 보인다(퀸시 얼굴 흰 점 사건).
+
+        윈도우와 맥은 키 색이 다르다. 어느 쪽에서 열릴지 모르는 그림도 있고,
+        가장자리를 어둡게 칠하면 없던 색이 새로 생기므로 둘 다 비껴 놓는다.
+        """
+        from PIL import ImageChops
+        for key in (TRANSPARENT, MAC_KEY):
+            kr, kg, kb = (int(key[i:i + 2], 16) for i in (1, 3, 5))
+            r, g, b, al = im.split()
+            eq = ImageChops.multiply(
+                ImageChops.multiply(r.point(lambda v: 255 if v == kr else 0),
+                                    g.point(lambda v: 255 if v == kg else 0)),
+                b.point(lambda v: 255 if v == kb else 0))
+            if not eq.getbbox():
+                continue
+            bump = eq.point(lambda v: 1 if v else 0)
+            nb = (ImageChops.add(b, bump) if kb < 255
+                  else ImageChops.subtract(b, bump))
+            im = Image.merge("RGBA", (r, g, nb, al))
+        return im
+
+    @staticmethod
+    def _fill_holes(solid):
+        """실루엣 '안쪽'의 투명 구멍만 메운다.
+
+        얼굴의 옅은 음영선처럼 반투명하게 그려진 내부 선은 이분화하면 구멍이
+        되어, 밝은 배경에서 흰 점·선으로 비쳐 보인다(퀸시 사건). 바깥과
+        이어지지 않은 투명 영역만 채우므로 실루엣 모양은 그대로 유지된다.
+        """
+        from PIL import ImageChops, ImageDraw
+        w, h = solid.size
+        pad = Image.new("L", (w + 2, h + 2), 0)
+        pad.paste(solid, (1, 1))
+        ImageDraw.floodfill(pad, (0, 0), 128)        # 바깥 투명 영역만 표시
+        holes = pad.point(lambda v: 255 if v == 0 else 0).crop((1, 1, w + 1, h + 1))
+        # 큰 구멍은 '메워야 할 틈'이 아니라 원래 뚫린 모양이다. 화관처럼
+        # 가운데가 뻥 뚫린 소품까지 메우면 그 자리에 그림의 RGB(검정)가
+        # 드러난다 (사가 화관 안쪽이 까맣게 보이던 원인).
+        # 메워야 할 것(옅은 음영선 때문에 생긴 틈)은 가늘고, 반지 구멍은
+        # 굵다 — 굵기로 가른다. 깎았다가(MinFilter) 도로 부풀리면(MaxFilter)
+        # 가는 것은 사라지고 굵은 것만 남는다.
+        from PIL import ImageFilter
+        n = 9
+        big = holes.filter(ImageFilter.MinFilter(n)).filter(
+            ImageFilter.MaxFilter(n))
+        holes = ImageChops.subtract(holes, big)
+        return ImageChops.lighter(solid, holes)
+
+    # 뒤쪽 조각의 기본 움직임 — config의 prop_back으로 캐릭터마다 덮어쓴다
+    PROP_BACK_MOTION = {
+        # 느긋하게 — 빠르면 캐릭터가 안절부절못하는 것처럼 보인다.
+        # 기뽀 요정 날개(back_period 1.0)보다 한참 느리게 잡았다. 그 값은
+        # 날개가 작아서 괜찮았지, 큰 날개·꼬리에 그대로 쓰면 부산스럽다.
+        "prop7": {"motion": "sway", "amp": 6.0, "period": 4.5,
+                  "jitter": 0.25, "pivot": [0.12, 0.25]},   # 악마 꼬리
+        "prop8": {"motion": "flap", "amp": 0.22, "period": 3.2,
+                  "jitter": 0.3},                            # 천사 날개
+    }
+
+    def _load_prop_back(self, pick, s, pil_cache):
+        """뽑힌 소품에 '몸 뒤에 그리는 짝'이 있으면 같이 읽는다.
+
+        악마 세트는 뿔(앞)+꼬리(뒤), 천사 세트는 고리(앞)+날개(뒤)처럼
+        한 소품이 몸 앞뒤로 나뉜다. PSD에서 몸체보다 아래에 둔 레이어가
+        '{소품}_back'으로 뽑혀 있다.
+        """
+        self.has["prop_back"] = False
+        name = f"{pick}_back"
+        path = os.path.join(self.prop_dir, f"{name}.png")
+        if name not in self._prop_layout or not os.path.exists(path):
+            return
+        im = Image.open(path).convert("RGBA")
+        if s != 1.0:
+            im = im.resize((max(1, round(im.width * s)),
+                            max(1, round(im.height * s))), Image.LANCZOS)
+        self.layout["prop_back"] = self._prop_layout[name]
+        pil_cache["prop_back"] = im
+        self.im["prop_back"] = ImageTk.PhotoImage(self._hard(im))
+        self.has["prop_back"] = True
+        # 기본 몸 뒤 파츠를 숨길지는 **캐릭터가 정한다.**
+        # back.png 는 캐릭터마다 뜻이 다르다 — 기뽀는 요정 날개지만
+        # 사가는 양갈래다. 예전에는 무조건 숨겨서, 뒤조각이 있는 소품이
+        # 뽑히면 사가의 머리카락이 통째로 사라졌다 (열넷 중 셋).
+        # 기본은 그대로 두는 쪽이다 — 잘못돼도 '겹쳐 보인다'로 끝나지
+        # '일부가 사라진다'가 되지 않는다.
+        if self.cfg.get("back_hide_on_prop"):
+            self.has["back"] = False
+        cfg = dict(self.PROP_BACK_MOTION.get(pick) or {})
+        cfg.update((self.cfg.get("prop_back") or {}).get(pick) or {})
+        self._prop_back_cfg = cfg
+
+    @staticmethod
+    def _props_in(layout, folder):
+        """layout과 실제 PNG가 둘 다 있는 소품 이름들 (자동업데이트 섞임 대비).
+
+        '..._back'은 몸 뒤에 그리는 짝(악마 꼬리·천사 날개)이라 따로 뽑지
+        않는다. 앞쪽 소품이 뽑히면 그 짝으로 같이 따라 나온다.
+
+        다만 **뒤쪽만 있는 소품**(준사 헤일로처럼 PSD 에서 몸체보다 아래에만
+        둔 것)도 후보에 넣는다. 앞쪽 그림이 있어야만 뽑던 때에는 그런
+        소품이 영영 안 나왔다.
+        """
+        out = set()
+        for n in layout:
+            if not n.startswith("prop") or n == "prop":
+                continue
+            base = n[:-5] if n.endswith("_back") else n
+            front = os.path.join(folder, f"{base}.png")
+            back = os.path.join(folder, f"{base}_back.png")
+            if os.path.exists(front) or os.path.exists(back):
+                out.add(base)
+        return sorted(out)
+
+    def _pick_prop(self):
+        """이번 실행에 쓸 소품 하나를 고른다 (없으면 None).
+
+        같은 게 연달아 나오지 않도록, 한 바퀴 다 돌 때까지 쓴 것을 빼고
+        고른다. 다 쓰면 초기화하되 직전 것만 제외해 연속 중복을 막는다.
+        기록은 상태 폴더에 남겨 자동 업데이트로 지워지지 않게 한다.
+        """
+        # 패션 슬롯에 소품이 없으면 기본 폴더 것을 쓴다 — 소품은 얼굴 위
+        # 덮개라 슬롯(옷)이 바뀌어도 좌표가 같다.
+        self.prop_dir, src = self.parts_dir, self.layout
+        avail = self._props_in(self.layout, self.parts_dir)
+        if not avail and self.parts_dir != self.dir:
+            try:
+                with open(os.path.join(self.dir, "layout.json"),
+                          encoding="utf-8") as fp:
+                    base = json.load(fp)
+                hit = self._props_in(base, self.dir)
+            except Exception:
+                hit = []
+            if hit:
+                self.prop_dir, src, avail = self.dir, base, hit
+        if not avail:
+            return None
+        self._prop_layout = src
+        path = os.path.join(self.state_dir, ".props.json")
+        used, last = [], None
+        try:
+            with open(path, encoding="utf-8") as fp:
+                d = json.load(fp)
+            used = [str(x) for x in (d.get("used") or []) if x in avail]
+            last = d.get("last")
+        except Exception:
+            pass
+        pool = [n for n in avail if n not in used]
+        if not pool:                       # 한 바퀴 다 돎 — 직전 것만 빼고 재시작
+            used = []
+            pool = [n for n in avail if n != last] or avail
+        pick = random.choice(pool)
+        try:
+            _save_json(path, {"used": used + [pick], "last": pick})
+        except Exception:
+            pass
+        return pick
+
+    def _load_parts(self):
+        s = self.s
+
+        # 밑그림에 완전히 덮이는 얼굴 파츠는 가장자리를 이분화하지 않는다.
+        # 이분화는 투명한 배경과 닿을 때 생기는 회색 테두리를 막으려는 것인데,
+        # 배경에 닿지 않는 파츠에서는 얇은 선만 잘려 나간다(속눈썹은 픽셀의
+        # 1/4가 사라졌다). Tk는 아래 그림과 알파 합성을 해 주므로 그냥 둬도
+        # 테두리가 지지 않는다.
+        self._soft_parts = self._find_covered_parts()
+
+        def load_pil(name):
+            """파츠 원본을 표시 배율로 줄여 둔다 (이분화는 하지 않는다).
+
+            이분화를 미리 해 두면, 몸짓이 그 계단진 그림을 다시 돌리고 늘리면서
+            손상이 두 번 겹쳐 선이 뭉텅뭉텅 끊긴다. 그래서 부드러운 원본을
+            들고 있다가 화면에 올리는 마지막 순간에 한 번만 이분화한다.
+            들고 있는 그림 수는 그대로라 메모리는 늘지 않는다.
+            """
+            im = Image.open(os.path.join(self.parts_dir,
+                                         f"{name}.png")).convert("RGBA")
+            if s != 1.0:
+                im = im.resize((max(1, round(im.width * s)),
+                                max(1, round(im.height * s))), Image.LANCZOS)
+            return im
+
+        def firm(name, im):
+            """화면에 바로 올릴 그림 — 배경에 닿는 파츠만 이분화한다."""
+            return im if name in self._soft_parts else self._hard(im)
+
+        self.im = {}
+        self.has = {}
+        pil_cache = {}
+        for name in ("body_open", "pupils", "body_mask", "lashes", "hair",
+                     "eyes_closed", "head", "desk", "arm_pen",
+                     "smile", "pet1", "pet2", "scarf", "back"):
+            # 파일과 layout 위치가 둘 다 있어야 사용 (자동업데이트 섞임 대비)
+            self.has[name] = (os.path.exists(os.path.join(self.parts_dir,
+                                                          f"{name}.png"))
+                              and name in self.layout)
+            if self.has[name]:
+                pil_cache[name] = load_pil(name)
+                self.im[name] = ImageTk.PhotoImage(firm(name, pil_cache[name]))
+
+        # 소품(prop1..N) — 켤 때마다 하나만 랜덤으로. 고른 것을 "prop"으로
+        # 이름 붙여 두면 overlays 순서대로 얼굴 위에 함께 그려진다.
+        self.has["prop"] = False
+        pick = self._pick_prop()
+        front = os.path.join(self.prop_dir, f"{pick}.png") if pick else ""
+        if pick and os.path.exists(front):
+            self.layout["prop"] = self._prop_layout[pick]
+            im = Image.open(front).convert("RGBA")
+            if s != 1.0:
+                im = im.resize((max(1, round(im.width * s)),
+                                max(1, round(im.height * s))), Image.LANCZOS)
+            # 소품도 머리 안에만 있으면 이분화하지 않는다 (안경테 계단 방지)
+            covered = self._covered_by_base(
+                self._prop_layout[pick],
+                os.path.join(self.prop_dir, f"{pick}.png"))
+            pil_cache["prop"] = im
+            self.im["prop"] = ImageTk.PhotoImage(im if covered
+                                                 else self._hard(im))
+            self.has["prop"] = True
+            self.prop_name = pick
+            # 소품마다 그리는 층이 다르다 — 안경은 앞머리 아래, 머리띠는
+            # 앞머리 위. PSD에서 뽑아 둔 'over'(덮개 몇 장 뒤인가)대로 끼운다.
+            ov = [o for o in (self.layout.get("overlays") or []) if o != "prop"]
+            over = self._prop_layout[pick].get("over")
+            if over is None:
+                # 옛 layout이라 정보가 없다 — 예전처럼 머리카락 앞에 둔다
+                pos = ov.index("hair") if "hair" in ov else len(ov)
+            else:
+                pos = max(0, min(int(over), len(ov)))
+            ov.insert(pos, "prop")
+            self.layout["overlays"] = ov
+        if pick:
+            # 앞쪽 그림이 없어도(뒤쪽만 있는 소품) 뒤쪽은 그린다
+            self.prop_name = self.prop_name or pick
+            self._load_prop_back(pick, s, pil_cache)
+
+        # 타이머 카드 가로 중심 = 책상 내용의 중심 (캔버스 중심이 아니라)
+        self.card_cx = self.W / 2
+        self._desk_top = self.H * 0.6        # 반려동물이 올라오는 기준선
+        self._desk_bb = None                 # 책상 그림의 실제 범위(배율 반영)
+        self._desk_prof = None               # 열마다 책상의 위·아래 끝
+        self._slime_pts = None               # 매트 좌표 캐시 — 배율이 바뀌면 다시
+        if "desk" in pil_cache:
+            bb = pil_cache["desk"].split()[3].getbbox()
+            self._desk_bb = bb
+            if bb:
+                # 매트가 책상 상판을 따라 덮으려면 실루엣을 알아야 한다.
+                # 열마다 위·아래 끝을 재 둔다 (켤 때 한 번만).
+                al = pil_cache["desk"].split()[3].point(
+                    lambda v: 255 if v > 40 else 0)
+                prof = []
+                for x in range(bb[0], bb[2]):
+                    box = al.crop((x, bb[1], x + 1, bb[3])).getbbox()
+                    prof.append((box[1], box[3]) if box else None)
+                self._desk_prof = prof
+                # 책상 PNG가 캔버스 전체가 아니라 잘려 있을 수 있으므로
+                # layout 위치를 더해 창 좌표로 옮긴다 (옛 캐릭터는 pos가 0,0)
+                dx, dy = self.layout["desk"]["pos"]
+                dx, dy = dx * s + self.ox, dy * s
+                self.card_cx = dx + (bb[0] + bb[2]) / 2
+                self._desk_top = dy + bb[1]
+
+        self._build_pet_mask(pil_cache)
+        self._load_hat(pil_cache)
+
+        # 잘 때 머리를 기울이는 축 = 목 (머리 가로 중심 · 몸통 윗선)
+        self._tilt_cache = {}
+        self._tilt_max = 0.0
+        self._tilt_base = self._tilt_base_awake = None
+        self._tilt_base_smile = None
+        base = "head" if self.has.get("head") else "body_open"
+        base_im = pil_cache.get(base)
+        hb = base_im.split()[3].getbbox() if base_im is not None else None
+        hx, hy = self.layout.get(base, {}).get("pos", (0, 0))
+        # 머리(없으면 몸통) 실루엣 상자 — zzZ 위치·기울임 축의 기준
+        self._head_box = ((hx * s + self.ox + hb[0], hy * s + hb[1],
+                           hx * s + self.ox + hb[2], hy * s + hb[3]) if hb else
+                          (0, 0, self.W, self.H))
+        if self.has.get("head"):
+            self._neck = ((self._head_box[0] + self._head_box[2]) / 2,
+                          self.layout["body_open"]["pos"][1] * s + 6)
+
+        # 회전 손 파츠: 어깨(최상단) 앵커 기준으로 회전 — 어깨가 몸에서 안 떨어짐
+        self.hop = {}
+        for name in ("arm_key", "arm_right_typing", "arm_pen"):
+            try:
+                im = load_pil(name)
+            except Exception:
+                continue
+            ab = im.split()[3].getbbox()
+            top = ab[1]
+            row = im.crop((0, top, im.width, min(top + 3, im.height))).split()[3].getbbox()
+            anchor_x = (row[0] + row[2]) / 2 if row else im.width / 2
+            # 회전 여유 패딩. 펜 쥔 손은 제스처에서 크게 흔드는데 파츠가
+            # 길어서(펜) 끝이 많이 돌아나가므로 여유를 더 준다.
+            m = max(6, round(im.height * (0.45 if name == "arm_pen" else 0.18)))
+            padded = Image.new("RGBA", (im.width + 2 * m, im.height + m), (0, 0, 0, 0))
+            padded.paste(im, (m, 0))
+            self.hop[name] = {"pil": padded, "anchor": (anchor_x + m, top),
+                              "off": (-m, 0), "cache": {}}
+
+        # 오른팔: 늘리기용. 좌우 반전본은 박수처럼 팔이 몸 안쪽을 향해야 할 때
+        # 쓴다 (원본은 바깥으로 휘어 있어 안쪽으로 모으면 어색하다).
+        try:
+            self.arm_pil = load_pil("arm_right")
+        except Exception:
+            self.arm_pil = None
+        self.arm_pil_m = (ImageOps.mirror(self.arm_pil)
+                          if self.arm_pil is not None else None)
+        # 왼팔(arm_key)도 손끝을 원하는 자리로 보낼 수 있게 위·아래 접합점을
+        # 잰다. 오른팔은 layout.json에 적혀 오지만 왼팔은 없어서 직접 잰다.
+        self.arm_key_pil = None
+        self._armk_anchor = None
+        try:
+            ki = load_pil("arm_key")
+            self.arm_key_pil = ki
+            self._armk_anchor = _end_anchors(ki)
+        except Exception:
+            pass
+        self._arm_cache = {}
+        self._build_notes()             # 리듬 탈 때 튀어나오는 음표
+        # 펜 쥔 손을 '팔 손끝'을 축으로 돌리기 위한 판. 축을 그림 한가운데에
+        # 두고 정사각형으로 만들어 두면 어느 각도로 돌려도 잘리지 않는다.
+        # (손을 안 돌리면 팔만 방향이 바뀌어 손이 팔에서 떨어져 보인다.)
+        self._pen_rot = None
+        try:
+            pi = load_pil("arm_pen")
+            ar, ap = self.layout["arm_right"], self.layout["arm_pen"]
+            vx = (ar["pos"][0] + ar["bottom"][0] - ap["pos"][0]) * s
+            vy = (ar["pos"][1] + ar["bottom"][1] - ap["pos"][1]) * s
+            R = int(math.ceil(max(math.hypot(vx - x, vy - y)
+                                  for x in (0, pi.width)
+                                  for y in (0, pi.height)))) + 2
+            sq = Image.new("RGBA", (2 * R, 2 * R), (0, 0, 0, 0))
+            sq.alpha_composite(pi, (int(round(R - vx)), int(round(R - vy))))
+            self._pen_rot = {"pil": sq, "cache": {}}
+        except Exception:
+            self._pen_rot = None
+        # 왼손 위치 미세 보정 (캔버스 px, config의 arm_key_offset)
+        ko = self.cfg.get("arm_key_offset", [0, 0])
+        self.arm_key_off = (ko[0] * s, ko[1] * s)
+        self._pil_cache = {n: pil_cache[n] for n in pil_cache}
+        self._load_pil = load_pil
+
+        if self.has.get("head"):
+            self._build_tilt_base()     # 잘 때 기울이는 머리 한 장 + 최대 각도
+
+        self._bake_oy()                 # oy 의존 좌표 계산
+        self._build_shadow_img()        # 그림자 이미지 생성
+
+    def _load_hat(self, pil_cache):
+        """축하용 고깔모자 — 머리 폭에 맞춰 줄이고 살짝 기울여 둔다."""
+        path = os.path.join(self.parts_dir, "hat.png")
+        if not os.path.exists(path):        # 스킨 폴더에 없으면 기본에서
+            path = os.path.join(self.dir, "hat.png")
+        self.hat_anchor = (0, 0)
+        if not os.path.exists(path):
+            self.has["hat"] = False
+            return
+        base = "head" if self.has.get("head") else "body_open"
+        if base not in pil_cache:
+            self.has["hat"] = False
+            return
+        bb = pil_cache[base].split()[3].getbbox()
+        head_w = (bb[2] - bb[0]) if bb else self.W
+        im = Image.open(path).convert("RGBA")
+        k = head_w * float(self.cfg.get("hat_scale", 0.24)) / max(im.width, 1)
+        im = im.resize((max(8, round(im.width * k)), max(8, round(im.height * k))),
+                       Image.LANCZOS)
+        im = im.rotate(14, expand=True, resample=self._resample())
+        self.im["hat"] = ImageTk.PhotoImage(self._hard(im))
+        self.has["hat"] = True
+
+    TILT_PAD = 70                    # 회전 여유 (잘려나가지 않게 캔버스를 넓혀 합성)
+
+    def _build_tilt_base(self):
+        """머리+얼굴 파츠를 한 장으로 합쳐 두고, 창을 안 벗어나는 최대 각도를 구한다."""
+        p = self.TILT_PAD
+        layer = Image.new("RGBA", (self.W + 2 * p, self.H + 2 * p), (0, 0, 0, 0))
+
+        def paste(name):
+            x, y = self.layout[name]["pos"]
+            layer.alpha_composite(self._pil_cache[name],
+                                  (round(x * self.s) + p, round(y * self.s) + p))
+
+        overlays = self.layout.get("overlays") or ["eyes_closed", "hair"]
+        paste("head")
+        for name in overlays:
+            if name in ("body_mask", "head") or not self.has.get(name):
+                continue
+            paste(name)
+        self._tilt_base = layer
+
+        # 깨어 있을 때 기울이는 판 — 눈을 감기지 않고 눈동자를 넣는다.
+        # 잘 때 쓰는 판에는 '눈깜빡'이 들어 있어서, 그대로 쓰면 몸짓만
+        # 하면 눈을 감아 버린다. 눈동자는 기울인 동안 가운데로 고정된다.
+        layer2 = Image.new("RGBA", (self.W + 2 * p, self.H + 2 * p), (0, 0, 0, 0))
+        layer, self._tilt_base_awake = layer2, layer2
+        paste("head")
+        if self.has.get("pupils"):
+            paste("pupils")
+        for name in overlays:
+            if name in ("body_mask", "head", "eyes_closed")                     or not self.has.get(name):
+                continue
+            paste(name)
+
+        # 웃는 얼굴로 기울이는 판 — 리듬을 타는 내내 웃고 있어야 하는데,
+        # 눈 뜬 판을 쓰면 고개가 기울 때마다 표정이 평소로 돌아가 깜빡인다.
+        self._tilt_base_smile = None
+        if self.has.get("smile"):
+            layer3 = Image.new("RGBA", (self.W + 2 * p, self.H + 2 * p),
+                               (0, 0, 0, 0))
+            layer, self._tilt_base_smile = layer3, layer3
+            paste("head")
+            for name in overlays:
+                if name in ("body_mask", "head", "lashes")                         or not self.has.get(name):
+                    continue
+                paste("smile" if name == "eyes_closed" else name)
+            if "eyes_closed" not in overlays:
+                paste("smile")
+
+        self._tilt_max = 0.0
+        # 실제로 돌려 보고, 창 밖으로 8px 이내로만 밀리는 최대 각도를 고른다
+        for deg in (8, 7, 6, 5, 4, 3, 2):
+            if abs(self._tilt_fit(self._rot_head(-deg))) <= 8:
+                self._tilt_max = float(deg)
+                break
+        # 창 안에 들어가도 '보기에' 자연스러운 각도는 캐릭터마다 다르다.
+        # 기뽀처럼 머리 밑변이 평평하고 몸과 겹치는 부분이 얇으면, 조금만
+        # 기울여도 머리가 벗겨져 굴러떨어지는 것처럼 보인다(제보).
+        self._tilt_max *= max(0.0, min(1.0, float(self.cfg.get("tilt_scale", 1.0))))
+
+    def _rot_head(self, deg, mode="sleep"):
+        p = self.TILT_PAD
+        base = {"awake": self._tilt_base_awake,
+                "smile": self._tilt_base_smile}.get(mode) or self._tilt_base
+        # _neck은 화면 좌표(ox 포함)인데 합성판은 ox가 없다 — 빼고 돌린다
+        return base.rotate(deg, center=(self._neck[0] - self.ox + p,
+                                        self._neck[1] + p),
+                           resample=self._resample())
+
+    def _tilt_fit(self, im):
+        """돌린 머리가 창 안에 들어오도록 좌우로 밀어야 할 픽셀 수."""
+        p = self.TILT_PAD
+        bb = im.split()[3].getbbox()
+        if not bb:
+            return 0
+        # 그릴 때 ox만큼 오른쪽으로 밀리므로 그것까지 계산에 넣는다
+        return (max(p + 2 - self.ox - bb[0], 0)
+                - max(bb[2] + self.ox - (p + self.W - 2), 0))
+
+    def _sleep_head(self, deg, mode="sleep"):
+        """기울어진 머리 — (이미지, 창 안으로 미는 보정값), 1도 단위 캐시."""
+        key = (round(deg), mode)
+        hit = self._tilt_cache.get(key)
+        if hit is not None:
+            return hit
+        # 머리 판 한 장이 1.1MB나 된다(488x599 RGBA). 60장이면 67MB —
+        # 실측으로 확인했다. 한 번에 쓰는 각도는 몇 개뿐이라 30이면 넉넉하다.
+        # 통째로 비우면 다음 프레임부터 다시 만드느라 메모리가 계단처럼
+        # 뛰므로, 오래된 절반만 버린다 (지뢰 18).
+        if len(self._tilt_cache) > self.TILT_CACHE_MAX:
+            for _old in list(self._tilt_cache)[:self.TILT_CACHE_MAX // 2]:
+                del self._tilt_cache[_old]
+        layer = self._rot_head(key[0], mode)
+        dx = max(-12, min(12, self._tilt_fit(layer)))
+        hit = (ImageTk.PhotoImage(self._hard(layer)), dx)
+        self._tilt_cache[key] = hit
+        return hit
+
+    def _tilt_xy(self, x, y, deg):
+        """목을 축으로 deg만큼 돈 뒤의 좌표 (콧방울 따라가기용)."""
+        a = math.radians(deg)
+        nx, ny = self._neck
+        dx, dy = x - nx, y - ny
+        return (nx + dx * math.cos(a) - dy * math.sin(a),
+                ny + dx * math.sin(a) + dy * math.cos(a))
+
+    def _draw_snot(self, now, yo, deg, tdx=0):
+        """자는 동안 코에서 부풀었다 꺼지는 콧방울."""
+        nose = self.cfg.get("nose")
+        if not nose:
+            return
+        t = now % 5.2
+        if t < 3.8:
+            r = 2.0 + 11.0 * (t / 3.8) ** 1.6
+        elif t < 4.05:
+            r = 13.0 * (1 - (t - 3.8) / 0.25)      # 픽 하고 꺼짐
+        else:
+            return
+        if r < 1.5:
+            return
+        r *= self._fx_scale              # 앉은 모습을 구울 때는 크게
+        x, y = nose[0] * self.s + self.ox, nose[1] * self.s
+        x, y = self._tilt_xy(x, y, -deg)           # 캔버스 좌표는 회전 방향 반대
+        x += tdx
+        y += self.oy + yo
+        c = self.canvas
+        cx, cy = x + r * 0.15, y + r * 0.85
+        c.create_oval(cx - r, cy - r, cx + r, cy + r,
+                      fill="#dfeeff", outline="#8dbfe4", width=2)
+        c.create_oval(cx - r * 0.55, cy - r * 0.6, cx - r * 0.05, cy - r * 0.1,
+                      fill="#ffffff", outline="")
+
+    def _build_pet_mask(self, pil_cache):
+        """반려동물이 '책상 뒤'에 있도록, 열마다 책상 윗선 위쪽만 남기는 마스크."""
+        self._pet_cache = {}
+        self._pet_hide = {}
+        self.pet_cast = []
+        if not (self.has.get("pet1") or self.has.get("pet2")):
+            self._pet_mask = None
+            return
+        if "desk" not in pil_cache:
+            self._pet_mask = None
+            return
+        desk = pil_cache["desk"]
+        W, H = desk.size
+        alpha = desk.split()[3].point(lambda v: 255 if v > 40 else 0)
+        tops = []
+        for x in range(W):                       # 열별 책상 최상단 행
+            bb = alpha.crop((x, 0, x + 1, H)).getbbox()
+            tops.append(bb[1] if bb else None)
+        last = H
+        for x in range(W):                       # 책상이 없는 열은 이웃 값으로
+            if tops[x] is None:
+                tops[x] = last
+            else:
+                last = tops[x]
+        last = H
+        for x in range(W - 1, -1, -1):
+            if tops[x] == H:
+                tops[x] = last
+            else:
+                last = tops[x]
+        mask = Image.new("L", (W, H), 0)
+        col = Image.new("L", (1, H), 255)
+        for x, t in enumerate(tops):
+            if t > 0:
+                mask.paste(col.crop((0, 0, 1, t)), (x, 0))
+        self._pet_mask = mask
+        self._pet_xy = {}
+        k = float(self.cfg.get("pet_scale", 1.3))
+        for name in ("pet1", "pet2"):
+            if not self.has.get(name):
+                continue
+            small = pil_cache[name]
+            rot = float(self.cfg.get("pet_rot", 0))
+            if k != 1.0 or rot:                  # 원본에서 다시 줄여야 안 뭉갠다
+                src = Image.open(os.path.join(self.parts_dir,
+                                              f"{name}.png")).convert("RGBA")
+                big = src.resize((max(1, round(src.width * self.s * k)),
+                                  max(1, round(src.height * self.s * k))),
+                                 Image.LANCZOS)
+                if rot:                          # 캐릭터 뒤에서 안 가리게 기울이기
+                    big = big.rotate(rot, expand=True, resample=self._resample())
+                bb = big.split()[3].getbbox()    # 회전으로 생긴 빈 여백은 잘라낸다
+                if bb:
+                    big = big.crop(bb)
+                pil_cache[name] = big = self._hard(big)
+            else:
+                big = small
+            px, py = self.layout[name]["pos"]
+            px, py = px * self.s + self.ox, py * self.s
+            # 원래 실루엣의 밑변 중심을 기준으로 커지고 기울어지게
+            sb = small.split()[3].getbbox() or (0, 0, small.width, small.height)
+            ax, ay = px + (sb[0] + sb[2]) / 2, py + sb[3]
+            px = round(ax - big.width / 2) + int(self.cfg.get("pet_dx", 0))
+            py = round(ay - big.height)
+            px = max(2, min(px, self.W - big.width - 2))   # 창 밖으로 안 나가게
+            self._pet_xy[name] = (px, py)
+            # 모든 열에서 책상 윗선 아래로 내려가면 완전히 사라진다
+            need = max(tops[min(max(px + j, 0), W - 1)]
+                       for j in range(big.width)) - py
+            self._pet_hide[name] = max(need + 4, 10)
+
+
+    def _timer_oy(self):
+        """타이머 카드가 차지하는 캐릭터 위 여백."""
+        if not self.timer_on:
+            return 0
+        # 그림 위쪽에 빈 여백이 큰 캐릭터(햄북이 86px)는 카드와 머리가
+        # 늘 그만큼 떨어진다 — 여백만큼 캐릭터를 올려 틈을 좁힌다.
+        lift = int(self.cfg.get("char_lift", 0))
+        # 사람이 환경설정에서 직접 맞추는 보정 (머리가 카드에 겹치면 +)
+        gap = max(-20, min(60, int(self.us.get("card_gap") or 0)))
+        if self.has_clock:
+            base = OY_CLOCK_OPEN if self.clock_open else OY_CLOCK_COMPACT
+            return max(0, base + self._yt_bar() + GOAL_ROW
+                       + max(0, self._lv_row() - LV_TRIM) - lift + gap)
+        extra = int(self.cfg.get("card_top", 22)) - 22        # 장식 여유 (토끼 귀)
+        return max(0, TIMER_H + extra + self._yt_bar()
+                   + max(0, self._lv_row() - LV_TRIM) - lift + gap)
+
+    def _bake_oy(self):
+        """oy(카드 높이)에 의존하는 좌표들 — 시계 토글로 oy가 바뀌면 다시 부른다."""
+        s = self.s
+        ar = self.layout["arm_right"]
+        ax, ay = ar["pos"]
+        self.arm_top = ((ax + ar["top"][0]) * s + self.ox,
+                        (ay + ar["top"][1]) * s + self.oy)
+        self.arm_bottom = ((ax + ar["bottom"][0]) * s + self.ox,
+                           (ay + ar["bottom"][1]) * s + self.oy)
+        self._arm_nat = (self.arm_bottom[0] - self.arm_top[0],
+                         self.arm_bottom[1] - self.arm_top[1])
+        # 왼팔(반전 재활용)의 어깨와 손끝. 어깨는 오른쪽 어깨를 몸통 한가운데
+        # 기준으로 접어 넘긴 자리, 손끝은 왼손 파츠가 팔에 붙는 지점이다.
+        bo = self.layout["body_open"]
+        mid = (bo["pos"][0] + bo["size"][0] / 2) * s + self.ox
+        self.body_mid_x = mid
+        # 왼팔(arm_key)의 어깨와 손끝 — 그림에서 직접 잰 접합점을 화면 좌표로.
+        if self._armk_anchor is not None:
+            kx, ky = self.layout["arm_key"]["pos"]
+            bx = kx * s + self.ox + self.arm_key_off[0]
+            by = ky * s + self.oy + self.arm_key_off[1]
+            (tx, ty), (ex, ey) = self._armk_anchor
+            self.armk_top = (bx + tx, by + ty)
+            self.armk_bottom = (bx + ex, by + ey)
+        else:
+            self.armk_top = (2 * mid - self.arm_top[0], self.arm_top[1])
+            self.armk_bottom = (2 * mid - self.arm_bottom[0], self.arm_bottom[1])
+        # 늘여 그릴 팔 그림과 그 기준 벡터. 기준이 0에 가까우면 늘이기 배율이
+        # 폭발해 얼굴을 가로지르는 흰 막대가 되므로 _stretched_arm에서 막는다.
+        nk = (self.armk_bottom[0] - self.armk_top[0],
+              self.armk_bottom[1] - self.armk_top[1])
+        self._arm_src = {}
+        if self.arm_pil is not None:
+            at = (ar["top"][0] * s, ar["top"][1] * s)
+            ab = (ar["bottom"][0] * s, ar["bottom"][1] * s)
+            w = self.arm_pil.width
+            self._arm_src["r"] = (self.arm_pil, self._arm_nat, at, ab)
+            self._arm_src["rm"] = (self.arm_pil_m,
+                                   (-self._arm_nat[0], self._arm_nat[1]),
+                                   (w - at[0], at[1]), (w - ab[0], ab[1]))
+        if self.arm_key_pil is not None and self._armk_anchor is not None:
+            self._arm_src["l"] = (self.arm_key_pil, nk,
+                                  self._armk_anchor[0], self._armk_anchor[1])
+        px, py = self.layout["arm_pen"]["pos"]
+        tx, ty = self.cfg.get("pen_tip", self.layout["arm_pen"]["pen_tip"])
+        self.pen_base_tip = ((px + tx) * s + self.ox, (py + ty) * s + self.oy)
+        self.quad = [(x * s + self.ox, y * s + self.oy)
+                     for x, y in self._quad_src]
+        blink = self.cfg.get("blink")
+        self.blink_cfg = None
+        if blink and self.has["body_mask"]:
+            r = blink["rect"]
+            self.blink_cfg = ([r[0] * s + self.ox, r[1] * s + self.oy,
+                               r[2] * s + self.ox, r[3] * s + self.oy],
+                              blink["color"])
+
+    def _build_shadow_img(self):
+        """캐릭터+카드 실루엣을 흐려 만든 반투명 그림자 이미지.
+
+        가장자리 파츠(귀 등)의 그림자가 잘리지 않도록 여백(P)을 두고 그린다.
+        """
+        self.shadow_img = self.shadow_img_type = None
+        if not self.us.get("shadow", True):
+            return
+        for typing in (False, True):
+            self._compose_shadow(typing)
+        self._shadow_base = self.shadow_img
+        self._shadow_typing = False
+
+    def _compose_shadow(self, typing):
+        """그림자 실루엣 한 벌. typing이면 펜 손 대신 타자 팔로 그린다."""
+        from PIL import ImageDraw, ImageFilter
+        P = SHADOW_PAD
+        comp = Image.new("RGBA", (self.W + 2 * P, self.H + 2 * P), (0, 0, 0, 0))
+        parts = ["body_open", "scarf", "lashes", "hair", "head", "desk"]
+        if not typing:
+            parts.append("arm_pen")
+        for name in parts:
+            if name in self._pil_cache:
+                x, y = self._pos(name)
+                comp.alpha_composite(self._pil_cache[name], (round(x) + P, round(y) + P))
+        # typing_arm 을 끈 캐릭터는 타자 중에도 평소 팔을 쓴다 (프고).
+        arms = ["arm_key",
+                "arm_right_typing"
+                if (typing and self.cfg.get("typing_arm", True))
+                else "arm_right"]
+        for name in arms:
+            try:
+                im = self._load_pil(name)
+            except Exception:
+                continue
+            x, y = self._pos(name)
+            if name == "arm_key":
+                x += self.arm_key_off[0]
+                y += self.arm_key_off[1]
+            comp.alpha_composite(im, (round(x) + P, round(y) + P))
+        if self.timer_on:
+            d = ImageDraw.Draw(comp)
+            cg = self._card_geom()
+            cx0, cy0 = cg["x0"] + P, cg["y0"] + P
+            cx1, cy1 = cg["x1"] + P, cg["y1"] + P
+            # 카드 위 장식의 실루엣도 함께 — 안 맞으면 리본을 달아도 귀
+            # 그림자가 진다. _draw_deco와 모양을 맞춰 둘 것.
+            deco = self.card.get("deco")
+            mx = (cx0 + cx1) / 2
+            if deco == "frog":                     # 프고: 개구리 눈 실루엣
+                for ex in (mx - 26, mx + 26):
+                    d.ellipse([ex - 17, cy0 - 16, ex + 17, cy0 + 10],
+                              fill=(0, 0, 0, 255))
+            elif deco == "ribbon":                 # 사가: 리본 실루엣
+                for sign in (-1, 1):
+                    d.polygon([(mx, cy0 - 1), (mx + 17 * sign, cy0 - 14),
+                               (mx + 19 * sign, cy0 + 1), (mx + 15 * sign, cy0 + 6)],
+                              fill=(0, 0, 0, 255))
+                d.ellipse([mx - 5, cy0 - 6, mx + 5, cy0 + 4], fill=(0, 0, 0, 255))
+            elif deco == "sprout":                 # 기뽀: 새싹 실루엣
+                d.line([(mx, cy0 + 6), (mx, cy0 - 12)], fill=(0, 0, 0, 255), width=3)
+                for sign in (-1, 1):
+                    d.polygon([(mx, cy0 - 9), (mx + 8 * sign, cy0 - 18),
+                               (mx + 15 * sign, cy0 - 10), (mx + 6 * sign, cy0 - 4)],
+                              fill=(0, 0, 0, 255))
+            elif deco == "burger":                 # 햄북이: 미니 햄버거
+                d.pieslice([mx - 22, cy0 - 19, mx + 22, cy0 + 13],
+                           180, 360, fill=(0, 0, 0, 255))
+                d.rounded_rectangle([mx - 22, cy0 - 4, mx + 22, cy0 + 6],
+                                    radius=4, fill=(0, 0, 0, 255))
+            elif deco == "sushi":                  # 연어: 초밥 실루엣
+                d.ellipse([mx - 23, cy0 - 17, mx + 23, cy0 + 12],
+                          fill=(0, 0, 0, 255))
+            elif deco == "scarf":                  # 퀸시: 목도리 띠 (귀 없음)
+                d.rounded_rectangle([cx0 + 14, cy0 - 15, cx1 - 14, cy0 + 7],
+                                    radius=9, fill=(0, 0, 0, 255))
+            else:                                  # 귀 달린 캐릭터들
+                for ex in (cx0 + 26, cx1 - 26):
+                    d.ellipse([ex - 12, cy0 - 17, ex + 12, cy0 + 7],
+                              fill=(0, 0, 0, 255))
+            d.rounded_rectangle([cx0, cy0, cx1, cy1], radius=16, fill=(0, 0, 0, 255))
+        a = comp.getchannel("A").filter(ImageFilter.GaussianBlur(7))
+        a = a.point(lambda v: int(v * 0.30))
+        black = Image.new("RGB", comp.size, (0, 0, 0))
+        img = Image.merge("RGBA", (*black.split(), a))
+        if typing:
+            self.shadow_img_type = img
+        else:
+            self.shadow_img = img
+
+    def _lv_row(self):
+        """카드 맨 위 레벨·칭호 줄이 차지하는 높이 (안 쓰면 0).
+
+        글자 크기 설정을 키우면 칭호 알약도 커지므로 줄도 같이 키운다.
+        고정으로 두면 알약이 카드 윗변에 딱 붙어 답답해 보인다.
+        """
+        if not (self.timer_on and self.cfg.get("level", True)):
+            return 0
+        return max(LV_ROW, round(LV_ROW * getattr(self, "font_k", 1.0)))
+
+    def _card_geom(self):
+        """현재 타이머 카드의 위치·크기. 시계 펼침이면 세로 직사각형."""
+        lv = self._lv_row()
+        lv = (lv - LV_TRIM) if lv else 0
+        if self.has_clock and self.clock_open:
+            w, h = 148, 150 + lv + GOAL_ROW   # 세로가 살짝 더 긴 직사각형
+        elif self.has_clock:
+            w, h = 196, 40 + lv + GOAL_ROW
+        else:
+            # 작업 종료 버튼은 우클릭 메뉴로 옮겼다 — 그 자리에 레벨·칭호가 온다
+            w, h = 200, 62 + lv
+        x0 = getattr(self, "card_cx", self.W / 2) - w / 2
+        # 창 밖으로 나가지 않게 — 책상이 한쪽으로 치우친 캐릭터도 안 잘리게
+        x0 = max(3.0, min(x0, self.W - w - 3.0)) if self.W >= w + 6 else x0
+        # 음악 버튼이 있으면 카드를 그만큼 아래로 밀어 버튼 자리를 낸다
+        y0 = float(self.cfg.get("card_top", 22)) + self._yt_bar()
+        return {"x0": x0, "y0": y0, "x1": x0 + w, "y1": y0 + h, "w": w, "h": h}
+
+    def _resample(self):
+        """돌리고 늘릴 때 쓰는 보간.
+
+        예전에는 이분화한 그림을 다시 돌렸기 때문에 NEAREST를 썼다(어차피
+        계단이니 빠른 쪽으로). 지금은 부드러운 원본에서 돌린 뒤 마지막에
+        이분화하므로, 여기서 부드럽게 보간해야 선이 살아난다.
+        """
+        return Image.BICUBIC
+
+    def _draw_back(self, now, yo):
+        """기본 몸 뒤 파츠 (사가 양갈래·기뽀 요정 날개)."""
+        self._back_anim("back", {
+            "motion": self.cfg.get("back_motion"),
+            "amp": self.cfg.get("back_amp", 1.0),
+            "period": self.cfg.get("back_period", 2.6),
+            "jitter": self.cfg.get("back_jitter", 0.0),
+            "pivot": self.cfg.get("back_pivot"),
+        }, now, yo)
+
+    def _draw_prop_back(self, now, yo):
+        """뽑힌 소품의 몸 뒤 조각 (악마 꼬리·천사 날개)."""
+        self._back_anim("prop_back", self._prop_back_cfg, now, yo)
+
+    def _back_anim(self, name, mo, now, yo):
+        """몸 뒤 파츠 — 설정대로 살짝 움직인다.
+
+          sway : 붙는 자리를 축으로 좌우로 천천히 흔들림 (양갈래·꼬리)
+          flap : 가로로 오므렸다 폈다 (날갯짓)
+          없음 : 그냥 붙어만 있음
+
+        프레임마다 이미지를 새로 만들면 메모리가 계속 늘어나므로(옛 팔 사고),
+        움직임을 정해진 칸으로 끊어 캐시한다. 칸 수만큼만 이미지가 생긴다.
+        기본 날개와 소품 날개가 함께 있을 수 있으므로 박자는 이름별로 든다.
+        """
+        x, y = self._pos(name)
+        mode = mo.get("motion")
+        if not mode:
+            self._put(name, x, y + yo)
+            return
+        amp = float(mo.get("amp", 1.0))
+        STEPS = 12                       # 한 주기를 12칸으로 — 캐시가 12장이면 끝
+        st = self._back_st.get(name)
+        if st is None:
+            st = self._back_st[name] = {
+                "phase": 0.0, "last": 0.0,
+                "period": float(mo.get("period", 2.6))}
+        # 위상을 직접 굴린다 — 한 번 왕복할 때마다 다음 주기를 새로 뽑을 수 있게
+        # (시계에서 바로 계산하면 속도를 바꿀 수 없어 날갯짓이 기계적으로 보인다)
+        dt = 0.0 if st["last"] <= 0 else min(now - st["last"], 0.2)
+        st["last"] = now
+        st["phase"] += dt / max(st["period"], 0.15)
+        if st["phase"] >= 1.0:
+            st["phase"] -= int(st["phase"])
+            st["period"] = self._new_back_period(mo)
+        k = int(st["phase"] * STEPS) % STEPS
+        got = self._back_frame(name, mode, k, STEPS, amp, mo)
+        if got is None:
+            self._put(name, x, y + yo)
+            return
+        # 여백(pad)만큼 키운 판에 그려 두었으니 그만큼 되돌려 붙인다.
+        # 이렇게 해야 회전축이 픽셀 그대로 고정된다 — 꼬리 연결부가 몸 뒤에
+        # 숨어 있으려면 축이 미끄러지면 안 된다.
+        img, pad = got
+        self.canvas.create_image(x - pad, y - pad + yo, image=img, anchor="nw")
+
+    @staticmethod
+    def _new_back_period(mo):
+        """다음 한 번의 왕복에 걸릴 시간. jitter가 있으면 매번 흔들어
+        뽑는다 — 새가 파닥이듯 빨라졌다 느려졌다 하게."""
+        base = float(mo.get("period", 2.6))
+        j = float(mo.get("jitter", 0.0) or 0.0)
+        if j <= 0:
+            return base
+        return base * random.uniform(max(0.15, 1.0 - j), 1.0 + j)
+
+    def _back_frame(self, name, mode, k, steps, amp, mo):
+        key = (name, mode, k)
+        hit = self._back_cache.get(key)
+        if hit is not None:
+            return hit
+        pil = self._pil_cache.get(name)
+        if pil is None:
+            return None
+        t = math.sin(2 * math.pi * k / steps)
+        pad = 0
+        if mode == "sway":
+            # 붙는 자리를 축으로 — 멀어질수록 크게 흔들린다. 꼬리처럼 축이
+            # 한쪽에 치우친 파츠는 pivot으로 옮긴다 (그림 크기 대비 비율).
+            px, py = (mo.get("pivot") or (0.5, 0.12))[:2]
+            cx, cy = pil.width * float(px), pil.height * float(py)
+            # expand=True로 돌리면 판이 커지면서 축이 어디로 갔는지 알기
+            # 어려워, 그리는 쪽에서 중심을 어림잡게 된다. 그러면 꼬리
+            # 연결부가 몸 밖으로 밀려 나온다. 대신 미리 여백을 둔 판에
+            # expand 없이 돌려서 축을 픽셀 그대로 붙잡는다.
+            far = max(math.hypot(dx, dy) for dx, dy in
+                      ((0 - cx, 0 - cy), (pil.width - cx, 0 - cy),
+                       (0 - cx, pil.height - cy),
+                       (pil.width - cx, pil.height - cy)))
+            pad = int(math.ceil(far * 2 * math.sin(math.radians(abs(amp)) / 2))) + 2
+            base = Image.new("RGBA", (pil.width + 2 * pad, pil.height + 2 * pad),
+                             (0, 0, 0, 0))
+            base.alpha_composite(pil, (pad, pad))
+            im = base.rotate(t * amp, center=(cx + pad, cy + pad),
+                             resample=self._resample(), expand=False)
+        elif mode == "flap":
+            # 가로만 줄였다 늘렸다 — 좌우 날개가 함께 접혔다 펴지는 느낌
+            f = 1.0 - (1.0 - math.cos(2 * math.pi * k / steps)) * 0.5 * amp
+            w = max(1, int(round(pil.width * f)))
+            im = Image.new("RGBA", pil.size, (0, 0, 0, 0))
+            im.alpha_composite(pil.resize((w, pil.height), Image.LANCZOS),
+                               ((pil.width - w) // 2, 0))
+        else:
+            return None
+        if len(self._back_cache) > 40:
+            self._back_cache.clear()
+        hit = (ImageTk.PhotoImage(self._hard(im)), pad)
+        self._back_cache[key] = hit
+        return hit
+
+    def _rotated_hop(self, name, deg):
+        """손 파츠를 어깨 앵커 기준으로 회전한 이미지 (1도 단위 캐시)."""
+        h = self.hop[name]
+        key = round(deg)
+        if key not in h["cache"]:
+            if len(h["cache"]) > 60:
+                h["cache"].clear()
+            im = h["pil"].rotate(deg, center=h["anchor"],
+                                 resample=self._resample(), expand=False)
+            h["cache"][key] = ImageTk.PhotoImage(self._hard(im))
+        return h["cache"][key]
+
+    # ── 타자 소리 ─────────────────────────────────────────────────────────
+    def _list_packs(self):
+        """타자 소리 팩 목록. 캐릭터 sounds/ + 공용 '타이핑 음원/' 폴더를 함께 스캔.
+
+        사용자가 ena-mascot/타이핑 음원/ 에 (압축 푼) Mechvibes 팩 폴더를 넣으면
+        자동으로 목록에 추가된다. pack 이름 → 폴더 경로를 self._pack_paths에 저장.
+        """
+        self._pack_paths = {}
+        for base in (os.path.join(self.dir, "sounds"),
+                     os.path.join(HERE, "타이핑 음원")):
+            if not os.path.isdir(base):
+                continue
+            for d in os.listdir(base):
+                p = os.path.join(base, d)
+                if d != "pen" and os.path.exists(os.path.join(p, "config.json")):
+                    self._pack_paths.setdefault(d, p)   # 먼저 찾은 것 우선
+        return sorted(self._pack_paths)
+
+    def _init_sound(self):
+        if self.sndpack is not None:
+            try:
+                self.sndpack.close()
+            except Exception:
+                pass
+            self.sndpack = None
+        if self.pensnd is not None:
+            try:                            # 그레인은 close로 짧은 클립까지 회수
+                getattr(self.pensnd, "close", self.pensnd.stop)()
+            except Exception:
+                pass
+            self.pensnd = None
+        if self.pokesnd is not None:
+            try:
+                self.pokesnd.close()
+            except Exception:
+                pass
+            self.pokesnd = None
+        if self.snacksnd is not None:
+            try:
+                snds = (self.snacksnd.values()
+                        if isinstance(self.snacksnd, dict)
+                        else [self.snacksnd])
+                for snd in snds:
+                    snd.close()
+            except Exception:
+                pass
+            self.snacksnd = None
+        if self.roomsnd is not None:
+            try:
+                self.roomsnd.close()
+            except Exception:
+                pass
+            self.roomsnd = None
+        if self._slime_snd is not None:
+            try:
+                self._slime_snd.close()
+            except Exception:
+                pass
+            self._slime_snd = None
+        self._pen_playing = False
+        self._pen_release_t = None
+        if not (self.us.get("sound", True) and self.sound_packs):
+            return
+        name = str(self.us.get("sound_pack") or "")
+        if name not in self.sound_packs:
+            name = self.sound_packs[0]
+        pack_dir = getattr(self, "_pack_paths", {}).get(
+            name, os.path.join(self.dir, "sounds", name))
+        try:
+            self.sndpack = SoundPack(
+                pack_dir, volume=float(self.us.get("sound_volume", 60)))
+        except Exception:
+            self.sndpack = None
+        pen_dir = os.path.join(self.dir, "sounds", "pen")
+        if os.path.isdir(pen_dir):
+            vol = float(self.us.get("pen_volume", 30))
+            # pen_grain(도로롱 전용): 알갱이 방식. 실패하면 원샷으로 폴백.
+            use_grain = bool(self.cfg.get("pen_grain")) and not IS_MAC
+            try:
+                self.pensnd = (PenGrainSound(pen_dir, volume=vol) if use_grain
+                               else PenSound(pen_dir, volume=vol))
+            except Exception:
+                try:
+                    self.pensnd = PenSound(pen_dir, volume=vol)
+                except Exception:
+                    self.pensnd = None
+        self._pen_grain = isinstance(self.pensnd, PenGrainSound)
+        poke_dir = os.path.join(self.dir, "sounds", "poke")
+        if os.path.isdir(poke_dir):
+            try:
+                self.pokesnd = PokeSound(
+                    poke_dir, volume=float(self.us.get("poke_volume", 40)))
+            except Exception:
+                self.pokesnd = None
+        # 홈에서 온 반응은 평소 말풍선 소리('뿅')와 달라야 구분이 된다.
+        # 종소리 두 음짜리 '띠링' — 없으면 그냥 평소 소리로 물러난다.
+        room_dir = os.path.join(self.dir, "sounds", "room")
+        if os.path.isdir(room_dir):
+            try:
+                self.roomsnd = PokeSound(
+                    room_dir, volume=float(self.us.get("poke_volume", 40)))
+            except Exception:
+                self.roomsnd = None
+        # '샤라랑' — 스페셜 컵케이크를 받을 때만 나는 반짝임 소리
+        sp_dir = os.path.join(self.dir, "sounds", "special")
+        if os.path.isdir(sp_dir):
+            try:
+                self.sparksnd = PokeSound(
+                    sp_dir, volume=float(self.us.get("poke_volume", 40)))
+            except Exception:
+                self.sparksnd = None
+        # 간식 먹는 소리 — 종류별 폴더(crunch/drink/munch)에서 간식에 맞는
+        # 것을 낸다. 케이크에서 얼음 소리가 나면 이상하니까. 하위 폴더가
+        # 없는 옛 구성(평평한 wav)은 통째로 한 묶음으로 물러난다.
+        snack_dir = os.path.join(self.dir, "sounds", "snack")
+        if os.path.isdir(snack_dir):
+            vol = float(self.us.get("poke_volume", 40))
+            pools = {}
+            for cat in os.listdir(snack_dir):
+                d2 = os.path.join(snack_dir, cat)
+                if os.path.isdir(d2):
+                    try:
+                        pools[cat] = PokeSound(d2, volume=vol)
+                    except Exception:
+                        pass
+            if not pools:
+                try:
+                    pools[""] = PokeSound(snack_dir, volume=vol)
+                except Exception:
+                    pass
+            self.snacksnd = pools or None
+        slime_dir = self._slime_dir()
+        if self.cfg.get("slime") and os.path.isdir(slime_dir):
+            # 종류마다 원본 소리 크기가 딴판이다 (직접 녹음한 것과 받은 음원).
+            # 종류별 vol로 눈금을 맞춰 둔다 — 사람이 볼륨을 다시 안 만지게.
+            vol = float(self.us.get("slime_volume", 45))
+            vol *= max(0.1, min(float(self._slime_look().get("vol", 1.0)), 2.0))
+            try:
+                self._slime_snd = SlimeSound(slime_dir,
+                                             volume=max(0.0, min(vol, 100.0)))
+            except Exception:
+                self._slime_snd = None
+
+    # ── 입력 콜백 ─────────────────────────────────────────────────────────
+    def _on_key(self, key):
+        self.key_events += 1
+        now = time.time()
+        k = str(key)
+        first = k not in self._held           # 꾹 누름(자동 반복)은 최초만
+        self._held.add(k)
+        # 투어박스 등 다이얼: 같은 키를 사람 타이핑보다 빠르게(90ms 이내) 연타 →
+        # 소리 억제 (브러시 크기·화면 회전 돌릴 때 키보드 소리 안 나게)
+        dial = (now - self._key_times.get(k, 0)) < 0.09
+        self._key_times[k] = now
+        if first and not dial:
+            self.stat["keys"] = self.stat.get("keys", 0) + 1
+        # 되돌리기(Ctrl+Z) 세기 — 그림 작업에서 가장 많이 누르는 조합이라
+        # '오늘 얼마나 고쳐 그렸나'를 보여 준다
+        if k in self.CTRL_KEYS:
+            self._ctrl_on = True
+        elif first and self._ctrl_on and self._working() and self._is_z(key):
+            self.stat["undo"] = int(self.stat.get("undo", 0)) + 1
+        sp = self.sndpack
+        if first and not dial and sp is not None:
+            try:
+                sp.play(key, self._scan_code(key))
+            except Exception:
+                pass
+
+    def _scan_code(self, key):
+        """누른 키의 PS/2 스캔코드 — 사운드 팩의 defines가 쓰는 번호.
+
+        확장키(방향키 등)는 Mechvibes와 같게 3584를 더한 번호로 맞춘다.
+        """
+        if not IS_WIN:
+            return None
+        vk = getattr(key, "vk", None)
+        if vk is None:
+            vk = getattr(getattr(key, "value", None), "vk", None)
+        if not vk:
+            ch = getattr(key, "char", None)   # vk가 없으면 글자로 되짚는다
+            if not (isinstance(ch, str) and len(ch) == 1):
+                return None
+            try:
+                fn = ctypes.windll.user32.VkKeyScanW
+                fn.argtypes = [ctypes.c_wchar]   # 코드가 아니라 글자를 넘긴다
+                fn.restype = ctypes.c_short      # 못 찾으면 -1
+                got = fn(ch)
+            except Exception:
+                return None
+            if got == -1:
+                return None
+            vk = got & 0xFF
+        try:
+            sc = ctypes.windll.user32.MapVirtualKeyW(int(vk), 4)  # VK_TO_VSC_EX
+        except Exception:
+            return None
+        if not sc:
+            return None
+        return 3584 + (sc & 0xFF) if sc > 0xFF else sc
+
+    def _poll_mac_input(self):
+        """맥: 리스너 콜백 대신 카운터 변화를 읽어 같은 상태를 만든다."""
+        mi = self._macin
+        if mi is None:
+            return
+        dk, dm, pressed = mi.read()
+        now = time.time()
+        if dk:
+            self.key_events += dk
+            self.stat["keys"] = self.stat.get("keys", 0) + dk
+            sp = self.sndpack
+            if sp is not None:
+                try:
+                    sp.play(self.key_events)      # 한 프레임에 한 번만
+                except Exception:
+                    pass
+        if dm:
+            self.last_pointer = now
+            if self.mouse_pressed:
+                self.last_drag = now
+        if pressed != self.mouse_pressed:
+            self.mouse_pressed = pressed
+            self.last_pointer = now
+            if not pressed:
+                self._new_stroke = True
+
+    CTRL_KEYS = ("Key.ctrl_l", "Key.ctrl_r", "Key.ctrl",
+                 "Key.cmd", "Key.cmd_r")
+
+    @staticmethod
+    def _is_z(key):
+        """Ctrl과 같이 눌린 키가 Z인가. 한글 상태에서도 잡히게 VK도 본다."""
+        ch = getattr(key, "char", None)
+        if ch in ("z", "Z", "\x1a"):
+            return True
+        return getattr(key, "vk", None) in (90, 122)
+
+    def _on_key_release(self, key):
+        self._held.discard(str(key))
+        if str(key) in self.CTRL_KEYS:
+            self._ctrl_on = False
+
+    def _working(self):
+        """지금이 '작업 중'인가 — 흔적(클릭·거리·되돌리기)은 이때만 센다."""
+        return getattr(self, "_last_state", None) == "work"
+
+    def _on_click(self, x, y, _button, pressed):
+        self.mouse_pressed = pressed
+        now = time.time()
+        self.last_pointer = now
+        # 작업 흔적: 누른 뒤 5px 넘게 끌었으면 '선', 아니면 '클릭'.
+        # (기존 타이머의 input_tracker와 같은 기준으로 맞췄다)
+        if pressed:
+            self._drag_px = 0.0
+            self._drag_at = (x, y)
+        else:
+            if self._working() and self._drag_at is not None \
+                    and self._drag_px <= 5.0:
+                self.stat["clicks"] = int(self.stat.get("clicks", 0)) + 1
+            self._drag_at = None
+            self._new_stroke = True
+        # 펜 소리는 여기서 바로 판정한다 — 그리기 루프를 기다리면 늦다.
+        # 슬라임을 꺼내 놓았으면 펜을 내려놓은 것이므로 사각거리는 소리도 없다
+        # (안 그러면 슬라임을 끄는 동안 펜 소리가 같이 난다).
+        if (self._pen_grain and self.pensnd is not None
+                and self._slime_grab is None):
+            try:
+                if pressed:
+                    self.pensnd.pen_down(x, y, now)
+                else:
+                    self.pensnd.pen_up(now)
+            except Exception:
+                pass
+
+    def _on_move(self, x, y):
+        now = time.time()
+        self.last_pointer = now
+        if self.mouse_pressed:
+            self.last_drag = now
+            if self._drag_at is not None:
+                d = math.hypot(x - self._drag_at[0], y - self._drag_at[1])
+                self._drag_at = (x, y)
+                self._drag_px += d
+                if self._working():
+                    self.stat["px"] = float(self.stat.get("px", 0.0)) + d
+        if (self._pen_grain and self.pensnd is not None
+                and self._slime_grab is None):
+            try:
+                self.pensnd.pen_move(x, y, now)
+            except Exception:
+                pass
+
+    def _on_press(self, e):
+        self._press = (e.x, e.y, e.x_root, e.y_root)
+        self._dragged = False
+        self._slime_grab = None
+        if self.slime is not None:
+            self._safe("slime_press", self._slime_press, e.x, e.y)
+
+    def _on_drag(self, e):
+        # 슬라임을 잡고 있으면 창을 옮기지 않는다 — 그 손짓은 늘이기다
+        if self._slime_grab is not None:
+            self._safe("slime_move", self._slime_move, e.x, e.y)
+            return
+        if self._press is None:
+            return
+        px, py, prx, pry = self._press
+        if not self._dragged and abs(e.x_root - prx) + abs(e.y_root - pry) < 4:
+            return
+        self._dragged = True
+        self.root.geometry(f"+{e.x_root - px}+{e.y_root - py}")
+
+    def _on_release(self, e):
+        if self._slime_grab is not None:
+            self._safe("slime_up", self._slime_release)
+            self._slime_grab = None
+            self._press = None
+            return
+        if self._dragged:
+            self._safe("win_pos", self._save_win_pos)
+        if self._press is not None and not self._dragged:
+            px, py, _, _ = self._press
+            g = self._card_geom()
+            on_card = (g["x0"] <= px <= g["x1"] and g["y0"] - 17 <= py <= g["y1"])
+            mb = getattr(self, "_yt_btn", None)
+            dot = getattr(self, "_dot_btn", None)
+            box = self._snack_box
+            sn = self._snack_get()
+            if (box and sn
+                    and time.time() - float(sn.get("t") or 0) >= self.SNACK_DROP
+                    and box[0] <= px <= box[2] and box[1] <= py <= box[3]):
+                # 간식을 눌렀다 — 먹고 치운다. 떨어지는 동안(1.2초)에는 누를
+                # 자리가 캐릭터 얼굴 위를 지나가서, 콕 찌르려던 클릭이
+                # 간식을 모르는 새에 먹어 버렸다 (멸종 제보) — 착지 후부터만.
+                self._safe("snack_eat", self._snack_eat)
+                self._press = None
+                return
+            if dot and (px - dot[0]) ** 2 + (py - dot[1]) ** 2 <= dot[2] ** 2:
+                self.open_update_news()
+                self._press = None
+                return
+            # 음악 버튼이 카드 윗변에 걸쳐 있으므로 카드보다 먼저 본다
+            if mb and (px - mb[0]) ** 2 + (py - mb[1]) ** 2 <= (mb[2] + 3) ** 2:
+                self._safe("music", self._yt_toggle)
+            elif self.has_clock and on_card:
+                self._toggle_clock()
+            elif self.cfg.get("slime") and not on_card and self._on_desk(px, py):
+                # 책상을 누르면 슬라임을 꺼냈다 치웠다 한다. 슬라임 위를
+                # 눌렀으면 이미 _on_press가 붙잡았으므로 여기까지 안 온다.
+                self._safe("slime_open",
+                           self._slime_close if self.slime is not None
+                           else self._slime_open)
+            elif self.can_talk and not on_card and py > self.oy:
+                self._on_poke()                        # 캐릭터를 콕 찌름
+        self._press = None
+
+    def _todo_load(self):
+        try:
+            with open(self.todo_path, encoding="utf-8") as fp:
+                data = json.load(fp)
+            items = data if isinstance(data, list) else data.get("items", [])
+            keep = []
+            for t in items:
+                if isinstance(t, dict):
+                    if str(t.get("t", "")).strip():
+                        keep.append(todo_pack(t.get("t", ""), t.get("b"),
+                                              t.get("i"), t.get("s", 0) or 0))
+                elif str(t).strip():
+                    keep.append(str(t)[:200])
+            self.todos = keep[:20]
+            if isinstance(data, dict):
+                p = data.get("pos")
+                if isinstance(p, (list, tuple)) and len(p) == 2:
+                    self.todo_pos = (int(p[0]), int(p[1]))
+                self.todo_flip = bool(data.get("flip"))
+                self.todo_zoom = TodoPanel._near_zoom(data.get("zoom", 100))
+        except Exception:
+            self.todos = []
+
+    def _todo_save(self):
+        try:
+            _save_json(self.todo_path,
+                       {"items": self.todos, "pos": self.todo_pos,
+                        "flip": self.todo_flip, "zoom": self.todo_zoom})
+        except Exception:
+            pass
+
+    def _todo_upload(self, text):
+        """완료한 할 일을 워크스페이스 '오늘의 할일'에 완료 상태로 올린다.
+
+        여기서 직접 서버에 보내지 않고 줄 단위로 파일에 적어 둔다. 기존
+        타이머가 읽어 올려 주므로, 지금 꺼져 있어도 다음에 켜질 때 올라간다.
+        날짜(작업일 경계 06:00) 계산도 그쪽 기준 하나로 통일한다.
+        """
+        text = str(text).strip()
+        if not (text and self.ws_path and self.cfg.get("workspace_todo")):
+            return
+        path = os.path.join(os.path.dirname(self.ws_path), ".mascot_todo")
+        with open(path, "a", encoding="utf-8") as fp:
+            fp.write(json.dumps({"goal": text[:500], "ts": time.time()},
+                                ensure_ascii=False) + os.linesep)
+
+    def _todo_zoomed(self, pct):
+        """할 일 목록 배율을 기억하고 바로 다시 그린다."""
+        # 자리는 저장하지 않는다 — 직접 옮긴 적이 없다면 다음에 켤 때도
+        # 그때의 폭에 맞춰 캐릭터 옆에 붙는 게 맞다.
+        self.todo_zoom = int(pct)
+        self._todo_save()
+        self._last_pos = None                # 다음 틱에 위치 재적용
+        self._todo_refresh()
+
+    def _todo_flipped(self, flip):
+        """꼬리 방향을 기억한다 — 패널을 캐릭터 오른쪽에 두는 사람도 있다."""
+        self.todo_flip = bool(flip)
+        self._todo_save()
+        self._todo_refresh()
+
+    def _todo_moved(self, x, y):
+        """패널을 끌어서 옮기면 본체 기준 상대 위치로 기억한다."""
+        self.todo_pos = (int(x - self.root.winfo_rootx()),
+                         int(y - self.root.winfo_rooty()))
+        if self.todo_panel is not None:
+            self.todo_panel.offset = self.todo_pos
+            self.todo_panel._moved_by_user = True
+        self._last_pos = None                # 다음 틱에 위치 재적용
+        self._todo_save()
+
+    def _due_tick(self):
+        """마감 말풍선을 캐릭터 옆에 붙여 두고, 날짜가 바뀌면 다시 그린다."""
+        if self.due_panel is None:
+            return
+        if time.strftime("%Y-%m-%d") != self._due_shown:
+            self._due_refresh()
+            return
+        self.due_panel.place(self.root.winfo_rootx(), self.root.winfo_rooty())
+
+    def _todo_refresh(self):
+        if self.todo_panel is None:
+            return
+        self.todo_panel.render(self.todos)
+        self.todo_panel.place(self.root.winfo_rootx(), self.root.winfo_rooty())
+
+    def _todo_done(self, idx):
+        """우클릭 > 완료 — 그 할 일이 사라지고 캐릭터가 축하해 준다."""
+        if not (0 <= idx < len(self.todos)):
+            return
+        done_text = todo_text(self.todos[idx])
+        del self.todos[idx]
+        self._todo_save()
+        self._safe("todo_up", self._todo_upload, done_text)
+        self._todo_refresh()
+        now = time.time()
+        self.smile_until = now + 4.0        # 웃는 표정 (파츠 없으면 그냥 넘어감)
+        self.click_bounce = now + 0.45      # 콩 하고 튐
+        self.squash_until = now + 0.12
+        self._gest_start("clap", force=True)
+        left = len(self.todos)
+        msg = ("할 일 다 끝냈어요!" if left == 0
+               else random.choice(["하나 끝!", "잘했어요!", "좋아요!",
+                                   f"{left}개 남았어요!"]))
+        self._say(msg, 3.0)
+        self._safe("todo_pop", self._burst, 18)
+        for _ in range(2):                  # 잘했다는 하트
+            self._safe("fx", self._spawn_note, now, "heart")
+
+    def _todo_delete(self, idx):
+        """우클릭 > 삭제 — 목록에서만 뺀다.
+
+        '완료'와 다르다. 축하도 없고 끝낸 일로 기록에도 올리지 않는다
+        (잘못 적었거나 안 하기로 한 일을 지우는 용도).
+        """
+        if not (0 <= idx < len(self.todos)):
+            return
+        del self.todos[idx]
+        self._todo_save()
+        self._todo_refresh()
+
+    def _todo_edit(self, idx):
+        """우클릭 > 수정 — 그 할 일의 글을 고친다."""
+        if 0 <= idx < len(self.todos):
+            self.add_todo(edit=idx)
+
+    def add_todo(self, edit=None):
+        """할 일 입력 창 — 엔터로 추가, Esc로 닫기. 연달아 여러 개 적을 수 있다.
+
+        굵기·기울임·글자 크기를 고를 수 있고, 고른 대로 입력칸에 바로 보인다.
+        Shift+엔터로 줄을 바꾼다 (말풍선에도 그대로 나온다).
+        edit에 번호를 주면 그 할 일을 고치는 창이 된다(엔터 한 번으로 끝).
+        """
+        if getattr(self, "_todo_win", None) is not None \
+                and self._todo_win.winfo_exists():
+            self._todo_win.destroy()        # 수정 창을 새로 열 수 있게 닫는다
+        cd = self.card
+        u = self._ui
+        W, H = u(320), u(198)
+        cur = (self.todos[edit] if edit is not None and edit < len(self.todos)
+               else "")
+        bold, italic, size = todo_style(cur)
+        sty = {"b": bold, "i": italic, "s": size}
+
+        win = tk.Toplevel(self.root)
+        self._todo_win = win
+        win.title("할 일 수정" if edit is not None else "할 일 추가")
+        win.attributes("-topmost", True)
+        win.resizable(False, False)
+        win.configure(bg=cd["panel"])
+        cv = tk.Canvas(win, width=W, height=H, bg=cd["panel"],
+                       highlightthickness=0)
+        cv.pack()
+
+        def rr(x0, y0, x1, y1, r, **kw):
+            pts = [x0 + r, y0, x1 - r, y0, x1, y0, x1, y0 + r, x1, y1 - r, x1, y1,
+                   x1 - r, y1, x0 + r, y1, x0, y1, x0, y1 - r, x0, y0 + r, x0, y0]
+            return cv.create_polygon(pts, smooth=True, **kw)
+
+        rr(u(14), u(12), W - u(14), u(44), u(12), fill=cd["soft"],
+           outline=cd["border"], width=2)
+        cv.create_text(W / 2, u(28),
+                       text="이렇게 바꿀까요?" if edit is not None else "무엇을 할까요?",
+                       font=self._uf(10, True), fill=cd["text"])
+
+        # 여러 줄을 쓸 수 있게 Text를 쓴다. 캔버스에 얹는 위젯은 부모를
+        # 캔버스로 둬야 스크롤·크기 변화에서 삐져나오지 않는다 (지뢰 22).
+        txt = tk.Text(cv, font=self._uf(10), relief="flat", bg="#ffffff",
+                      fg=cd["text"], highlightthickness=1, wrap="word",
+                      highlightbackground=cd["border"],
+                      highlightcolor=cd["fill"], undo=True)
+        cv.create_window(u(20), u(56), anchor="nw", window=txt,
+                         width=W - u(40), height=u(58))
+        txt.insert("1.0", todo_text(cur))
+
+        # ── 구간별 꾸밈 ──────────────────────────────────────────────────
+        # 다른 편집기처럼, 끌어서 고른 부분에만 굵기·기울임이 걸린다.
+        # 아무것도 안 골랐으면 글 전체에 건다(예전 방식과 같게).
+        uk = getattr(self, "ui_k", 1.0)
+        # 두 가지 방식이 섞이면 헷갈린다. 구간을 골라 바꾸기 전까지는
+        # '글 전체' 방식으로 두어, 단추를 먼저 누르고 타이핑해도 그대로
+        # 적용되게 한다. 한 번이라도 골라서 바꾸면 그때부터 구간별이다.
+        part = {"on": len(todo_runs(cur)) > 1}
+
+        def tag_font(bold, italic):
+            return run_font(bold, italic, 10, sty["s"], uk)
+
+        txt.tag_configure("b", font=tag_font(True, False))
+        txt.tag_configure("i", font=tag_font(False, True))
+        txt.tag_configure("bi", font=tag_font(True, True))
+
+        def retag():
+            """굵기/기울임 표시를 실제 글꼴로 다시 칠한다 (크기가 바뀔 때도)."""
+            txt.tag_configure("b", font=tag_font(True, False))
+            txt.tag_configure("i", font=tag_font(False, True))
+            txt.tag_configure("bi", font=tag_font(True, True))
+            n = len(txt.get("1.0", "end-1c"))
+            for j in range(n):                # 둘 다면 합친 표시로 바꿔 준다
+                a, z = "1.0+%dc" % j, "1.0+%dc" % (j + 1)
+                names = set(txt.tag_names(a))
+                both = {"b", "i"} <= names
+                txt.tag_remove("bi", a, z)
+                if both:
+                    txt.tag_add("bi", a, z)
+
+        def sel_range():
+            """지금 고른 구간. 안 골랐으면 None."""
+            try:
+                return txt.index("sel.first"), txt.index("sel.last")
+            except tk.TclError:
+                return None
+
+        def marks_of(a, z):
+            """그 구간이 이미 전부 그 표시인가."""
+            def all_has(tag):
+                j, n = 0, len(txt.get(a, z))
+                for j in range(n):
+                    if tag not in txt.tag_names("%s+%dc" % (a, j)):
+                        return False
+                return n > 0
+            return all_has
+
+        def whole_tags():
+            """'글 전체' 방식일 때 — 지금 글자 전부에 표시를 다시 맞춘다."""
+            for key in ("b", "i"):
+                txt.tag_remove(key, "1.0", "end")
+                if sty[key] and txt.get("1.0", "end-1c"):
+                    txt.tag_add(key, "1.0", "end-1c")
+
+        def toggle(key):
+            rng = sel_range()
+            if rng is None:                   # 고른 게 없으면 글 전체
+                sty[key] = not sty[key]
+                whole_tags()
+            else:
+                part["on"] = True             # 여기서부터 구간별
+                a, z = rng
+                if marks_of(a, z)(key):
+                    txt.tag_remove(key, a, z)
+                else:
+                    txt.tag_add(key, a, z)
+            apply_font()
+
+        def apply_font():
+            """입력칸 글꼴을 지금 방식에 맞춘다.
+
+            글 전체 방식이면 칸 자체를 굵게/기울임으로 둔다 — 그래야 단추를
+            먼저 누르고 타이핑해도 눈에 보이고 그대로 저장된다.
+            """
+            if part["on"]:
+                txt.config(font=run_font(False, False, 10, sty["s"], uk))
+            else:
+                txt.config(font=run_font(sty["b"], sty["i"], 10, sty["s"], uk))
+                whole_tags()
+            retag()
+
+        # ── 꾸밈 단추 ────────────────────────────────────────────────────
+        chips = {}
+
+        def chip(x0, x1, y0, label, key, font=None):
+            box = (x0, y0, x1, y0 + u(26))
+            shape = rr(*box, u(9), fill=cd["soft"], outline=cd["border"],
+                       width=1)
+            tid = cv.create_text((x0 + x1) / 2, y0 + u(13), text=label,
+                                 font=font or self._uf(9, True), fill=cd["sub"])
+            chips[key] = (shape, tid, box)
+            return box
+
+        def paint():
+            rng = sel_range()
+            for key, (shape, tid, _) in chips.items():
+                if key not in ("b", "i"):
+                    continue
+                # 고른 구간이 있으면 그 구간의 상태를, 없으면 글 전체 상태를
+                on = marks_of(*rng)(key) if rng else sty[key]
+                cv.itemconfig(shape, fill=cd["fill"] if on else cd["soft"],
+                              outline=cd["fill"] if on else cd["border"])
+                cv.itemconfig(tid, fill="#ffffff" if on else cd["sub"])
+            cv.itemconfig(chips["size"][1], text="크기 %+d" % sty["s"]
+                          if sty["s"] else "크기 보통")
+            apply_font()
+
+        y0 = u(124)
+        chip(u(20), u(74), y0, "굵게", "b", self._uf(9, True))
+        chip(u(80), u(140), y0, "기울임", "i",
+             (UI_FONT, max(7, round(9 * getattr(self, "ui_k", 1.0))),
+              "italic"))
+        chip(u(150), u(180), y0, "－", "minus")
+        chip(u(184), u(250), y0, "크기 보통", "size")
+        chip(u(254), u(284), y0, "＋", "plus")
+
+        def on_chip(e):
+            for key, (_, _, box) in chips.items():
+                if box[0] <= e.x <= box[2] and box[1] <= e.y <= box[3]:
+                    if key in ("b", "i"):
+                        toggle(key)
+                    elif key == "minus":
+                        sty["s"] = max(-4, sty["s"] - 1)
+                    elif key == "plus":
+                        sty["s"] = min(8, sty["s"] + 1)
+                    elif key == "size":
+                        sty["s"] = 0
+                    paint()
+                    txt.focus_set()
+                    return
+
+        cv.bind("<Button-1>", on_chip)
+        cv.create_text(W / 2, u(176),
+                       text=("엔터로 저장 · Shift+엔터 줄바꿈 · Esc로 취소"
+                             if edit is not None
+                             else "엔터로 추가 · Shift+엔터 줄바꿈 · Esc로 닫기"),
+                       font=self._uf(8), fill=cd["sub"])
+        paint()
+
+        def commit(_e=None):
+            raw = txt.get("1.0", "end-1c")
+            text = raw.strip()
+            if part["on"]:                    # 구간별 — 표시를 그대로 읽는다
+                lead = len(raw) - len(raw.lstrip())
+                segs = [(chx,
+                         "b" in txt.tag_names("1.0+%dc" % (lead + j)),
+                         "i" in txt.tag_names("1.0+%dc" % (lead + j)))
+                        for j, chx in enumerate(text)]
+                runs = runs_pack(segs)
+                flags = {f for _n, f in runs}
+                if len(flags) <= 1:   # 결국 통째로 같으면 예전 방식으로 저장
+                    f = flags.pop() if flags else 0
+                    b_, i_ = bool(f & 1), bool(f & 2)
+                else:
+                    b_, i_ = sty["b"], sty["i"]
+            else:                             # 글 전체 — 고른 대로
+                runs, b_, i_ = [], sty["b"], sty["i"]
+            item = todo_pack(text, b_, i_, sty["s"], runs)
+            if edit is not None:                 # 수정: 한 번 고치고 닫는다
+                if text and edit < len(self.todos):
+                    self.todos[edit] = item
+                    self._todo_save()
+                    self._todo_refresh()
+                win.destroy()
+                return "break"
+            if text:
+                self.todos.append(item)
+                del self.todos[20:]
+                self._todo_save()
+                self._todo_refresh()
+                txt.delete("1.0", "end")
+            else:
+                win.destroy()
+            return "break"
+
+        def on_return(e):
+            if e.state & 0x0001:        # Shift — 줄바꿈은 그대로 둔다
+                return None
+            return commit()
+
+        txt.bind("<Return>", on_return)
+        # 고른 구간이 바뀌면 단추 표시도 따라가야 한다 (다른 편집기처럼)
+        for ev in ("<ButtonRelease-1>", "<KeyRelease>", "<<Selection>>"):
+            txt.bind(ev, lambda _e: paint(), add="+")
+        win.bind("<Escape>", lambda _e: win.destroy())
+        self._place_near(win)
+        self._dialog_keep(win, "todo")
+        txt.focus_force()
+        if edit is not None:
+            # 저장돼 있던 구간별 꾸밈을 입력칸에 그대로 되살린다
+            pos = 0
+            for seg, b_, i_ in todo_runs(cur):
+                a, z = "1.0+%dc" % pos, "1.0+%dc" % (pos + len(seg))
+                if b_:
+                    txt.tag_add("b", a, z)
+                if i_:
+                    txt.tag_add("i", a, z)
+                pos += len(seg)
+            retag()
+            txt.tag_add("sel", "1.0", "end-1c")   # 바로 고쳐 쓸 수 있게
+            paint()
+
+    def _on_poke(self):
+        """캐릭터 클릭 반응 — 콩 튀고 한마디. (반응 파츠는 나중에 교체 가능)"""
+        now = time.time()
+        self.click_bounce = now + 0.45
+        self.squash_until = now + 0.12
+        self._panel_z = 0.0          # 눌러서 캐릭터가 앞으로 나왔다 — 바로 되돌린다
+        if self.pokesnd is not None:
+            try:
+                self.pokesnd.play()
+            except Exception:
+                pass
+        if self.stretch_pending:          # 스트레칭 알림을 끄는 클릭
+            self._stretch_done(now)
+            return
+        # 세 번에 한 번쯤은 몸으로도 반응한다 (매번 하면 금방 질린다)
+        if random.random() < 0.35:
+            self._gest_start(random.choice(("wave", "nod", "shake")))
+        self._say(self._pick_talk(self._click_pool()), 2.2)
+
+    def _relayout_card(self):
+        """카드 위 여백(oy)이 달라졌을 때 창·좌표·그림자를 다시 맞춘다.
+
+        창은 아래를 고정하고 위로 자란다 — 캐릭터가 책상에 앉은 자리가
+        움직이지 않게. 시계 펼침과 음악 버튼이 이 길을 같이 쓴다.
+        """
+        old_oy, old_H = self.oy, self.H
+        new_oy = self._timer_oy()
+        if new_oy == old_oy:
+            return
+        old_x, old_y = self.root.winfo_x(), self.root.winfo_y()
+        self.oy = new_oy
+        self.H = self.ch_px + self.oy
+        d = self.oy - old_oy
+        self.canvas.config(height=self.H)
+        self.root.geometry(f"{self.W}x{self.H}+{old_x}+{old_y - (self.H - old_H)}")
+        self._pen_xy[1] += d                 # 좌표계가 d만큼 내려가므로 펜도 이동
+        self._bake_oy()
+        self._build_shadow_img()
+        if self.shadow is not None and self.shadow_img is not None:
+            self.shadow.set_image(self.shadow_img)
+
+    def _toggle_clock(self):
+        """시계 펼침/접힘 — 창 높이를 바꾸고(아래 고정) 좌표·그림자 재계산."""
+        self.clock_open = not self.clock_open
+        self.us["clock_open"] = self.clock_open
+        self._save_settings()
+        self._relayout_card()
+
+    def close(self):
+        try:
+            # 예약해 둔 다음 프레임을 먼저 거둔다. 안 그러면 창을 닫은 뒤에
+            # 그 프레임이 없어진 창을 불러 'invalid command name' 이 뜬다.
+            if self._tick_after is not None:
+                try:
+                    self.root.after_cancel(self._tick_after)
+                except Exception:
+                    pass
+                self._tick_after = None
+            if getattr(self, "_photo_after", None) is not None:
+                try:
+                    self.root.after_cancel(self._photo_after)
+                except Exception:
+                    pass
+                self._photo_after = None
+            if getattr(self, "_stk_after", None) is not None:
+                try:
+                    self.root.after_cancel(self._stk_after)
+                except Exception:
+                    pass
+                self._stk_after = None
+            if self.timer_on and self.ws_path is None:
+                self._timer_save()
+            if self._kb is not None:
+                self._kb.stop()
+            if self._ms is not None:
+                self._ms.stop()
+            if self.tray is not None:
+                self.tray.close()
+            if self._fx is not None:
+                self._fx.destroy()
+                self._fx = None
+            # 음악 재생기를 먼저 거둔다. 파이프가 닫히면 스스로 끝나지만,
+            # 여기서 확실히 보내 두어야 고아 프로세스가 남지 않는다.
+            self._yt_stop()
+            if self._stk is not None:
+                # 자리를 저장하고 거둔다. 타이머를 끄면 스티커도 같이 사라진다.
+                try:
+                    self._stk.shutdown()
+                except Exception:
+                    pass
+                self._stk = None
+            if self.todo_panel is not None:
+                self.todo_panel.destroy()
+            if self.due_panel is not None:
+                self.due_panel.destroy()
+            # 살아있음 신호를 지운다. 안 지우면 에이전트가 최대 8초 동안
+            # '아직 떠 있다'고 착각해서, 그 사이 아이콘을 눌러도 캐릭터가
+            # 안 뜨고 클릭이 그냥 삼켜진다.
+            if self.ws_path is not None:
+                try:
+                    base = os.path.dirname(self.ws_path)
+                    os.remove(os.path.join(base, ".mascot_live"))
+                    try:
+                        os.remove(os.path.join(base, ".mascot_pid"))
+                    except OSError:
+                        pass
+                except OSError:
+                    pass
+        finally:
+            self.root.destroy()
+
+    # ── 타이머 ───────────────────────────────────────────────────────────
+    def _timer_load(self):
+        # 자동 초기화 없음 — 우클릭 '타이머 초기화'로만 리셋 (확정 방침)
+        try:
+            with open(self.state_path, encoding="utf-8") as fp:
+                st = json.load(fp)
+            self.work_secs = float(st.get("seconds", 0))
+            self.zero_at = float(st.get("zero_at", 0) or 0)
+            self.day_key = str(st.get("day_key", "") or "")
+            self.day_base = float(st.get("day_base", 0) or 0)
+            self.goal_cheered = str(st.get("goal_cheered", "") or "")
+            self.lv_secs = self._lv_of(st)
+            saved = st.get("stat")
+            if isinstance(saved, dict):
+                self.stat.update({k: saved.get(k, v) for k, v in self.stat.items()})
+                # 시계에 칠할 분은 집합으로 되살린다 (강제 종료로 사라지지 않게)
+                self._act = {int(v) for v in self.stat.get("mins", [])
+                             if isinstance(v, (int, float)) and 0 <= v < 1440}
+            r = st.get("rec")
+            if isinstance(r, dict):      # 세션이 이어지면 축하 기록도 이어받는다
+                self.rec["strokes"] = [int(v) for v in r.get("strokes", [])
+                                       if isinstance(v, (int, float))]
+                self.rec["focus"] = float(r.get("focus", 0) or 0)
+        except Exception:
+            pass
+
+    def _timer_save(self):
+        try:
+            self.stat["mins"] = sorted(self._act)
+            _save_json(self.state_path,
+                       {"seconds": round(self.work_secs),
+                        "zero_at": round(self.zero_at),
+                        "day_key": self.day_key,
+                        "day_base": round(self.day_base),
+                        "lv_secs": round(self.lv_secs),
+                        "lv_epoch": LV_EPOCH,
+                        "goal_cheered": self.goal_cheered,
+                        "stat": self.stat, "rec": self.rec})
+        except Exception:
+            pass
+
+    # ── 레벨 ─────────────────────────────────────────────────────────────
+    # 1시간 그리면 1레벨. 숨은 계산이 없어 'Lv42 = 41시간 넘게 그렸다'로 읽힌다.
+    # 칭호는 캐릭터마다 다르다 (config의 "titles"). 없으면 아래 기본값.
+    LV_TITLES = ((1, "첫 붓"), (3, "삐뚤빼뚤"), (5, "낙서쟁이"),
+                 (8, "지우개 친구"), (12, "선 연습생"), (16, "동그라미 장인"),
+                 (20, "밑그림쟁이"), (25, "스케치 요정"), (30, "선 긋는 사람"),
+                 (36, "색칠 견습"), (42, "팔레트 지킴이"), (50, "그리는 사람"),
+                 (60, "붓 한 자루"), (75, "채색 요정"), (90, "그림 친구"),
+                 (100, "밤샘 새싹"), (125, "커피 두 잔"), (150, "손목 조심"),
+                 (175, "마감 친구"), (200, "손이 기억해"), (250, "그림 벌레"),
+                 (300, "붓끝 장인"), (350, "레이어 부자"), (400, "한 획의 사람"),
+                 (500, "태블릿 요정"), (600, "그림쟁이"), (700, "무한 캔버스"),
+                 (800, "선의 마술사"), (900, "잠은 나중에"), (1000, "붓의 주인"),
+                 (1250, "그림 도사"), (1500, "전설의 손"), (2000, "그림 요정왕"),
+                 (3000, "붓과 한 몸"), (5000, "그림 그 자체"))
+
+    def _titles(self):
+        """이 캐릭터의 칭호 표 — [[레벨, 이름], ...]. 잘못 적혀 있으면 기본값."""
+        got = self.cfg.get("titles")
+        try:
+            out = [(int(a), str(b)) for a, b in got if str(b).strip()]
+            return sorted(out) or list(self.LV_TITLES)
+        except Exception:
+            return list(self.LV_TITLES)
+
+    def _level(self):
+        """지금 레벨. 1시간마다 하나씩 오르고, 시작이 Lv1이다."""
+        return 1 + int(max(0.0, self.lv_secs) // 3600)
+
+    def _title(self, lv=None):
+        """그 레벨의 칭호."""
+        lv = self._level() if lv is None else lv
+        name = ""
+        for need, nm in self._titles():
+            if lv >= need:
+                name = nm
+            else:
+                break
+        return name
+
+    def _lv_of(self, st):
+        """저장된 기록에서 레벨용 시간을 꺼낸다.
+
+        판 번호(lv_epoch)가 다르면 0부터 다시 센다. 레벨을 처음 넣을 때
+        '지금까지 일한 시간'을 물려주었더니 누구는 Lv7에서 시작해 다 같이
+        출발하지 못했다. 이미 물려받아 저장된 사람도 이 번호로 되돌린다.
+        """
+        try:
+            if int(st.get("lv_epoch", 0)) == LV_EPOCH:
+                return max(self._lv_floor(),
+                           float(st.get("lv_secs") or 0))
+        except (TypeError, ValueError):
+            pass
+        return self._lv_floor()
+
+    def _lv_floor(self):
+        """config의 레벨 복구 바닥 — 사고로 지워진 레벨을 되살린다.
+
+        기뽀가 중복 실행 사고로 상태 파일을 잃고 Lv12 → Lv1이 됐다.
+        친구 컴퓨터를 원격에서 고칠 통로가 배포되는 config뿐이라, 기한이
+        있는 바닥값을 둔다. 기한이 지나면 무시한다 (일부러 처음부터
+        시작하려는 사람을 막지 않게).
+        """
+        try:
+            fl = self.cfg.get("lv_floor") or {}
+            until = str(fl.get("until") or "")
+            if until and self._my_workday() <= until:
+                return max(0.0, float(fl.get("secs") or 0))
+        except Exception:
+            pass
+        return 0.0
+
+    def _lv_load(self):
+        """연동 중인 캐릭터는 타이머 기록을 안 읽으므로 레벨만 되살린다."""
+        try:
+            with open(self.state_path, encoding="utf-8") as fp:
+                self.lv_secs = self._lv_of(json.load(fp))
+        except Exception:
+            pass
+
+    def _lv_tick(self, now):
+        """레벨용 시간을 쌓는다 — 카드에 보이는 시간이 늘어난 만큼만.
+
+        예전에는 프레임 간격(dt)을 따로 더했다. 그러면 카드는 에이전트가
+        준 누적을 보여 주고 레벨은 제가 센 값을 쓰게 되어 조금씩 어긋난다
+        (실제로 카드가 1:00:10인데 레벨은 37초 뒤에야 올랐다). 이제 늘어난
+        만큼만 그대로 옮겨 담아 둘이 같은 속도로 간다.
+
+        `work_secs`를 그대로 쓸 수는 없다 — '타이머 초기화'로 0이 되고,
+        연동 중인 캐릭터는 그 값을 에이전트에게서 통째로 받아오기 때문에
+        '늘어난 만큼'만 본다.
+        """
+        prev, cur = self._lv_work, float(self.work_secs)
+        self._lv_work = cur
+        if prev is None:
+            return                  # 첫 프레임 — 기준만 잡는다 (켤 때 안 튀게)
+        d = cur - prev
+        if d <= 0:
+            return                  # 줄었으면(초기화·연동 교체) 기준만 옮긴다
+        # 한 번에 크게 뛰면(연동 복구 등) 조금만 인정한다 — 레벨은 못 되돌린다
+        self.lv_secs += min(d, 120.0)
+        if now - self._lv_save_at > 60:      # 강제 종료로 진행이 날아가지 않게
+            self._lv_save_at = now
+            self._safe("timer_save", self._timer_save)
+        lv = self._level()
+        if lv <= self._lv_seen:
+            return
+        first, self._lv_seen = self._lv_seen <= 0, lv
+        self._lv_save_at = now
+        self._safe("timer_save", self._timer_save)
+        if first or not self.can_talk:
+            return                       # 처음 켠 순간에는 축하하지 않는다
+        title = self._title(lv)
+        self._say("Lv.%d! %s" % (lv, title) if title else "Lv.%d!" % lv, 4.5)
+        self._lv_glow = now              # 카드 테두리를 한 바퀴 도는 반짝이
+        self._safe("burst", self._burst, 18, 40)
+
+    HIST_DAYS = 60               # 하루 기록을 며칠치 보관할지
+
+    def _day_hour(self):
+        """하루가 바뀌는 시각 (환경설정). 사람마다 생활 리듬이 달라서 연다."""
+        try:
+            return max(0, min(12, int(self.us.get("day_start", 6))))
+        except Exception:
+            return 6
+
+    def _my_workday(self, ts=None):
+        """이 캐릭터 기준의 작업일. 기록은 '시작한 시각'으로 날짜를 정한다.
+
+        끝낸 시각으로 정하면 밤 10시~새벽 4시 작업이 다음 날로 밀려서,
+        이틀치 작업이 하루에 뭉치고 앞날이 빈 날이 된다.
+        """
+        return _workday(ts, self._day_hour())
+
+    def _session_day(self):
+        """이번 작업의 날짜 — 처음 일한 시각 기준 (없으면 지금)."""
+        first = self.stat.get("first") or 0
+        return self._my_workday(first if first else None)
+    GOAL_TALK = ("목표 달성! 오늘 대단했어.", "목표 채웠어! 잘했어.",
+                 "오늘 목표 끝! 멋지다.")
+
+    def _goal_tick(self, now):
+        """목표 시간을 채우면 한 번 축하한다 (작업일마다 한 번)."""
+        if not (self.cfg.get("goal_cheer") and self.can_cheer):
+            return
+        today = self._my_workday()        # 축하는 '지금'이 어느 작업일인지로
+        if self.goal_cheered == today:
+            return
+        goal = max(float(self.us.get("goal_hours", 6)), 0.5) * 3600
+        if self._shown_secs() < goal:
+            return
+        self.goal_cheered = today
+        self._timer_save()
+        self.hat_until = now + 12.0
+        self.smile_until = now + 5.0
+        # 목표를 채운 날은 만세 또는 박수 — 둘 중 하나가 번갈아 나오게 한다.
+        # 새 동작이 꺼진 캐릭터에서는 만세가 무시되므로 그대로 박수가 된다.
+        if random.random() < 0.5:
+            self._gest_start("cheer", force=True)
+        if self.gest != "cheer":
+            self._gest_start("clap", force=True)
+        pool = self.cfg.get("goal_talk") or self.GOAL_TALK
+        self._say(random.choice(list(pool)), 6.0)
+        self._safe("burst", self._burst, 40, 66)
+
+    # ── 마감 목록 ────────────────────────────────────────────────────────
+    DUE_NEAR, DUE_SOON = 1, 3        # 이 날짜 안이면 색이 바뀐다
+
+    def _due_load(self):
+        try:
+            with open(os.path.join(self.state_dir, ".dues.json"),
+                      encoding="utf-8") as fp:
+                d = json.load(fp)
+            items = d.get("items", []) if isinstance(d, dict) else []
+            self.dues = [{"name": str(i.get("name", ""))[:60],
+                          "date": str(i.get("date", ""))}
+                         for i in items if str(i.get("date", "")).strip()][:20]
+            if isinstance(d, dict):
+                p_ = d.get("pos")
+                if isinstance(p_, (list, tuple)) and len(p_) == 2:
+                    self.due_pos = (int(p_[0]), int(p_[1]))
+                self.due_flip = bool(d.get("flip"))
+                self.due_zoom = TodoPanel._near_zoom(d.get("zoom", 100))
+        except Exception:
+            self.dues = []
+
+    def _due_save(self):
+        try:
+            _save_json(os.path.join(self.state_dir, ".dues.json"),
+                       {"items": self.dues, "pos": self.due_pos,
+                        "flip": self.due_flip, "zoom": self.due_zoom})
+        except Exception:
+            pass
+
+    @staticmethod
+    def _days_to(datestr):
+        """그 날짜까지 남은 날 수. 마감은 달력 날짜로 센다."""
+        try:
+            t = time.mktime(time.strptime(str(datestr), "%Y-%m-%d"))
+        except Exception:
+            return None
+        today = time.mktime(time.strptime(time.strftime("%Y-%m-%d"), "%Y-%m-%d"))
+        return int(round((t - today) / 86400))
+
+    def _due_lines(self):
+        """말풍선에 넣을 글과 색 — 가까운 마감부터 위로."""
+        rows = []
+        for d in self.dues:
+            n = self._days_to(d.get("date"))
+            if n is None:
+                continue
+            tag = "D-DAY" if n == 0 else (f"D-{n}" if n > 0 else f"D+{-n}")
+            name = (d.get("name") or "").strip()
+            # 남은 날짜를 윗줄에 굵게, 마감 이름을 아랫줄에. 먼저 눈에 들어와야
+            # 하는 것은 '며칠 남았나'다.
+            if name:
+                item = todo_pack(tag + "\n" + name, False, False, 0,
+                                 [[len(tag), 1], [1 + len(name), 0]])
+            else:
+                item = todo_pack(tag, True, False, 0)
+            rows.append((n, item))
+        rows.sort(key=lambda r: r[0])
+        texts = [t for _, t in rows]
+        tints = ["#d64a63" if n <= self.DUE_NEAR else
+                 "#e08a3c" if n <= self.DUE_SOON else None for n, _ in rows]
+        return texts, tints
+
+    def _due_refresh(self):
+        if self.due_panel is None:
+            return
+        texts, tints = self._due_lines()
+        self.due_panel.render(texts, tints)
+        self.due_panel.place(self.root.winfo_rootx(), self.root.winfo_rooty())
+        self._due_shown = time.strftime("%Y-%m-%d")
+
+    def _due_moved(self, x, y):
+        self.due_pos = (int(x - self.root.winfo_rootx()),
+                        int(y - self.root.winfo_rooty()))
+        if self.due_panel is not None:
+            self.due_panel.offset = self.due_pos
+            self.due_panel._moved_by_user = True
+        self._last_pos = None
+        self._due_save()
+
+    def _due_flipped(self, flip):
+        self.due_flip = bool(flip)
+        self._due_save()
+        self._due_refresh()
+
+    def _due_zoomed(self, pct):
+        self.due_zoom = int(pct)
+        self._due_save()
+        self._last_pos = None
+        self._due_refresh()
+
+    def _due_remove(self, idx):
+        """말풍선 우클릭 > 완료 — 그 마감을 목록에서 지운다."""
+        order = sorted(range(len(self.dues)),
+                       key=lambda i: (self._days_to(self.dues[i]["date"])
+                                      if self._days_to(self.dues[i]["date"])
+                                      is not None else 99999))
+        if not (0 <= idx < len(order)):
+            return
+        self.dues.pop(order[idx])
+        self._due_save()
+        self._due_refresh()
+        self._say("하나 끝났네!", 3.0)
+
+    def _due_edit(self, idx):
+        order = sorted(range(len(self.dues)),
+                       key=lambda i: (self._days_to(self.dues[i]["date"])
+                                      if self._days_to(self.dues[i]["date"])
+                                      is not None else 99999))
+        if 0 <= idx < len(order):
+            self.add_due(edit=order[idx])
+
+    def add_due(self, edit=None):
+        """마감 입력 창 — 이름과 날짜. 엔터로 저장, Esc로 닫기."""
+        if getattr(self, "_due_win", None) is not None                 and self._due_win.winfo_exists():
+            self._due_win.destroy()
+        cd, u = self.card, self._ui
+        W, H = u(320), u(176)
+        win = tk.Toplevel(self.root)
+        self._due_win = win
+        win.title("마감 수정" if edit is not None else "마감 추가")
+        win.attributes("-topmost", True)
+        win.resizable(False, False)
+        win.configure(bg=cd["panel"])
+        cv = tk.Canvas(win, width=W, height=H, bg=cd["panel"],
+                       highlightthickness=0)
+        cv.pack()
+
+        def rr(x0, y0, x1, y1, r, **kw):
+            pts = [x0 + r, y0, x1 - r, y0, x1, y0, x1, y0 + r, x1, y1 - r, x1, y1,
+                   x1 - r, y1, x0 + r, y1, x0, y1, x0, y1 - r, x0, y0 + r, x0, y0]
+            return cv.create_polygon(pts, smooth=True, **kw)
+
+        rr(u(14), u(12), W - u(14), u(44), u(12), fill=cd["soft"],
+           outline=cd["border"], width=2)
+        cv.create_text(W / 2, u(28), text="언제까지 끝낼까요?",
+                       font=self._uf(10, True), fill=cd["text"])
+        cur = self.dues[edit] if (edit is not None
+                                  and edit < len(self.dues)) else {}
+        nv = tk.StringVar(value=cur.get("name", ""))
+        dv = tk.StringVar(value=cur.get("date", time.strftime("%Y-%m-%d")))
+        ents = []
+        for i, (lab, var) in enumerate((("이름", nv), ("날짜", dv))):
+            ry = u(58) + i * u(38)
+            cv.create_text(u(22), ry + u(13), anchor="w", text=lab,
+                           font=self._uf(9), fill=cd["sub"])
+            e = tk.Entry(win, textvariable=var, font=self._uf(10),
+                         relief="flat", bg="#ffffff", fg=cd["text"],
+                         highlightthickness=1, highlightbackground=cd["border"],
+                         highlightcolor=cd["fill"])
+            cv.create_window(u(58), ry, anchor="nw", window=e,
+                             width=W - u(80), height=u(26))
+            ents.append(e)
+        cv.create_text(W / 2, u(150), text="날짜는 2026-08-15 처럼 · Esc로 닫기",
+                       font=self._uf(8), fill=cd["sub"])
+
+        def commit(_e=None):
+            name = nv.get().strip()[:60]
+            date = dv.get().strip()
+            if self._days_to(date) is None:      # 날짜가 틀리면 그 칸으로
+                ents[1].focus_set()
+                ents[1].selection_range(0, "end")
+                return
+            item = {"name": name, "date": date}
+            if edit is not None and edit < len(self.dues):
+                self.dues[edit] = item
+                self._due_save()
+                self._due_refresh()
+                win.destroy()
+                return
+            self.dues.append(item)
+            del self.dues[20:]
+            self._due_save()
+            self._due_refresh()
+            win.destroy()
+
+        for e in ents:
+            e.bind("<Return>", commit)
+        win.bind("<Escape>", lambda _e: win.destroy())
+        self._place_near(win)
+        self._dialog_keep(win, "due")
+        ents[0].focus_force()
+
+    def _hist_load(self):
+        """날짜별 하루 기록 {"2026-07-30": {...}}."""
+        try:
+            with open(os.path.join(self.state_dir, ".history.json"),
+                      encoding="utf-8") as fp:
+                d = json.load(fp)
+            return d.get("days", {}) if isinstance(d, dict) else {}
+        except Exception:
+            return {}
+
+    def _hist_add(self, key=None):
+        """그날 기록을 남긴다. 작업 종료 때와 작업일이 바뀔 때 부른다.
+
+        작업 시간은 '더하기'가 아니라 '덮어쓰기'다 — 하루에 몇 번을 끝내도
+        같은 값이 되어 겹칠 수가 없다. 획·클릭처럼 세션마다 0으로 되돌리는
+        값들은 더해서 하루치를 만든다.
+        """
+        if not self.cfg.get("history"):
+            return
+        days = self._hist_load()
+        key = key or self._session_day()
+        cur = days.get(key) or {}
+        s_ = self.stat
+        dist = self._dist_m()
+        days[key] = {
+            "work": max(int(cur.get("work", 0)), int(self._today_secs())),
+            "strokes": int(cur.get("strokes", 0)) + int(s_.get("strokes", 0)),
+            "keys": int(cur.get("keys", 0)) + int(s_.get("keys", 0)),
+            "best": max(int(cur.get("best", 0)), int(s_.get("best", 0))),
+            "runs": int(cur.get("runs", 0)) + 1,
+            "clicks": int(cur.get("clicks", 0)) + int(s_.get("clicks", 0)),
+            "undo": int(cur.get("undo", 0)) + int(s_.get("undo", 0)),
+            "dist": round(float(cur.get("dist", 0.0)) + dist, 2),
+        }
+        for k in sorted(days)[:-self.HIST_DAYS]:      # 오래된 것부터 버린다
+            days.pop(k, None)
+        # 누적 거리는 따로 든다. 날짜 기록은 60일이 지나면 버려지는데,
+        # 마일스톤은 '처음부터 지금까지'라 거기서 빼면 뒷걸음질친다.
+        try:
+            cum = round(self._cum_m() + dist, 2)
+            _save_json(os.path.join(self.state_dir, ".history.json"),
+                       {"days": days, "cum_m": cum})
+        except Exception:
+            pass
+        # 이번 세션 몫은 여기서 0으로 되돌린다. 안 그러면 하루에 두 번
+        # 끝냈을 때 같은 획·클릭이 기록에 두 번 들어간다.
+        # (작업 시간은 zero_at이 같은 일을 이미 하고 있다.)
+        for k in ("strokes", "keys", "clicks", "undo", "px",
+                  "best", "runs", "_run", "first", "last"):
+            self.stat[k] = 0 if isinstance(self.stat.get(k), int) else 0.0
+
+    def _dist_m(self):
+        """이번 세션에 끌면서 지나간 거리(m). 화면 DPI로 환산한다."""
+        dpi = getattr(self, "_dpi", 0) or screen_dpi()
+        self._dpi = dpi
+        return float(self.stat.get("px", 0.0)) / dpi * 0.0254
+
+    def _cum_m(self):
+        """지금까지 그린 누적 거리(m) — 저장된 값만. 이번 세션은 안 들어 있다."""
+        try:
+            with open(os.path.join(self.state_dir, ".history.json"),
+                      encoding="utf-8") as fp:
+                d = json.load(fp)
+            return float(d.get("cum_m", 0.0)) if isinstance(d, dict) else 0.0
+        except Exception:
+            return 0.0
+
+    def _hist_summary(self):
+        """브리핑에 붙일 요약 — 어제 대비 · 최근 7일 · 연속 일수."""
+        days = self._hist_load()
+        if not days:
+            return None
+        # 기준일은 '지금'이 아니라 이번 작업이 기록된 날이어야 한다.
+        # 밤을 새워 경계를 넘으면 기록은 시작한 날에 들어가는데 여기서 지금
+        # 날짜를 쓰면, 오늘 기록을 '어제'로 보여 주고 연속도 끊긴 것으로 센다.
+        today = self._session_day()
+
+        def shift(key, n):
+            t = time.mktime(time.strptime(key, "%Y-%m-%d")) + n * 86400
+            return time.strftime("%Y-%m-%d", time.localtime(t))
+
+        yday = days.get(shift(today, -1), {}).get("work", 0)
+        week = sum(int(days.get(shift(today, -i), {}).get("work", 0))
+                   for i in range(7))
+        streak, i = 0, 0
+        while int(days.get(shift(today, -i), {}).get("work", 0)) >= 600:
+            streak += 1
+            i += 1
+        return {"yday": int(yday), "week": int(week), "streak": streak}
+
+    # ── 만든 사람에게 보내는 한마디 ──────────────────────────────────────
+    FB_MAX = 800                 # 한 번에 보낼 수 있는 글자 수
+    FB_COOL = 30                 # 연달아 보내는 것 방지 (초)
+
+    FB_KEY = b"ena-mascot-feedback"
+
+    @staticmethod
+    def _unmask(blob):
+        """가려 놓은 주소를 푼다.
+
+        보안 수단이 아니라, 배포 레포가 공개라서 자동 스캐너가 주소를 찾아
+        웹훅을 폐기해 버리는 것을 막으려는 것이다. 프로그램을 뜯으면 누구나
+        볼 수 있으니, 문제가 생기면 웹훅을 새로 만들어 다시 배포하면 된다.
+        """
+        try:
+            raw = _b64.b64decode(str(blob).encode())
+            k = Mascot.FB_KEY
+            return bytes(c ^ k[i % len(k)] for i, c in enumerate(raw)).decode()
+        except Exception:
+            return ""
+
+    def _fb_url(self):
+        url = str(self.cfg.get("feedback_url") or "").strip()
+        return url or self._unmask(self.cfg.get("feedback_url_enc") or "")
+
+    def _fb_path(self):
+        return os.path.join(self.state_dir, ".feedback_queue.json")
+
+    def _fb_send(self, text):
+        """건의를 보낸다. 실패하면 파일에 담아 두었다가 다음에 다시 보낸다.
+
+        보내는 것은 사용자가 적은 글과 캐릭터 이름·버전뿐이다. 컴퓨터 정보나
+        작업 기록 같은 것은 보내지 않는다.
+        """
+        text = str(text).strip()[:self.FB_MAX]
+        if not text:
+            return False, "내용을 적어 주세요."
+        now = time.time()
+        if now - getattr(self, "_fb_last", 0) < self.FB_COOL:
+            return False, "잠시 뒤에 다시 보내 주세요."
+        self._fb_last = now
+        self._fb_queue_add(text)
+        threading.Thread(target=self._fb_flush, daemon=True).start()
+        return True, "보냈어요. 고마워요!"
+
+    def _fb_queue_add(self, text):
+        try:
+            items = self._fb_queue_load()
+            items.append({"text": text, "ts": time.time(),
+                          "char": self.cfg.get("name", self.char),
+                          "ver": self._my_version()})
+            _save_json(self._fb_path(), items[-20:])
+        except Exception:
+            pass
+
+    def _my_version(self):
+        """배포 매니페스트에 적힌 버전 (없으면 빈 문자열)."""
+        try:
+            with open(os.path.join(os.path.dirname(self.dir), "version.json"),
+                      encoding="utf-8") as fp:
+                return str(json.load(fp).get("version") or "")
+        except Exception:
+            return ""
+
+    def _fb_queue_load(self):
+        try:
+            with open(self._fb_path(), encoding="utf-8") as fp:
+                v = json.load(fp)
+            return v if isinstance(v, list) else []
+        except Exception:
+            return []
+
+    def _fb_flush(self):
+        """쌓인 건의를 보낸다 (백그라운드). 못 보내면 그대로 남겨 둔다."""
+        import urllib.request
+        url = self._fb_url()
+        items = self._fb_queue_load()
+        if not (url and items):
+            return
+        left = []
+        for it in items:
+            when = time.strftime("%Y-%m-%d %H:%M",
+                                 time.localtime(it.get("ts", time.time())))
+            head = (f"**{it.get('char', '')}** · {when}"
+                    f" · v{it.get('ver', '')}")
+            body = head + "\n" + str(it.get("text", ""))
+            try:
+                req = urllib.request.Request(
+                    url, data=json.dumps({"content": body[:1900]}).encode(),
+                    headers={"Content-Type": "application/json",
+                             "User-Agent": "mascot-feedback"}, method="POST")
+                with urllib.request.urlopen(req, timeout=15,
+                                            context=_ssl_ctx()) as r:
+                    if r.status >= 300:
+                        left.append(it)
+            except Exception:
+                left.append(it)
+        try:
+            if left:
+                _save_json(self._fb_path(), left)
+            elif os.path.exists(self._fb_path()):
+                os.remove(self._fb_path())
+        except Exception:
+            pass
+
+    def _tray_ico_path(self):
+        """트레이에 쓸 머리 아이콘 파일을 만들어 두고 그 경로를 준다.
+
+        선물 exe에는 .ico가 안 들어 있을 수 있어서, 파츠로 그때그때 만든다.
+        만들어 둔 것이 파츠보다 새것이면 다시 만들지 않는다.
+        """
+        out = os.path.join(self.state_dir, ".tray.ico")
+        base = "head" if self.has_part("head") else "body_open"
+        src = os.path.join(self.parts_dir, f"{base}.png")
+        try:
+            if (os.path.exists(out) and os.path.exists(src)
+                    and os.path.getmtime(out) >= os.path.getmtime(src)):
+                return out
+        except OSError:
+            pass
+        try:
+            cw, ch = self.layout["canvas"]
+            sheet = Image.new("RGBA", (cw, ch), (0, 0, 0, 0))
+
+            def put(name):
+                pth = os.path.join(self.parts_dir, f"{name}.png")
+                if os.path.exists(pth) and name in self.layout:
+                    sheet.alpha_composite(Image.open(pth).convert("RGBA"),
+                                          tuple(self.layout[name]["pos"]))
+            put(base)
+            put("pupils")
+            for n in (self.layout.get("overlays") or []):
+                if n in ("lashes", "hair"):
+                    put(n)
+            hb = Image.open(src).convert("RGBA").split()[3].getbbox()
+            hx, hy = self.layout[base]["pos"]
+            crop = sheet.crop((hx + hb[0], hy + hb[1], hx + hb[2], hy + hb[3]))
+            bb = crop.split()[3].getbbox()
+            if bb:
+                crop = crop.crop(bb)
+            side = int(max(crop.size) * 1.06)
+            sq = Image.new("RGBA", (side, side), (0, 0, 0, 0))
+            sq.alpha_composite(crop, ((side - crop.width) // 2,
+                                      (side - crop.height) // 2))
+            sq.resize((256, 256), Image.LANCZOS).save(
+                out, sizes=[(16, 16), (20, 20), (24, 24), (32, 32), (48, 48)])
+            return out
+        except Exception:
+            self._log_error("tray_ico")
+            return ""
+
+    # ── 바탕화면 스티커 (config의 "stickers"를 켠 캐릭터만) ────────────────
+    def _stickers_on(self):
+        """이 캐릭터가 스티커를 쓰는가.
+
+        모듈은 배포 payload에 없다(mascot.py + parts_*만 나간다). 그래서
+        절대 위쪽에서 import하면 안 되고, 여기서 있는지 확인만 한다.
+        """
+        if not (IS_WIN and self.cfg.get("stickers")):
+            return False
+        return os.path.isdir(os.path.join(HERE, "stickers"))
+
+    def _sticker_app(self, make=True):
+        """스티커 묶음을 얻는다 (처음 부를 때 만든다). 실패하면 None."""
+        got = getattr(self, "_stk", None)
+        if got is not None or not make or not self._stickers_on():
+            return got
+        try:
+            from stickers import StickerApp, set_base
+            set_base(os.path.join(self.state_dir, ".stickers"))
+            self._stk = StickerApp(self.root,
+                                   visible=bool(self.us.get("stickers_show", True)))
+            if self.us.get("stickers_lock"):
+                self._stk.set_all_locked(True)
+        except Exception:
+            self._stk = None
+            self._log_error("stickers")
+        return getattr(self, "_stk", None)
+
+    def _apply_stickers(self):
+        """환경설정에서 저장했을 때 — 보이기/잠금을 반영한다."""
+        if not self._stickers_on():
+            return
+        show = bool(self.us.get("stickers_show", True))
+        # 안 보이게 두는데 아직 만든 적도 없다면 굳이 만들지 않는다
+        app = self._sticker_app(make=show)
+        if app is None:
+            return
+        app.set_visible(show)
+        app.set_all_locked(bool(self.us.get("stickers_lock")))
+
+    # ── 유튜브 음악 (config의 "youtube"를 켠 캐릭터만) ──────────────────
+    # 재생은 따로 도는 자식 프로그램(youtube_player.py)이 맡는다. pywebview가
+    # 메인 스레드를 요구하는데 그 자리는 tkinter가 이미 쓰고 있어서다.
+    # 여기서는 명령을 보내고 상태를 받아 버튼만 그린다.
+    YT_IDLE_QUIT = 300.0       # 멈춘 채로 이만큼 지나면 재생기를 거둔다
+    YT_GROOVE_EVERY = 900.0    # 음악 중 리듬 타기 간격 (15분에 한 번)
+    YT_NOTE_SLOW = 0.5         # 음악 음표가 오르는 속도 (1이면 평소 속도)
+    YT_ERRS = {2: "주소가 이상해요.", 5: "이 영상은 재생이 안 돼요.",
+               100: "없는 영상이에요.", 101: "이 영상은 밖에서 못 틀게 막아 뒀어요.",
+               150: "이 영상은 밖에서 못 틀게 막아 뒀어요."}
+
+    def _yt_on(self):
+        """이 캐릭터가 음악을 쓰는가. 한 번만 확인하고 기억한다.
+
+        재생기와 pywebview는 배포 payload에 없다(mascot.py + parts_*만 나간다).
+        그래서 스티커와 똑같이, 있는지 확인만 하고 없으면 조용히 없는 기능이
+        된다 — 선물본에서는 메뉴에도 버튼에도 나타나지 않는다.
+        """
+        got = getattr(self, "_yt_avail", None)
+        if got is None:
+            got = False
+            # 얼린 배포본에는 재생기가 exe 안에 구워져 있어 파일이 없을 수 있다.
+            has_file = (os.path.exists(os.path.join(HERE, "youtube_player.py"))
+                        or getattr(sys, "frozen", False))
+            if IS_WIN and self.cfg.get("youtube") and has_file:
+                try:
+                    import importlib.util
+                    got = importlib.util.find_spec("webview") is not None
+                except Exception:
+                    got = False
+            self._yt_avail = got
+        return got
+
+    def _yt_bar(self):
+        """음악 버튼이 카드 위에 요구하는 여백. 노래를 넣기 전에는 0."""
+        if not (self.timer_on and self.us.get("yt_url")):
+            return 0
+        return YT_BAR if self._yt_on() else 0
+
+    @staticmethod
+    def _yt_ids(url):
+        """붙여넣은 주소에서 영상 ID와 재생목록 ID를 뽑는다.
+
+        youtu.be/…, watch?v=…, /embed/…, /shorts/…, music.youtube.com,
+        그리고 ID만 달랑 붙여넣은 경우까지 받는다.
+        """
+        import re
+        from urllib.parse import parse_qs, urlparse
+
+        s = str(url or "").strip()
+        if not s:
+            return "", ""
+        if re.fullmatch(r"[A-Za-z0-9_-]{11}", s):
+            return s, ""
+        if "//" not in s:
+            s = "https://" + s
+        try:
+            u = urlparse(s)
+        except ValueError:
+            return "", ""
+        q = parse_qs(u.query or "")
+        lst = (q.get("list") or [""])[0]
+        vid = (q.get("v") or [""])[0]
+        if not vid:
+            parts = [p for p in (u.path or "").split("/") if p]
+            if u.netloc.endswith("youtu.be") and parts:
+                vid = parts[0]
+            elif parts and parts[0] in ("embed", "shorts", "live", "v"):
+                vid = parts[1] if len(parts) > 1 else ""
+        if not re.fullmatch(r"[A-Za-z0-9_-]{11}", vid or ""):
+            vid = ""
+        if not re.fullmatch(r"[A-Za-z0-9_-]{2,64}", lst or ""):
+            lst = ""
+        return vid, lst
+
+    def _yt_alive(self):
+        p = getattr(self, "_yt_proc", None)
+        return p is not None and p.poll() is None
+
+    def _yt_busy(self):
+        """켜는 중·받는 중 — 버튼에 도는 표시를 낸다."""
+        return bool(self._yt_want and not self._yt.get("playing")
+                    and self._yt_alive())
+
+    def _yt_spawn(self):
+        """재생기를 띄운다. 이미 떠 있으면 그대로 쓴다."""
+        if self._yt_alive():
+            return True
+        if not self._yt_on():
+            return False
+        import subprocess
+        exe = sys.executable
+        if getattr(sys, "frozen", False):
+            # 얼린 배포본: 파이썬이 따로 없으므로 같은 실행 파일을 부르고,
+            # mascot.py 맨 위의 갈림길이 재생기로 넘겨 준다.
+            cmd = [exe, "--yt-player"]
+        else:
+            pyw = os.path.join(os.path.dirname(exe), "pythonw.exe")
+            if os.path.exists(pyw):
+                exe = pyw                  # 검은 콘솔 창이 뜨지 않게
+            cmd = [exe, "-u", os.path.join(HERE, "youtube_player.py")]
+        # 브라우저 자료(로그인 쿠키)를 남길 폴더. 점으로 시작해 배포 payload에
+        # 안 들어가고, .gitignore에도 넣어 두었다 — 구글 세션이 들어 있다.
+        prof = os.path.join(self.state_dir, ".ytprofile")
+        try:
+            self._yt_proc = subprocess.Popen(
+                cmd + ["--profile", prof],
+                cwd=HERE, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL, encoding="utf-8", errors="replace",
+                creationflags=0x08000000)          # CREATE_NO_WINDOW
+        except Exception:
+            self._yt_proc = None
+            self._log_error("yt_spawn")
+            return False
+        self._yt = {}
+        self._yt_err = 0
+        self._yt_idle = 0.0
+        q = self._yt_q = []
+        threading.Thread(target=self._yt_reader, args=(self._yt_proc, q),
+                         daemon=True).start()
+        return True
+
+    def _yt_reader(self, proc, q):
+        """자식이 보내는 상태 줄을 모은다 (스레드). 꺼내 쓰는 건 그리기 루프.
+
+        큐를 인자로 받는 이유: 재생기를 껐다 켜면 새 큐로 갈리는데, 그때
+        옛 스레드가 새 큐에 끼어들면 죽은 재생기의 상태가 섞인다.
+        """
+        try:
+            for line in proc.stdout:
+                if line.startswith("@YT "):
+                    q.append(line[4:])
+        except Exception:
+            pass
+        q.append("@dead")
+
+    def _yt_send(self, **kw):
+        p = getattr(self, "_yt_proc", None)
+        if p is None or p.poll() is not None:
+            return False
+        try:
+            p.stdin.write(json.dumps(kw) + "\n")
+            p.stdin.flush()
+            return True
+        except Exception:
+            self._yt_forget()
+            return False
+
+    def _yt_forget(self):
+        """재생기가 사라졌다고 표시만 한다 (프로세스 정리는 _yt_stop)."""
+        self._yt_proc = None
+        self._yt = {}
+        self._yt_want = False
+        self._yt_err = 0
+        self._yt_idle = 0.0
+
+    def _yt_stop(self):
+        """재생기를 거둔다. 프로세스째 사라져 메모리가 통째로 돌아온다."""
+        p = getattr(self, "_yt_proc", None)
+        self._yt_forget()
+        if p is None or p.poll() is not None:
+            return
+        try:
+            p.stdin.write('{"c":"quit"}\n')
+            p.stdin.flush()
+        except Exception:
+            pass
+        try:
+            p.stdin.close()          # 파이프가 닫히면 자식이 스스로 끝낸다
+        except Exception:
+            pass
+        # 기다리는 일은 딴 스레드에 맡긴다. 여기서 기다리면 창이 멎는다.
+        def reap():
+            try:
+                p.wait(timeout=4)
+            except Exception:
+                try:
+                    p.kill()
+                except Exception:
+                    pass
+
+        threading.Thread(target=reap, daemon=True).start()
+
+    def _yt_toggle(self):
+        """음악 버튼을 눌렀을 때 — 없으면 띄우고, 있으면 재생/멈춤."""
+        url = str(self.us.get("yt_url") or "")
+        if not url:
+            return self.add_music()
+        if not self._yt_alive():
+            if not self._yt_spawn():
+                self._say("음악을 켤 수 없어요.", 3.0)
+                return
+            vid, lst = self._yt_ids(url)
+            if not (vid or lst):
+                self._say("주소가 이상해요.", 3.0)
+                self._yt_stop()
+                return
+            self._yt_want = True
+            self._yt_send(c="vol", v=int(self.us.get("yt_volume", 55)))
+            self._yt_send(c="load", v=vid, list=lst)
+            return
+        if self._yt.get("playing"):
+            self._yt_want = False
+            self._yt_send(c="pause")
+        else:
+            self._yt_want = True
+            self._yt_send(c="play")
+
+    def _yt_login(self):
+        """유튜브 로그인 창을 띄운다.
+
+        로그인해 두면 그 계정으로 재생되므로, 프리미엄이면 광고가 빠진다.
+        쿠키는 캐릭터 폴더의 .ytprofile에 남아 다음부터는 저절로 들어간다.
+        """
+        if not self._yt_spawn():
+            self._say("음악을 켤 수 없어요.", 3.0)
+            return
+        self.us["yt_asked"] = True
+        self._save_settings()
+        ml, mt, mr, mb = monitor_at(*cursor_pos())
+        x = int(ml + max(0, (mr - ml - 560) / 2))
+        y = int(mt + max(30, (mb - mt - 720) / 2))
+        self._yt_want = True
+        self._yt_send(c="vol", v=int(self.us.get("yt_volume", 55)))
+        self._yt_send(c="login", x=x, y=y)
+        # 로그인 창을 닫으면 이 곡부터 튼다 (재생기가 기억해 둔다)
+        vid, lst = self._yt_ids(str(self.us.get("yt_url") or ""))
+        if vid or lst:
+            self._yt_send(c="load", v=vid, list=lst)
+        self._say("로그인하면 광고 없이 들려요.", 4.5)
+
+    def _yt_tick(self, now):
+        """자식이 보낸 상태를 받아 반영한다 (그리기 루프에서 호출)."""
+        # 큐는 갈아 끼우지 말고 앞에서 꺼낸다. 새 목록으로 바꾸면 읽기 스레드는
+        # 처음 받은 목록에 계속 넣으므로, 그때부터 상태가 한 줄도 안 들어온다.
+        q = self._yt_q
+        while q:
+            line = q.pop(0)
+            if line == "@dead":
+                # 한 번도 준비되지 못하고 죽었으면 사람에게 알린다.
+                # (WebView2 런타임이 없는 컴퓨터 등)
+                if self._yt_want and not self._yt.get("ready"):
+                    self._say("음악을 켤 수 없어요.", 4.0)
+                self._yt_forget()
+                return
+            try:
+                s = json.loads(line)
+            except ValueError:
+                continue
+            was = self._yt.get("title", "")
+            self._yt = s
+            if s.get("signed") and not self.us.get("yt_signed"):
+                self.us["yt_signed"] = True
+                self.us["yt_asked"] = True
+                self._save_settings()
+                self._say("로그인 완료!", 3.0)
+            err = int(s.get("err") or 0)
+            if err and err != self._yt_err:
+                self._yt_err = err
+                self._yt_want = False
+                self._say(self.YT_ERRS.get(err, "이 노래는 못 틀겠어요."), 4.5)
+            elif not err:
+                self._yt_err = 0
+                # 곡이 바뀌면 제목을 말해 준다. 말풍선이 떠 있어도 덮어쓴다 —
+                # 사람이 방금 튼 노래라 그게 지금 가장 하고 싶은 말이다.
+                if s.get("playing") and s.get("title") and s["title"] != was:
+                    if self.can_talk:
+                        self._say("♪ " + s["title"][:26], 4.5)
+        if getattr(self, "_yt_proc", None) is None:
+            return
+        if not self._yt_alive():
+            self._yt_forget()
+            return
+        self._yt_notes(now)
+        # 오래 멈춰 있으면 재생기를 거둔다 — 안 쓰는 동안 메모리를 0으로.
+        # 기준은 '재생 중인가'가 아니라 '사람이 틀어 두었는가'다. 켜지는 데
+        # 몇 초 걸리는데 그 사이를 쉬는 것으로 세면 시작하자마자 꺼 버린다.
+        if self._yt_want:
+            self._yt_idle = 0.0
+        elif self._yt_idle == 0.0:
+            self._yt_idle = now
+        elif now - self._yt_idle > self.YT_IDLE_QUIT:
+            self._yt_stop()
+
+    def _yt_notes(self, now):
+        """음악이 나오는 동안 음표가 계속 떠다닌다.
+
+        한 번에 하나만 — 왼쪽 음표가 천천히 올라가 사라지면 곧바로 오른쪽에
+        하나. 여러 개가 겹치면 캐릭터가 안 보인다.
+        """
+        if not self._yt.get("playing") or self._sleeping:
+            self._yt_note = None
+            self._yt_note_at = 0.0
+            return
+        n = self._yt_note
+        # 목록 비교가 아니라 '그 물건인지'로 본다. 음표는 리스트라 값이 같은
+        # 다른 음표를 자기라고 착각할 수 있다.
+        if n is not None and any(x is n for x in self.notes):
+            return
+        if now < self._yt_note_at:             # 못 띄웠을 때만 잠깐 쉰다
+            return
+        self._yt_note = None
+        self._yt_note_side = -self._yt_note_side
+        before = len(self.notes)
+        self._safe("fx", self._spawn_note, now, "note", self._yt_note_side,
+                   self.YT_NOTE_SLOW)
+        if len(self.notes) > before:
+            self._yt_note = self.notes[-1]
+        else:                                  # 그림이 없어 못 띄웠다
+            self._yt_note_at = now + 2.0
+
+    def _draw_music_btn(self):
+        """타이머 카드 위 정중앙의 동그란 재생/멈춤 버튼."""
+        if not self._yt_bar():
+            return
+        c, cd = self.canvas, self.card
+        g = self._card_geom()
+        bx = (g["x0"] + g["x1"]) / 2
+        by = g["y0"] - 24            # 카드 윗변에서 10px 띄운다 (붙으면 답답하다)
+        r = 14.0
+        c.create_oval(bx - r + 1.5, by - r + 2, bx + r + 1.5, by + r + 2,
+                      fill="#e3e6ee", outline="")            # 옅은 그림자
+        c.create_oval(bx - r, by - r, bx + r, by + r,
+                      fill=cd["bg"], outline=cd["border"], width=2)
+        ink = cd["fill"]
+        if self._yt_busy():                       # 켜는 중 — 도는 호
+            a = (time.time() * 200) % 360
+            c.create_arc(bx - 7, by - 7, bx + 7, by + 7, start=a, extent=110,
+                         style="arc", outline=ink, width=3)
+        elif self._yt.get("playing"):             # 멈춤 표시 (막대 둘)
+            for sx in (-3.8, 3.8):
+                c.create_rectangle(bx + sx - 1.8, by - 6, bx + sx + 1.8, by + 6,
+                                   fill=ink, outline="")
+        else:                                     # 재생 표시 (세모)
+            c.create_polygon(bx - 4.5, by - 6.5, bx - 4.5, by + 6.5,
+                             bx + 7.0, by, fill=ink, outline="")
+        self._yt_btn = (bx, by, r)
+
+    def _draw_update_dot(self):
+        """안 본 업데이트가 있으면 카드 오른쪽 위에 작은 빨간 점.
+
+        점 자체가 버튼이다. 한 번 누르면 안내가 열리고 그 순간 읽음이 된다.
+        """
+        if not self._update_unread():
+            return
+        g = self._card_geom()
+        r = 5.5
+        # 카드 오른쪽 위 모서리에 걸치듯 얹는다. 안쪽으로 넣으면 시간 글자를
+        # 덮어서, 모서리 곡선 위가 유일하게 비어 있는 자리다.
+        cx = min(g["x1"] - 6, self.W - r - 3)
+        cy = max(g["y0"] + 6, r + 3)
+        c = self.canvas
+        # 어떤 카드 색 위에서도 보이도록 흰 테를 한 겹 두른다
+        c.create_oval(cx - r - 2, cy - r - 2, cx + r + 2, cy + r + 2,
+                      fill="#ffffff", outline="")
+        c.create_oval(cx - r, cy - r, cx + r, cy + r,
+                      fill="#e5484d", outline="")
+        self._dot_btn = (cx, cy, r + 7)
+
+    def open_update_news(self):
+        """업데이트 소식 다시 보기 — 점을 눌렀을 때도 이 길로 온다."""
+        self._safe("update_popup", self._show_update_popup)
+
+    def add_music(self):
+        """유튜브 노래 주소를 넣는 창. 엔터로 저장 후 바로 재생."""
+        if getattr(self, "_yt_win", None) is not None \
+                and self._yt_win.winfo_exists():
+            self._yt_win.destroy()
+        cd, u = self.card, self._ui
+        W, H = u(360), u(244)
+        win = tk.Toplevel(self.root)
+        self._yt_win = win
+        win.title("유튜브 노래")
+        win.attributes("-topmost", True)
+        win.resizable(False, False)
+        win.configure(bg=cd["panel"])
+        cv = tk.Canvas(win, width=W, height=H, bg=cd["panel"],
+                       highlightthickness=0)
+        cv.pack()
+
+        def rr(x0, y0, x1, y1, rad, **kw):
+            pts = [x0 + rad, y0, x1 - rad, y0, x1, y0, x1, y0 + rad,
+                   x1, y1 - rad, x1, y1, x1 - rad, y1, x0 + rad, y1,
+                   x0, y1, x0, y1 - rad, x0, y0 + rad, x0, y0]
+            return cv.create_polygon(pts, smooth=True, **kw)
+
+        rr(u(14), u(12), W - u(14), u(44), u(12), fill=cd["soft"],
+           outline=cd["border"], width=2)
+        cv.create_text(W / 2, u(28), text="무슨 노래를 틀까요?",
+                       font=self._uf(10, True), fill=cd["text"])
+        uv = tk.StringVar(value=str(self.us.get("yt_url") or ""))
+        cv.create_text(u(22), u(71), anchor="w", text="주소",
+                       font=self._uf(9), fill=cd["sub"])
+        ent = tk.Entry(cv, textvariable=uv, font=self._uf(10), relief="flat",
+                       bg="#ffffff", fg=cd["text"], highlightthickness=1,
+                       highlightbackground=cd["border"],
+                       highlightcolor=cd["fill"])
+        cv.create_window(u(58), u(58), anchor="nw", window=ent,
+                         width=W - u(80), height=u(26))
+        vol = tk.IntVar(value=int(self.us.get("yt_volume", 55)))
+        cv.create_text(u(22), u(110), anchor="w", text="볼륨",
+                       font=self._uf(9), fill=cd["sub"])
+        sc = tk.Scale(cv, from_=0, to=100, orient="horizontal", variable=vol,
+                      showvalue=True, bg=cd["panel"], fg=cd["sub"],
+                      troughcolor=cd["track"], highlightthickness=0,
+                      relief="flat", font=self._uf(8), length=u(240),
+                      command=lambda _v: self._yt_send(c="vol", v=vol.get()))
+        cv.create_window(u(58), u(94), anchor="nw", window=sc, width=W - u(80))
+
+        def btn(x0, y0, x1, y1, label, cmd, fill, fg="#ffffff", size=9):
+            shape = rr(x0, y0, x1, y1, (y1 - y0) / 2, fill=fill, outline="")
+            tid = cv.create_text((x0 + x1) / 2, (y0 + y1) / 2, text=label,
+                                 font=self._uf(size, True), fill=fg)
+            for item in (shape, tid):
+                cv.tag_bind(item, "<Button-1>", lambda _e: cmd())
+
+        # ── 유튜브 계정 — 로그인해 두면 그 계정으로 재생된다(프리미엄 적용)
+        signed = bool(self.us.get("yt_signed"))
+        cv.create_text(u(22), u(146), anchor="w",
+                       text=("유튜브 계정 · 로그인됨"
+                             if signed else "유튜브 계정 · 로그인 안 됨"),
+                       font=self._uf(9), fill=cd["text"] if signed else cd["sub"])
+
+        def do_login():
+            win.destroy()
+            self._yt_stop()
+            self.root.after(200, self._yt_login)
+
+        btn(W - u(126), u(133), W - u(20), u(159),
+            "다시 로그인" if signed else "로그인", do_login,
+            cd["track"] if signed else cd["fill"],
+            cd["sub"] if signed else "#ffffff", 8)
+        cv.create_text(W / 2, u(228),
+                       text="영상 주소나 재생목록 주소 · 소리만 나옵니다 · Esc로 닫기",
+                       font=self._uf(8), fill=cd["sub"])
+
+        def commit(_e=None):
+            url = uv.get().strip()[:400]
+            vid, lst = self._yt_ids(url)
+            if url and not (vid or lst):
+                ent.focus_set()
+                ent.selection_range(0, "end")
+                return
+            had, was = self._yt_bar(), str(self.us.get("yt_url") or "")
+            self.us["yt_url"] = url
+            self.us["yt_volume"] = int(vol.get())
+            self._save_settings()
+            if self._yt_bar() != had:
+                self._safe("card", self._relayout_card)
+            win.destroy()
+            # 재생기를 새로 열 때는 옛것이 완전히 사라진 뒤에 연다.
+            # 겹치면 잠깐 두 배로 무거워진다.
+            wait = 1200 if self._yt_alive() else 60
+            if not url:
+                self._yt_stop()
+            elif not self.us.get("yt_signed") and not self.us.get("yt_asked"):
+                # 처음 노래를 넣은 때 — 로그인부터 권한다. 로그인 창을 닫으면
+                # 재생기가 기억해 둔 이 곡으로 바로 이어진다.
+                self._yt_stop()
+                self.root.after(wait, self._yt_login)
+            elif url != was or not self._yt_alive():
+                self._yt_stop()
+                self.root.after(wait, self._yt_toggle)
+            elif not self._yt.get("playing"):
+                self._yt_toggle()
+
+        def clear():
+            uv.set("")
+            commit()
+
+        btn(u(20), u(176), u(176), u(204), "재생", commit, cd["fill"])
+        btn(u(190), u(176), W - u(20), u(204), "지우기", clear,
+            cd["track"], cd["sub"])
+        ent.bind("<Return>", commit)
+        win.bind("<Escape>", lambda _e: win.destroy())
+        self._place_near(win)
+        self._keep_front(win)
+        ent.focus_force()
+
+    def _set_win_icon(self):
+        """별도 창(할 일·업데이트·환경설정…)의 제목표시줄 아이콘.
+
+        그냥 두면 Tk 기본 깃털이 뜬다. 트레이에 쓰는 그 캐릭터 얼굴을
+        그대로 쓴다. default= 로 걸면 나중에 뜨는 창까지 전부 따라온다.
+        """
+        if not IS_WIN:
+            return
+        try:
+            # 파이썬으로 띄운 창은 작업표시줄이 '파이썬 프로그램'으로 묶어
+            # 파이썬 기본 아이콘이 뜬다. 앱 아이디를 따로 주면 창 아이콘이
+            # 그대로 단추에 보인다 (지뢰 21 — 공용 windll 은 안 건드린다).
+            ctypes.WinDLL("shell32").SetCurrentProcessExplicitAppUserModelID(
+                "ena.mascot." + self.char)
+        except Exception:
+            pass
+        ico = self._tray_ico_path()
+        if ico and os.path.exists(ico):
+            self.root.iconbitmap(default=ico)
+
+    def _tray_setup(self):
+        """트레이 아이콘 올리기 — 왼쪽 클릭은 부르기, 오른쪽은 메뉴."""
+        if not (IS_WIN and self.cfg.get("tray", True)):
+            return
+        ico = self._tray_ico_path()
+        if not ico:
+            return
+        name = str(self.cfg.get("name", self.char))
+        self.tray = TrayIcon(ico, f"{name} 타이머",
+                             lambda: self._tray_q.append("call"),
+                             lambda: self._tray_q.append("menu"))
+
+    def _tray_tick(self):
+        """트레이에서 누른 것을 그리기 루프에서 처리한다 (스레드 분리)."""
+        while self._tray_q:
+            what = self._tray_q.pop(0)
+            if what == "menu":
+                self._tray_menu()
+            else:
+                self._tray_call()
+
+    @staticmethod
+    def _to_front(u, hwnd):
+        """창을 맨 앞으로. 윈도우가 그냥은 안 시켜 준다.
+
+        SetForegroundWindow는 '지금 맨 앞인 프로그램'이 아니면 거부당한다
+        (아무 프로그램이나 화면을 가로채지 못하게 하는 장치). 실측으로 세 번
+        중 두 번 거부됐다. 지금 맨 앞인 창의 입력 큐에 잠깐 붙으면 같은
+        프로그램처럼 취급되어 통과한다 — 트레이 프로그램의 정석이다.
+        """
+        try:
+            fg = u.GetForegroundWindow()
+            me = ctypes.windll.kernel32.GetCurrentThreadId()
+            other = u.GetWindowThreadProcessId(fg, None) if fg else 0
+            joined = bool(other and other != me
+                          and u.AttachThreadInput(other, me, True))
+            try:
+                u.SetForegroundWindow(hwnd)
+            finally:
+                if joined:
+                    u.AttachThreadInput(other, me, False)
+        except Exception:
+            pass
+
+    def _tray_menu(self):
+        """트레이 우클릭 메뉴 — 바깥을 누르면 그냥 닫히게.
+
+        메뉴를 띄울 때 우리 창이 맨 앞(포그라운드)이 아니면, 윈도우가 바깥
+        클릭을 메뉴에 전달하지 않아 메뉴가 계속 떠 있는다. 트레이 아이콘을
+        누른 시점의 맨 앞 창은 사용자가 쓰던 프로그램이라 늘 이 상태가 된다.
+        메뉴를 띄우기 직전에 창을 맨 앞으로 올려 두면 정상적으로 닫힌다.
+        (트레이 프로그램이 쓰는 정석 방법 — 메뉴가 닫힌 뒤 빈 메시지를 보내
+        윈도우가 메뉴 상태를 정리하게 한다.)
+        """
+        x, y = cursor_pos()
+        hwnd = getattr(self, "_main_hwnd", 0)
+        u = ctypes.windll.user32 if IS_WIN else None
+        if u is not None and hwnd:
+            self._to_front(u, hwnd)
+        # 맨 앞으로 올리는 건 윈도우가 거부할 수도 있다(정책상). 그때를 대비해
+        # 메뉴가 포커스를 잃으면 스스로 닫히게 걸어 둔다.
+        def bye(_e=None):
+            try:
+                self._menu.unpost()
+            except Exception:
+                pass
+        self._menu.bind("<FocusOut>", bye, add="+")
+        self._menu.bind("<Escape>", bye, add="+")
+        try:
+            self._menu.tk_popup(int(x), int(y))
+        finally:
+            self._menu.grab_release()
+            if u is not None and hwnd:
+                try:
+                    u.PostMessageW(hwnd, 0x0000, 0, 0)   # WM_NULL
+                except Exception:
+                    pass
+
+    def _screen_box(self):
+        """캐릭터가 놓인 화면의 작업 영역 (왼쪽, 위, 오른쪽, 아래).
+
+        `winfo_screenwidth/height`는 주 모니터 크기만 알려 준다. 그 값으로
+        창 자리를 맞추면 보조 모니터에 있는 캐릭터를 눌러도 창이 주 모니터로
+        날아간다. 사람에게는 '눌러도 아무 일이 안 일어난다'로 보인다
+        (선물본에서 업데이트 소식이 안 뜬다는 제보의 진짜 원인).
+        """
+        try:
+            return monitor_work(self.root.winfo_rootx() + self.W // 2,
+                                self.root.winfo_rooty() + self.H // 2)
+        except Exception:
+            return (0, 0, self.root.winfo_screenwidth(),
+                    self.root.winfo_screenheight())
+
+    def _screen_h(self):
+        """캐릭터가 놓인 화면의 세로 크기 — 창 높이를 정할 때 쓴다."""
+        l, t, r, b = self._screen_box()
+        return max(400, b - t)
+
+    def _dialog_keep(self, win, name):
+        """따로 뜨는 입력 창 공통 — 앞에 붙들어 두고, 닫은 자리를 기억한다.
+
+        캐릭터·말풍선이 전부 '항상 위'라서, 입력 창이 떠도 0.5초 주기의
+        다시 올리기에 밀려 타이머 뒤로 들어가 버렸다 (지뢰 15). 입력 창도
+        살아 있는 동안 주기적으로 다시 올린다. 자리는 .ui_prefs.json 에
+        창 이름별로 남겨, 다음에 열 때 그 자리에서 뜬다.
+        """
+        try:
+            with open(self.ui_prefs_path, encoding="utf-8") as fp:
+                prefs = json.load(fp)
+        except Exception:
+            prefs = {}
+        pos = (prefs.get("dlg") or {}).get(name)
+        if pos:
+            try:
+                x, y = int(pos[0]), int(pos[1])
+                sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
+                if -80 < x < sw - 80 and 0 <= y < sh - 80:   # 화면 밖이면 버림
+                    win.geometry("+%d+%d" % (x, y))
+            except Exception:
+                pass
+        state = {"xy": None}
+
+        def took(e):
+            if e.widget is win:
+                try:
+                    state["xy"] = (win.winfo_x(), win.winfo_y())
+                except Exception:
+                    pass
+
+        def gone(e):
+            if e.widget is not win or not state["xy"]:
+                return
+            try:
+                with open(self.ui_prefs_path, encoding="utf-8") as fp:
+                    d = json.load(fp)
+            except Exception:
+                d = {}
+            d.setdefault("dlg", {})[name] = list(state["xy"])
+            try:
+                _save_json(self.ui_prefs_path, d)
+            except Exception:
+                pass
+
+        win.bind("<Configure>", took, add="+")
+        win.bind("<Destroy>", gone, add="+")
+        self._keep_front(win)
+
+    def _keep_front(self, win, focus=True):
+        """창이 살아 있는 동안 타이머(항상 위)보다 앞을 지킨다.
+
+        캐릭터를 누르는 순간 캐릭터 창이 맨 앞으로 올라오며 다른 창을
+        덮는다 (지뢰 15). 처음에는 0.7초마다 무조건 올렸는데, 올릴 때마다
+        창이 깜빡였다 — 지뢰 15의 '밀렸는지 먼저 재고 올릴 것'을 안 지킨
+        값이다. 이제 내 다른 창(캐릭터·말풍선)이 이 창을 실제로 덮었을
+        때만 올린다. 윈도우가 아니면 잴 길이 없어 예전대로 주기 올림.
+        """
+        try:
+            win.attributes("-topmost", True)   # 한 번만 — 주기로 걸면 깜빡인다
+        except Exception:
+            pass
+
+        def covered():
+            # 같은 프로세스의 '항상 위' 창이 이 창보다 앞에서 겹치는가.
+            # z순서는 눈이 아니라 GetWindow 로 잰다 (지뢰 15).
+            try:
+                u = ctypes.windll.user32
+                target = int(win.wm_frame(), 16)
+                kin = set()
+                if self._main_hwnd:
+                    kin.add(self._main_hwnd)
+                for holder in (self.shadow, self.todo_panel,
+                               self.due_panel, self._fx):
+                    h = getattr(holder, "hwnd", None)
+                    if h:
+                        kin.add(h)
+                    top = getattr(holder, "top", None)
+                    if top is not None:
+                        try:
+                            kin.add(int(top.wm_frame(), 16))
+                        except Exception:
+                            pass
+                r = (ctypes.c_long * 4)()
+                u.GetWindowRect(target, ctypes.byref(r))
+                tx0, ty0, tx1, ty1 = r[0], r[1], r[2], r[3]
+                cur = u.GetTopWindow(0)
+                while cur and cur != target:
+                    if cur in kin and u.IsWindowVisible(cur):
+                        u.GetWindowRect(cur, ctypes.byref(r))
+                        if not (r[2] <= tx0 or tx1 <= r[0]
+                                or r[3] <= ty0 or ty1 <= r[1]):
+                            return True
+                    cur = u.GetWindow(cur, 2)      # GW_HWNDNEXT
+            except Exception:
+                return False
+            return False
+
+        def raise_loop():
+            try:
+                if not win.winfo_exists():
+                    return
+                if not IS_WIN or covered():
+                    win.lift()
+                win.after(400 if IS_WIN else 700, raise_loop)
+            except Exception:
+                pass
+
+        win.after(150, raise_loop)
+        if focus:
+            win.after(80, lambda: win.focus_force()
+                      if win.winfo_exists() else None)
+
+    def _place_near(self, win, dx=40, dy=20):
+        """캐릭터 옆에, 캐릭터가 있는 화면 안으로 창을 놓는다."""
+        win.update_idletasks()
+        l, t, r, b = self._screen_box()
+        w = max(win.winfo_width(), win.winfo_reqwidth())
+        h = max(win.winfo_height(), win.winfo_reqheight())
+        px = min(max(self.root.winfo_rootx() - dx, l + 10),
+                 max(r - w - 10, l + 10))
+        py = min(max(self.root.winfo_rooty() - dy, t + 10),
+                 max(b - h - 20, t + 10))
+        win.geometry("+%d+%d" % (int(px), int(py)))
+
+    def _tray_call(self):
+        """캐릭터를 불러온다 — 화면 밖이면 보이는 자리로 끌어온다."""
+        self.root.deiconify()
+        self.root.lift()
+        self.root.attributes("-topmost", True)
+        if not self.us.get("topmost", True):
+            self.root.after(1200, lambda: self.root.attributes("-topmost", False))
+        x, y = self.root.winfo_x(), self.root.winfo_y()
+        ml, mt, mr, mb = monitor_at(*cursor_pos())
+        if not (ml - 20 <= x <= mr - 40 and mt - 20 <= y <= mb - 60):
+            self.root.geometry(f"+{mr - self.W - 60}+{mb - self.H - 90}")
+            self._safe("win_pos", self._save_win_pos)
+        self._say("여기 있어요!", 2.2)
+
+    def _hello_tick(self, now):
+        """바로가기를 또 눌렀으면 대답한다. 뒤에 뜬 쪽은 이미 물러난 뒤다."""
+        if now - self._hello_at < 1.0:
+            return
+        self._hello_at = now
+        p = os.path.join(self.state_dir, HELLO_FILE)
+        if not os.path.exists(p):
+            return
+        try:
+            fresh = now - os.path.getmtime(p) < 30
+            os.remove(p)
+        except OSError:
+            return           # 못 지우면 계속 불리므로 대답하지 않는다
+        if fresh:            # 예전에 남아 있던 신호에는 대답하지 않는다
+            self._tray_call()
+
+    # 윈도우가 '알림을 띄우면 안 되는 상태'로 보는 값들
+    # (2=전체화면 프로그램, 3=D3D 전체화면, 4=프레젠테이션 모드)
+    FS_STATES = (2, 3, 4)
+
+    def _fullscreen_busy(self):
+        """게임·영상이 캐릭터가 있는 화면을 전체화면으로 덮고 있는가.
+
+        두 가지를 다 만족해야 한다.
+
+        1) 윈도우가 '알림 띄우면 안 되는 상태'라고 답할 것. 창 크기로만 재면
+           '최대화'와 구분이 안 되는데, 이 API는 최대화에는 반응하지 않는다
+           (실측: 최대화 5, 전체화면 2).
+        2) 앞에 있는 창이 '캐릭터가 놓인 화면'을 통째로 덮을 것. 1)은 주
+           모니터만 보기 때문에(실측), 이것 없이는 주 모니터에서 게임을 켰을
+           때 다른 화면에 있던 캐릭터까지 사라진다.
+
+        그래서 보조 모니터에서 전체화면으로 켠 경우는 잡지 못한다. 잘못
+        숨기는 것보다 안 숨기는 쪽이 낫다고 보고 이렇게 뒀다.
+        """
+        return IS_WIN and self._fs_state_busy() and self._fs_covers_me()
+
+    def _fs_state_busy(self):
+        """윈도우가 '지금 알림을 띄우면 안 된다'고 답하는가."""
+        try:
+            sh = getattr(self, "_shell32", None)
+            if sh is None:
+                # 공용 windll이 아니라 따로 연다 (지뢰 21: argtypes 간섭)
+                sh = self._shell32 = ctypes.WinDLL("shell32")
+            st = ctypes.c_int(0)
+            if sh.SHQueryUserNotificationState(ctypes.byref(st)) != 0:
+                return False
+            return st.value in self.FS_STATES
+        except Exception:
+            return False
+
+    def _fs_covers_me(self):
+        """앞에 있는 창이 캐릭터가 놓인 화면을 통째로 덮고 있는가.
+
+        최대화한 창은 작업표시줄을 안 덮으므로 여기서 걸러진다
+        (실측: 화면 아래끝 2143 / 최대화 창 아래끝 2106 / 전체화면 2143).
+        """
+        try:
+            u = ctypes.windll.user32
+            fg = u.GetForegroundWindow()
+            if not fg or fg == self._main_hwnd:
+                return False
+            r = (ctypes.c_long * 4)()          # left, top, right, bottom
+            u.GetWindowRect(fg, ctypes.byref(r))
+            x = self.root.winfo_rootx() + self.W // 2
+            y = self.root.winfo_rooty() + self.H // 2
+            ml, mt, mr, mb = monitor_at(x, y)
+            return r[0] <= ml and r[1] <= mt and r[2] >= mr and r[3] >= mb
+        except Exception:
+            return False
+
+    def _fs_windows(self):
+        """같이 숨겼다 같이 보여야 하는 창들 (본체·그림자·말풍선 패널)."""
+        out = [self.root]
+        for holder in (self.shadow, self.todo_panel, self.due_panel):
+            top = getattr(holder, "top", None)
+            if top is not None:
+                out.append(top)
+        return out
+
+    def _fs_tick(self, now):
+        """전체화면 프로그램(게임·영상) 위에 얹혀 있지 않게 잠깐 비켜 준다.
+
+        '항상 위'라서 게임이나 영화 위에 캐릭터가 그대로 남는다. 사람이
+        설정을 뒤져 끄게 하지 말고, 전체화면인 동안만 스스로 물러난다.
+        """
+        if not IS_WIN or not self.us.get("topmost", True):
+            if self._fs_hidden:
+                self._fs_show()
+            return
+        if now - self._fs_at < 0.8:
+            return
+        self._fs_at = now
+        busy = self._fullscreen_busy()
+        if busy and not self._fs_hidden:
+            self._fs_hidden = True
+            for w in self._fs_windows():
+                try:
+                    w.withdraw()
+                except Exception:
+                    pass
+            if self._fx is not None:
+                try:
+                    self._fx.hide()
+                except Exception:
+                    pass
+        elif not busy and self._fs_hidden:
+            self._fs_show()
+
+    def _fs_show(self):
+        """비켜 있던 창들을 되돌린다. 자리와 z순서를 다시 잡아 준다."""
+        self._fs_hidden = False
+        for w in self._fs_windows():
+            try:
+                w.deiconify()
+            except Exception:
+                pass
+        try:
+            self.root.attributes("-topmost", bool(self.us.get("topmost", True)))
+        except Exception:
+            pass
+        # 그림자는 그림이 바뀔 때만 다시 올린다. 숨은 동안 레이어 내용이
+        # 날아갔을 수 있으니 되돌아올 때 한 번 밀어 넣는다 (지뢰 23).
+        if self.shadow is not None:
+            try:
+                self.shadow.set_image(self._shadow_base or self.shadow_img)
+            except Exception:
+                pass
+        # 되돌린 직후에 창을 직접 건드리면 Tk가 미뤄 둔 이동이 버려진다
+        # (지뢰 15). 다음 프레임에서 따라오게 자리 기억만 지운다.
+        self._last_pos = None
+        self._panel_z = 0.0
+
+    Z_PIN = 1.0              # 이 간격으로 '내가 아직 맨 앞인가'를 본다
+
+    def _z_pin(self, now):
+        """'항상 위'인데도 뒤로 밀렸으면 다시 올린다.
+
+        항상 위는 창을 만들 때 한 번 정해질 뿐이다. 다른 '항상 위' 프로그램이
+        앞으로 나오면 캐릭터가 그 뒤로 눌리는데, 스스로 올라오는 길이 없어
+        그대로 굳는다(실측: 전체화면 프로그램 뒤에서 z순번 9에 30초 동안
+        그대로). 같은 프로세스의 말풍선 창들은 0.5초마다 다시 올려 주고 있어
+        맨 앞(z 0·1·2)에 있었다 — 캐릭터에만 그게 없었던 것이다.
+
+        올릴 필요가 있을 때만 올린다. 필요 없는데 주기적으로 밀어 넣으면
+        눈에 띄게 깜빡인다 (그림자에서 겪은 일).
+        """
+        if (not IS_WIN or self._fs_hidden or not self._main_hwnd
+                or not self.us.get("topmost", True)
+                or now - self._z_pin_at < self.Z_PIN):
+            return
+        self._z_pin_at = now
+        u = ctypes.windll.user32
+        x, y = self.root.winfo_rootx(), self.root.winfo_rooty()
+        bx0, by0, bx1, by1 = x, y, x + self.W, y + self.H
+        # 내 창들은 앞에 있어도 괜찮다 (말풍선은 일부러 캐릭터보다 위에 둔다)
+        mine = {self._main_hwnd}
+        for holder in (self.shadow, self.todo_panel, self.due_panel, self._fx):
+            h = getattr(holder, "hwnd", None)
+            if h:
+                mine.add(h)
+            top = getattr(holder, "top", None)
+            if top is not None:
+                try:
+                    mine.add(int(top.wm_frame(), 16))
+                except Exception:
+                    pass
+        r = (ctypes.c_long * 4)()
+        cur = u.GetTopWindow(0)
+        buried = False
+        while cur and cur != self._main_hwnd:
+            if cur not in mine and u.IsWindowVisible(cur):
+                u.GetWindowRect(cur, ctypes.byref(r))
+                if not (r[2] <= bx0 or bx1 <= r[0]
+                        or r[3] <= by0 or by1 <= r[1]):
+                    buried = True
+                    break
+            cur = u.GetWindow(cur, 2)          # GW_HWNDNEXT
+        if not buried:
+            return
+        # HWND_TOP(0) — HWND_TOPMOST(-1)는 이미 항상 위인 창에는 무효라
+        # 순서를 못 되돌린다 (지뢰 23).
+        u.SetWindowPos(self._main_hwnd, 0, 0, 0, 0, 0, 0x1 | 0x2 | 0x10)
+        # 캐릭터가 맨 앞으로 갔으니 그림자와 말풍선을 다시 붙여 준다.
+        # 여기서 직접 옮기지 않는 것은, 미뤄 둔 이동이 버려지기 때문이다
+        # (지뢰 15) — 다음 프레임의 자리잡기에 맡긴다.
+        self._last_pos = None
+        self._panel_z = 0.0
+        self._z_check = 0.0
+
+    def _load_win_pos(self, sw, sh):
+        """지난번에 두었던 자리. 없거나 화면 밖이면 기본 자리(오른쪽 아래)로.
+
+        모니터 구성이 바뀌면 저장된 자리가 화면 밖일 수 있으므로, 창이 화면에
+        조금이라도 걸치는지 확인하고 아니면 기본 자리로 되돌린다.
+        """
+        base = (sw - self.W - 50, sh - self.H - 70)
+        if not self.cfg.get("remember_pos"):
+            return base
+        try:
+            with open(self.ui_prefs_path, encoding="utf-8") as fp:
+                d = json.load(fp)
+            x, y = int(d["win_x"]), int(d["win_y"])
+        except Exception:
+            return base
+        vx = self.root.winfo_vrootx() if hasattr(self.root, "winfo_vrootx") else 0
+        vy = self.root.winfo_vrooty() if hasattr(self.root, "winfo_vrooty") else 0
+        vw = max(self.root.winfo_vrootwidth(), sw)
+        vh = max(self.root.winfo_vrootheight(), sh)
+        if (x + self.W < vx + 40 or x > vx + vw - 40
+                or y + self.H < vy + 40 or y > vy + vh - 40):
+            return base                      # 그 자리에 이제 화면이 없다
+        return (x, y)
+
+    def _save_win_pos(self):
+        """지금 자리를 기억해 둔다 — 끌어 놓을 때마다 바로 (강제 종료 대비)."""
+        if not self.cfg.get("remember_pos"):
+            return
+        try:
+            self.root.update_idletasks()      # 방금 옮긴 자리가 반영된 뒤 읽는다
+            d = {}
+            if os.path.exists(self.ui_prefs_path):
+                with open(self.ui_prefs_path, encoding="utf-8") as fp:
+                    d = json.load(fp) or {}
+            d["win_x"] = int(self.root.winfo_x())
+            d["win_y"] = int(self.root.winfo_y())
+            _save_json(self.ui_prefs_path, d)
+        except Exception:
+            pass
+
+    def _shown_secs(self):
+        """카드에 보여 줄 시간. 작업 종료를 누른 뒤로 다시 센 만큼만.
+
+        누적 자체(work_secs)는 그대로 두고 기준점만 옮긴다. 기존 타이머가
+        보내 주는 값을 덮어쓰면 다음 갱신에 바로 되돌아오기 때문이다.
+        """
+        if self.work_secs < self.zero_at:     # 작업일이 넘어가 누적이 줄었다
+            self.zero_at = 0.0
+        return max(0.0, self.work_secs - self.zero_at)
+
+    def _today_secs(self):
+        """오늘(작업일) 일한 시간.
+
+        카드에 보이는 값(_shown_secs)은 '작업 종료 뒤로 다시 센 만큼'이라
+        여러 번 끝내면 줄어든다. 기록과 브리핑은 하루 단위여야 하므로
+        작업일이 시작될 때의 누적을 빼서 따로 낸다.
+        """
+        if self.work_secs < self.day_base:   # 연동 쪽이 초기화됐다
+            self.day_base = 0.0
+        return max(0.0, self.work_secs - self.day_base)
+
+    def _day_roll(self, now):
+        """작업일이 바뀌면 지난 하루를 기록에 옮겨 담고 0부터 다시 센다.
+
+        작업 종료를 안 누르고 그냥 끄는 날이 있어서, 버튼에만 기대면 그날이
+        통째로 빈다. 지우기 전에 기록으로 먼저 옮기므로 시간이 사라지지 않는다.
+        """
+        if now - self._day_at < 30:
+            return
+        self._day_at = now
+        key = self._my_workday()
+        if key == self.day_key:
+            return
+        if self.day_key and self._today_secs() >= 60:
+            # 지난 하루를 그 날짜로 남긴다 (기록은 덮어쓰기라 겹치지 않는다)
+            self._safe("history", self._hist_add, self.day_key)
+        self.day_key = key
+        self.day_base = self.work_secs
+        self.zero_at = self.work_secs       # 카드도 오늘치부터
+        self.stat["day"] = key
+        self._act.clear()
+        self._safe("timer_save", self._timer_save)
+
+    def _reset_records(self):
+        """새 세션 — 기록 갱신 축하를 처음부터 다시 센다."""
+        self.rec = {"strokes": [], "focus": 0.0}
+        self._rec_prev_run = 0.0
+        self._rec_armed = True
+
+    def _menu_popup(self, x, y):
+        """우클릭 메뉴 — 캐릭터('항상 위')에 안 가리게 띄운다.
+
+        캐릭터·말풍선이 전부 항상 위라서, 메뉴가 캐릭터와 겹치면 뒤로
+        깔렸다 (지뢰 15). 메뉴가 떠 있는 동안만 캐릭터의 항상 위를 내려
+        두고, 닫히면 되돌린다.
+        """
+        was = bool(self.us.get("topmost", True))
+        if was:
+            try:
+                self.root.attributes("-topmost", False)
+            except Exception:
+                pass
+        try:
+            self._menu.tk_popup(int(x), int(y))
+        finally:
+            self._menu.grab_release()
+        if was:
+            def back(tries=0):
+                try:
+                    if self._menu.winfo_ismapped() and tries < 100:
+                        self.root.after(300, lambda: back(tries + 1))
+                        return
+                    self.root.attributes("-topmost", True)
+                    self.root.lift()
+                except Exception:
+                    pass
+            self.root.after(250, back)
+
+    RESET_KEEP = 5           # 초기화 백업을 몇 벌 남길지
+
+    def _reset_backup(self):
+        """초기화 직전 상태를 남긴다 — 잘못 눌러도 되돌릴 수 있게."""
+        try:
+            with open(self.state_path, encoding="utf-8") as fp:
+                cur = json.load(fp)
+        except Exception:
+            return
+        path = os.path.join(self.state_dir, ".reset_backup.json")
+        try:
+            with open(path, encoding="utf-8") as fp:
+                got = json.load(fp)
+            backs = got if isinstance(got, list) else []
+        except Exception:
+            backs = []
+        backs.append({"ts": time.time(), "state": cur})
+        _save_json(path, backs[-self.RESET_KEEP:])
+
+    def _timer_unreset(self):
+        """'초기화 되돌리기' — 가장 최근 백업으로 되살린다."""
+        path = os.path.join(self.state_dir, ".reset_backup.json")
+        try:
+            with open(path, encoding="utf-8") as fp:
+                backs = json.load(fp)
+            back = backs.pop()
+        except Exception:
+            self._say("되돌릴 초기화 기록이 없어요", 3.5)
+            return
+        st = back.get("state") or {}
+        self.work_secs = float(st.get("seconds", 0))
+        self.zero_at = float(st.get("zero_at", 0))
+        self.day_base = float(st.get("day_base", 0))
+        self.lv_secs = max(self.lv_secs, float(st.get("lv_secs", 0)))
+        if isinstance(st.get("stat"), dict):
+            self.stat = st["stat"]
+            self._act = set(self.stat.get("mins") or [])
+        if isinstance(st.get("rec"), dict):
+            self.rec = st["rec"]
+        self._timer_save()
+        _save_json(path, backs)
+        ago = max(0, time.time() - float(back.get("ts") or 0))
+        self._say("초기화 전으로 돌려놨어요 (%d분 전 상태)" % (ago // 60), 4.5)
+
+    def _timer_reset(self):
+        # 잘못 누르는 일이 있어서, 지우기 전에 통째로 백업해 둔다.
+        self._safe("reset_backup", self._reset_backup)
+        self.work_secs = 0.0
+        self.zero_at = 0.0
+        self.day_base = 0.0
+        self._reset_records()
+        self._timer_save()
+        if self.can_talk:
+            self._say("초기화했어요. 잘못 눌렀으면 메뉴의 '초기화 되돌리기'!",
+                      4.5)
+
+    @staticmethod
+    def _app_key(s):
+        """앱 이름 비교용 정규화 — 확장자·공백·기호를 지우고 소문자로.
+
+        윈도우는 실행파일 이름('clipstudiopaint.exe'), 맥은 앱 표시 이름
+        ('CLIP STUDIO PAINT')이라 그대로 비교하면 같은 프로그램도 안 맞는다.
+        둘 다 'clipstudiopaint'로 만들어 비교한다.
+        """
+        s = str(s).lower()
+        for ext in (".exe", ".app"):
+            if s.endswith(ext):
+                s = s[:-len(ext)]
+        return "".join(ch for ch in s if ch.isalnum())
+
+    def _fg_is_self(self):
+        """앞 창이 이 프로그램 자신의 창인가 (캐릭터·설정·말풍선 모두 포함)."""
+        if not IS_WIN:
+            return False
+        try:
+            u = ctypes.windll.user32
+            pid = ctypes.c_ulong()
+            u.GetWindowThreadProcessId(u.GetForegroundWindow(),
+                                       ctypes.byref(pid))
+            return pid.value == os.getpid()
+        except Exception:
+            return False
+
+    def _fg_is_work(self, now):
+        """앞 창이 작업 프로그램인지 (1초 캐시).
+
+        캐릭터를 누르면 잠깐 이 창이 앞으로 온다. 그걸 '작업 아님'으로 세면
+        스트레칭 알림을 끄려고 누른 것만으로 최장 집중 기록이 끊긴다.
+        자기 창일 때는 직전 판정을 그대로 유지한다.
+        """
+        if now - self._fg_checked > 1.0 and not self._fg_is_self():
+            self._fg_checked = now
+            fg = self._app_key(foreground_process())
+            apps = [self._app_key(a) for a in
+                    str(self.us["work_apps"]).split(",") if a.strip()]
+            self._fg_work = bool(fg) and any(a and (a == fg or a in fg or fg in a)
+                                             for a in apps)
+        return self._fg_work
+
+    def _timer_tick(self, now, idle):
+        """상태 반환: work(측정)/other(작업앱 아님)/idle(휴식)/off(연동 끊김)."""
+        self._safe("day_roll", self._day_roll, now)
+        if self.ws_path is not None:
+            # 워크스페이스 워크타이머 연동: 에이전트의 라이브 파일을 읽어 표시만 한다
+            if now - self._ws_read > 1.0:
+                self._ws_read = now
+                try:
+                    with open(self.ws_path, encoding="utf-8") as fp:
+                        self._ws_data = json.load(fp)
+                except Exception:
+                    self._ws_data = None
+            d = self._ws_data
+            # 기존 타이머가 꺼졌거나(프로세스 종료), 떠 있어도 '작업 종료' 상태라
+            # 시간을 세지 않는 경우 모두 캐릭터가 이어서 잰다.
+            # (세션이 꺼진 걸 몰라서 아무도 안 세는 사이 작업 시간이 통째로
+            #  사라지던 문제 — 캐릭터 화면에는 옛 누적값이 그대로 보여 더 헷갈렸다)
+            ws_down    = (not d) or (now - float(d.get("ts", 0)) > 8)
+            ws_no_sess = bool(d) and not d.get("session_on", True)
+            if ws_down or ws_no_sess:
+                if not self._ws_lost:
+                    self._ws_lost = True
+                    self._t_last = now
+                    self._solo_from = self.work_secs   # 여기서부터 혼자 잰 시간
+                return self._own_tick(now, idle)
+            if self._ws_lost:         # 기존 타이머가 돌아왔다 — 다시 따라간다
+                self._ws_lost = False
+            self.work_secs = float(d.get("total", 0))
+            if d.get("active"):
+                state = "work"
+            elif d.get("idle") or idle >= self.idle_thr:
+                state = "idle"
+            else:
+                state = "other"
+            # 연동 모드에서도 집중 구간을 쌓아야 '최장 집중 갱신'이 뜬다
+            dt = min(max(now - self._t_last, 0.0), 2.0)
+            self._t_last = now
+            st = self.stat
+            st[state] = st.get(state, 0.0) + dt
+            self._log_work(now, state, st, dt)
+            self._safe("level", self._lv_tick, now)
+            return state
+
+        return self._own_tick(now, idle)
+
+    def _log_work(self, now, state, s, dt):
+        """작업 중이면 집중 구간·시작·마지막·시계에 칠할 분을 기록한다.
+
+        연동 모드와 자체 측정 모드가 같은 값을 남겨야 브리핑이 한 가지
+        모습으로 나온다. 그래서 두 길이 이 함수 하나를 같이 쓴다.
+        """
+        if state != "work":
+            s["_run"] = 0.0
+            return
+        if s.get("_run", 0.0) <= 0:          # 쉬다가 다시 시작 = 새 집중 구간
+            s["runs"] = int(s.get("runs", 0)) + 1
+        s["_run"] = s.get("_run", 0.0) + dt
+        s["best"] = max(s.get("best", 0.0), s["_run"])
+        if not s.get("first"):
+            s["first"] = now
+        s["last"] = now
+        # 시계에 칠할 분. 1분에 한 번만 들여다본다 — 매 프레임 날짜를
+        # 만들어 비교하면 그것만으로 초당 30번이다.
+        lt = time.localtime(now)
+        m = lt.tm_hour * 60 + lt.tm_min
+        if m != getattr(self, "_act_min", -1):
+            self._act_min = m
+            day = self._my_workday()
+            if day != s.get("day"):       # 작업일이 바뀌면 시계를 비운다
+                s["day"] = day
+                self._act.clear()
+            self._act.add(m)
+
+    def _own_tick(self, now, idle):
+        """캐릭터가 직접 재는 경로 (연동 없는 캐릭터 + 연동이 끊겼을 때)."""
+        dt = min(max(now - self._t_last, 0.0), 2.0)
+        self._t_last = now
+        if idle >= self.idle_thr:
+            state = "idle"
+        elif self.us["work_apps_only"] and not self._fg_is_work(now):
+            state = "other"
+        else:
+            state = "work"
+            self.work_secs += dt
+        # 하루 브리핑용 집계 (작업/딴짓/휴식 시간, 최장 집중 구간, 시작·마지막)
+        s = self.stat
+        s[state] = s.get(state, 0.0) + dt
+        self._log_work(now, state, s, dt)
+        self._safe("level", self._lv_tick, now)
+        if now - self._t_save > 30:
+            self._t_save = now
+            self._timer_save()
+        return state
+
+    def _text_w(self, text):
+        """상태 텍스트 폭(px) — 캔버스로 측정·캐시 (tkinter.font 의존 제거)."""
+        w = self._tw_cache.get(text)
+        if w is None:
+            t = self.canvas.create_text(-2000, -2000, text=text, anchor="nw",
+                                        font=(UI_FONT, 8))
+            bb = self.canvas.bbox(t)
+            w = (bb[2] - bb[0]) if bb else len(text) * 11
+            self.canvas.delete(t)
+            self._tw_cache[text] = w
+        return w
+
+    def _rrect(self, x0, y0, x1, y1, r, **kw):
+        pts = [x0 + r, y0, x1 - r, y0, x1, y0, x1, y0 + r, x1, y1 - r, x1, y1,
+               x1 - r, y1, x0 + r, y1, x0, y1, x0, y1 - r, x0, y0 + r, x0, y0]
+        return self.canvas.create_polygon(pts, smooth=True, **kw)
+
+    @staticmethod
+    def _ear_pts(cx, cy, droop, k=1.0):
+        """카드 위 토끼 귀 윤곽 (베지에 척추 + 폭). droop=1이면 옆으로 접힌다."""
+        p0 = (cx, cy)
+        if droop:
+            p1, p2 = (cx + 1, cy - 28), (cx + 24, cy - 16)
+        else:
+            p1, p2 = (cx - 4, cy - 26), (cx + 1, cy - 33)
+        left, right, cap, N = [], [], [], 8
+        for i in range(N + 1):
+            t = i / N
+            u = 1 - t
+            x = u * u * p0[0] + 2 * u * t * p1[0] + t * t * p2[0]
+            y = u * u * p0[1] + 2 * u * t * p1[1] + t * t * p2[1]
+            dx = 2 * u * (p1[0] - p0[0]) + 2 * t * (p2[0] - p1[0])
+            dy = 2 * u * (p1[1] - p0[1]) + 2 * t * (p2[1] - p1[1])
+            n = math.hypot(dx, dy) or 1.0
+            tx, ty = dx / n, dy / n
+            nx, ny = -ty, tx
+            w = (1.8 + 4.6 * math.sin(math.pi * (0.18 + 0.74 * t))) * k
+            left.append((x + nx * w, y + ny * w))
+            right.append((x - nx * w, y - ny * w))
+            if i == N:                       # 귀 끝은 반원으로 둥글게
+                for j in range(1, 5):
+                    th = math.pi * j / 5
+                    ct, st = math.cos(th), math.sin(th)
+                    cap.append((x + (ct * nx + st * tx) * w,
+                                y + (ct * ny + st * ty) * w))
+        return [v for p in left + cap + right[::-1] for v in p]
+
+    LV_GLOW = 1.8            # 레벨업 반짝이가 테두리를 도는 시간(초)
+
+    @staticmethod
+    def _rect_point(x0, y0, x1, y1, f):
+        """사각형 둘레 위의 한 점 — f(0~1)는 왼쪽 위에서 시계 방향."""
+        w, h = x1 - x0, y1 - y0
+        per = 2 * (w + h)
+        d = (f % 1.0) * per
+        if d < w:
+            return x0 + d, y0
+        d -= w
+        if d < h:
+            return x1, y0 + d
+        d -= h
+        if d < w:
+            return x1 - d, y1
+        d -= w
+        return x0, y1 - d
+
+    def _draw_lv_glow(self, x0, y0, x1, y1, now):
+        """레벨업 — 반짝이 혜성이 카드 테두리를 한 바퀴 돈다."""
+        p = (now - self._lv_glow) / self.LV_GLOW
+        if not 0.0 <= p < 1.0:
+            return
+        c = self.canvas
+        e = 1.0 - (1.0 - p) ** 2               # 빠르게 나가 천천히 멎는다
+        col = self.card.get("fill", "#f0a8c0")
+        for j, (back, r) in enumerate(((0.0, 4), (0.018, 3), (0.040, 2))):
+            px, py = self._rect_point(x0, y0, x1, y1, e - back)
+            c.create_oval(px - r, py - r, px + r, py + r,
+                          fill=col if j else "#ffffff",
+                          outline=col, width=1)
+
+    def _draw_deco(self, x0, y0, x1, y1):
+        """카드 위 장식(귀 등) — 캐릭터 컨셉별."""
+        c = self.canvas
+        deco = self.card["deco"]
+        if deco == "panda":
+            for ex in (x0 + 26, x1 - 26):
+                c.create_oval(ex - 12, y0 - 17, ex + 12, y0 + 7,
+                              fill="#2b2b2b", outline="")
+                c.create_oval(ex - 6, y0 - 11, ex + 6, y0 + 1,
+                              fill="#4a4a4a", outline="")
+        elif deco == "cat":
+            # 색은 그 캐릭터의 테마색에서 뽑는다. 분홍으로 박아 두면 붉은
+            # 카드(멸종)에서 혼자 튄다. 도로롱은 원래 값과 거의 같게 나온다.
+            base = self.card["fill"]
+            outer, line = self._tint(base, 0.30), self._shade(base, 0.15)
+            inner = self._tint(base, 0.14)
+            for sign, ex in ((-1, x0 + 26), (1, x1 - 26)):
+                c.create_polygon(ex - 13 * sign, y0 + 5, ex + 3 * sign, y0 - 17,
+                                 ex + 13 * sign, y0 + 3,
+                                 fill=outer, outline=line, width=2)
+                c.create_polygon(ex - 6 * sign, y0 + 2, ex + 3 * sign, y0 - 10,
+                                 ex + 8 * sign, y0 + 1,
+                                 fill=inner, outline="")
+        elif deco == "dog":
+            # 접힌 검은 강아지 귀 — 카드 위 모서리에서 바깥으로 늘어짐
+            for sign, ex in ((-1, x0 + 18), (1, x1 - 18)):
+                c.create_oval(ex - 15, y0 - 15, ex + 9, y0 + 28,
+                              fill="#2b2b2b", outline="")
+                c.create_oval(ex - 9, y0 - 7, ex + 3, y0 + 14,
+                              fill="#4a4a4a", outline="")
+        elif deco == "frog":
+            # 프고: 개구리 눈 두 개가 카드 위로 빼꼼 — 몸(페페)이 파랑이라
+            # 눈은 초록으로, 테마의 '초록+파랑'을 카드에서도 잇는다.
+            green, line = "#69a63c", "#49781f"
+            mx = (x0 + x1) / 2
+            for ex in (mx - 26, mx + 26):
+                c.create_oval(ex - 17, y0 - 16, ex + 17, y0 + 10,
+                              fill=green, outline=line, width=2)
+                c.create_oval(ex - 11, y0 - 11, ex + 11, y0 + 6,
+                              fill="#ffffff", outline=line, width=2)
+                c.create_oval(ex - 4, y0 - 5, ex + 4, y0 + 3,
+                              fill="#20261c", outline="")
+                c.create_oval(ex - 1, y0 - 4, ex + 3, y0 - 1,
+                              fill="#ffffff", outline="")
+        elif deco == "burger":
+            # 햄북이: 카드 위 한가운데 미니 햄버거 (번·양상추·패티)
+            mx = (x0 + x1) / 2
+            bun, line = "#ecbf6b", "#a8763e"
+            c.create_arc(mx - 22, y0 - 19, mx + 22, y0 + 13, start=0,
+                         extent=180, style="pieslice", fill=bun,
+                         outline=line, width=2)
+            for dx2 in (-10, 0, 10):               # 참깨
+                c.create_oval(mx + dx2 - 2, y0 - 12 + abs(dx2) // 5,
+                              mx + dx2 + 2, y0 - 9 + abs(dx2) // 5,
+                              fill="#fdf3d9", outline="")
+            for i2 in range(6):                    # 양상추 물결
+                lx = mx - 20 + i2 * 8
+                c.create_oval(lx - 4, y0 - 4, lx + 4, y0 + 4,
+                              fill="#7cb956", outline="#578a35")
+            c.create_rectangle(mx - 19, y0 + 1, mx + 19, y0 + 6,
+                               fill="#8a5a34", outline="#6d4426")
+        elif deco == "sushi":
+            # 연어: 카드 위 한가운데 연어 초밥 (밥 + 연어 살 + 살 결)
+            mx = (x0 + x1) / 2
+            c.create_oval(mx - 20, y0 - 8, mx + 20, y0 + 12,
+                          fill="#fdfdf6", outline="#d8d0bf", width=2)
+            c.create_oval(mx - 23, y0 - 17, mx + 23, y0 + 1,
+                          fill="#ef9d76", outline="#c96f4e", width=2)
+            for i2 in range(3):
+                sx2 = mx - 12 + i2 * 11
+                c.create_arc(sx2 - 6, y0 - 15, sx2 + 8, y0 - 1, start=40,
+                             extent=120, style="arc",
+                             outline="#f8cfb6", width=2)
+        elif deco == "rabbit":
+            base = self.card.get("bg", "#ffffff")
+            inner = self.card.get("track", "#c9d3e6")
+            for sign, ex in ((-1, x0 + 26), (1, x1 - 34)):
+                droop = 1 if sign > 0 else 0        # 오른쪽 귀는 접혀 내려감
+                c.create_polygon(self._ear_pts(ex, y0 + 10, droop),
+                                 smooth=True, fill=base,
+                                 outline=self.card["border"], width=2)
+                c.create_polygon(self._ear_pts(ex, y0 + 8, droop, 0.42),
+                                 smooth=True, fill=inner, outline="")
+        elif deco == "scarf":
+            navy, silver = "#2f3f66", "#dfe5f0"
+            self._rrect(x0 + 14, y0 - 15, x1 - 14, y0 + 7, 9, fill=navy, outline="")
+            span = (x1 - x0 - 76) / 3
+            for i in range(4):
+                sx = x0 + 44 + i * span
+                c.create_line(sx, y0 - 13, sx - 7, y0 + 5, fill=silver, width=3)
+        elif deco == "rose":
+            for ex in (x0 + 26, x1 - 26):
+                c.create_oval(ex - 12, y0 - 17, ex + 12, y0 + 7,
+                              fill="#f5bdd2", outline="#d687ab", width=2)
+                c.create_arc(ex - 8, y0 - 13, ex + 8, y0 + 3, start=300,
+                             extent=270, style="arc", outline="#d687ab", width=2)
+        elif deco == "ribbon":
+            # 사가: 카드 위 한가운데 작은 분홍 리본
+            mx = (x0 + x1) / 2
+            fill, line = "#f9b6d2", "#e07aa8"
+            for sign in (-1, 1):                    # 좌우 고리
+                c.create_polygon(mx, y0 - 1, mx + 17 * sign, y0 - 14,
+                                 mx + 19 * sign, y0 + 1, mx + 15 * sign, y0 + 6,
+                                 smooth=True, fill=fill, outline=line, width=2)
+            for sign in (-1, 1):                    # 아래로 늘어진 끈
+                c.create_line(mx + 2 * sign, y0 + 3, mx + 7 * sign, y0 + 13,
+                              fill=line, width=3)
+            c.create_oval(mx - 5, y0 - 6, mx + 5, y0 + 4,
+                          fill="#ffd9e8", outline=line, width=2)   # 가운데 매듭
+        elif deco == "sprout":
+            # 기뽀: 카드 위 한가운데 작은 새싹
+            mx = (x0 + x1) / 2
+            leaf, stem = "#8fc34a", "#5c8a2c"
+            c.create_line(mx, y0 + 6, mx, y0 - 12, fill=stem, width=3)
+            for sign in (-1, 1):                    # 좌우 잎
+                c.create_polygon(mx, y0 - 9 - 2 * (sign > 0),
+                                 mx + 8 * sign, y0 - 18,
+                                 mx + 15 * sign, y0 - 10,
+                                 mx + 6 * sign, y0 - 4,
+                                 smooth=True, fill=leaf, outline=stem, width=2)
+
+    def _status_of(self, state, sleeping):
+        if self.stretch_pending and self.stretch_shown >= self.TAP_CARD_AT:
+            return DOT_OTHER, "스트레칭!"
+        if state == "off":
+            return DOT_OFF, "타이머 꺼짐"
+        if self._ws_lost and state == "work":
+            return DOT_ON, "혼자 측정 중"
+        if sleeping:
+            return DOT_OFF, "자는 중"
+        if state == "work":
+            return DOT_ON, "작업중"
+        if state == "other":
+            return DOT_OTHER, "딴짓 중"
+        return DOT_OFF, "쉬는 중"
+
+    def _draw_clock(self, cx, cy, R, now):
+        """아날로그 시계 + 작업한 시간을 방사형 선으로(기존 '작업 흔적' 방식).
+
+        작업한 분마다 중심→가장자리 방향으로 선 하나(오전=연한색/오후=진한색).
+        연속 작업이면 부채꼴처럼 촘촘히 채워지고, 안 한 시간대는 비어 있다.
+        """
+        c = self.canvas
+        cd = self.card
+        am_col = cd.get("arc_am", "#f4c9dd")     # 오전 = 연한 분홍
+        pm_col = cd.get("arc_pm", "#e493bd")     # 오후 = 진한 분홍
+        # 바탕
+        c.create_oval(cx - R, cy - R, cx + R, cy + R,
+                      fill=cd["bg"], outline=cd["border"], width=2)
+        # 작업한 분 = 방사형 선 (12시간 다이얼 위치)
+        Rf = R - 3
+        seen = set()
+        for m in ((self._ws_data or {}).get("act") or []):
+            lt = time.localtime(m * 60)
+            pos = (lt.tm_hour % 12) * 60 + lt.tm_min
+            key = (pos, lt.tm_hour < 12)
+            if key in seen:
+                continue
+            seen.add(key)
+            a = math.radians(pos / 720 * 360 - 90)
+            col = am_col if lt.tm_hour < 12 else pm_col
+            c.create_line(cx, cy, cx + Rf * math.cos(a), cy + Rf * math.sin(a),
+                          fill=col, width=1)
+        # 시각 눈금
+        for i in range(12):
+            a = math.radians(i * 30 - 90)
+            big = i % 3 == 0
+            r2 = R - (8 if big else 5)
+            c.create_line(cx + (R - 3) * math.cos(a), cy + (R - 3) * math.sin(a),
+                          cx + r2 * math.cos(a), cy + r2 * math.sin(a),
+                          fill=cd["sub"], width=2 if big else 1)
+        lt = time.localtime(now)
+        hh = lt.tm_hour % 12 + lt.tm_min / 60
+        mm = lt.tm_min + lt.tm_sec / 60
+
+        def hand(frac, length, width, color):
+            a = math.radians(frac * 360 - 90)
+            c.create_line(cx, cy, cx + length * math.cos(a), cy + length * math.sin(a),
+                          width=width, fill=color, capstyle="round")
+
+        hand(hh / 12, R * 0.46, 3, cd["text"])
+        hand(mm / 60, R * 0.66, 2, cd["text"])
+        hand(lt.tm_sec / 60, R * 0.76, 1, cd["fill"])
+        c.create_oval(cx - 2.5, cy - 2.5, cx + 2.5, cy + 2.5, fill=cd["fill"], outline="")
+
+    # ── 귀여운 이벤트: 말풍선 · 혼잣말 · 클릭 반응 · 반려동물 · 축하 ──────
+    PET_RISE, PET_HOLD, PET_FALL = 0.5, 6.0, 0.5
+    TALK = [
+        "히히", "바보!", "배고파요", "조금만 더 힘내자!", "뭐 좀 먹고 할까...",
+        "야옹", "싫어 그 가느다란 꼬리", "사탄 참 좋다", "가즈아", "야르",
+        "졸려", "심심해", "오늘도 화이팅!", "집중! 집중!", "손이 멈췄다?",
+        "그림 그리자!", "저장했지?", "Ctrl+S!", "커피 한 잔?", "조금만 더!",
+        "쉬엄쉬엄 하자.", "손목 괜찮아?", "한 장만 더!", "끝내고 놀자!",
+        "영혼을 바쳐라.", "몰?루", "오늘도 평화롭다.", "좋은 하루!",
+        "기분 최고!", "운세 좋음!", "행운 냥!", "행복 충전!", "산책은 싫어.",
+        "창밖이 궁금해.", "햇빛이다!", "꾸벅...", "후암~", "멍...", "어라?",
+        "오?", "흠...", "비밀이야.", "쉿!", "냥냥펀치!", "히힛!",
+        "간식은 언제?",
+    ]
+    CLICK_TALK = TALK
+
+    def _say(self, text, secs=4.0):
+        self.bubble = (text, time.time() + secs)
+
+    def _talk_pool(self, state):
+        return self.cfg.get("talk") or self.TALK
+
+    def _pick_talk(self, pool):
+        """최근에 한 말은 빼고 고른다 — 같은 말이 금방 또 나오면 김이 샌다.
+
+        목록의 3분의 1 정도를 기억해 두고 그 밖에서 뽑는다. 목록이 짧으면
+        기억하는 개수도 같이 줄어 항상 뽑을 게 남는다.
+        """
+        keep = max(1, min(len(pool) - 1, len(pool) // 3))
+        recent = getattr(self, "_recent_talk", [])
+        cand = [t for t in pool if t not in recent] or list(pool)
+        pick = random.choice(cand)
+        self._recent_talk = (recent + [pick])[-keep:]
+        return pick
+
+    def _click_pool(self):
+        return self.cfg.get("click_talk") or self._talk_pool(None)
+
+    def _fun_tick(self, now, state, sleeping):
+        """혼잣말·반려동물 스케줄과 폭죽 물리 (매 프레임)."""
+        # 말풍선 사라짐은 fun과 무관하게 항상 처리한다. 예전에는 fun이 꺼진
+        # 캐릭터에서 한 번 뜬 말풍선이 영영 남았다.
+        if self.bubble and now > self.bubble[1]:
+            self.bubble = None
+        if self.particles:
+            self._step_particles()
+        if self.notes:
+            self._step_notes()
+        if not self.fun and not self.can_cheer:
+            return
+        if not self.fun:
+            self._rec_tick(now, state)
+            return
+        if self._update_msg and self.bubble is None and not sleeping:
+            self._say(self._update_msg, 12.0)     # 업데이트 알림 (시작 후 한 번)
+            self._update_msg = None
+            self.next_talk = now + 120
+            if self._update_notes:                # 무엇이 바뀌었는지 팝업으로
+                self._safe("update_popup", self._show_update_popup, False)
+        self._rec_tick(now, state)
+        if (self.bubble is None and now >= self.next_talk
+                and not sleeping and now > self.celebrate_until):
+            line = self._pick_talk(self._talk_pool(state))
+            self._say(line)
+            self.next_talk = now + random.uniform(700, 1700)
+            if random.random() < 0.4:         # 혼잣말하며 고개를 까딱
+                self._gest_start(self._talk_gesture(line))
+        # 반려동물 등장/퇴장
+        total = self.PET_RISE + self.PET_HOLD + self.PET_FALL
+        if self.pet_t0 == 0.0 and now >= self.next_pet and not sleeping:
+            self.pet_cast = self._pick_pets()
+            self.pet_t0 = now if self.pet_cast else 0.0
+            if not self.pet_cast:
+                self.next_pet = now + 999999
+        elif self.pet_t0 and now - self.pet_t0 > total + 0.4:
+            self.pet_t0 = 0.0
+            self.next_pet = now + random.uniform(240, 600)
+
+    def _step_particles(self):
+        """폭죽 조각 (중력 + 수명)."""
+        alive = []
+        for p in self.particles:
+            p[0] += p[2]
+            p[1] += p[3]
+            p[3] += 0.35
+            p[5] -= 1
+            if p[5] > 0 and p[1] < self.H + 30:
+                alive.append(p)
+        self.particles = alive
+
+    STROKE_MARKS = (300, 1000, 3000, 10000)   # 그린 획수 축하 지점
+    FOCUS_MIN = 20 * 60                       # 최장 집중은 20분부터 인정
+    FOCUS_STEP = 60                           # 최소 이만큼은 넘겨야 '갱신'
+
+    def _rec_tick(self, now, state):
+        """기록 갱신 축하 — 그린 획수 돌파 · 이번 세션 최장 집중 갱신."""
+        if not self.can_cheer or self.bubble is not None                 or now < self.celebrate_until:
+            return
+        if now < self._rec_next or state != "work":
+            return                            # 작업 중일 때만, 그리고 쿨다운 뒤
+        run = float(self.stat.get("_run", 0.0))
+        if run < self._rec_prev_run:          # 집중이 끊겼다 → 다음 구간 준비
+            self._rec_armed = True
+        self._rec_prev_run = run
+
+        strokes = int(self.stat.get("strokes", 0))
+        for mark in self.STROKE_MARKS:
+            if strokes >= mark and mark not in self.rec["strokes"]:
+                self.rec["strokes"].append(mark)
+                self._cheer(f"{mark:,}획 돌파!")
+                return
+        if (self._rec_armed and run >= self.FOCUS_MIN
+                and run > self.rec["focus"] + self.FOCUS_STEP):
+            self.rec["focus"] = run
+            self._rec_armed = False           # 이 구간에서는 한 번만
+            self._cheer(f"최장 집중 갱신! {int(run // 60)}분째")
+
+    def _cheer(self, text):
+        """작업 종료보다 약한 축하 — 말풍선 + 폭죽 조금 (팝업 없음)."""
+        now = time.time()
+        self._rec_next = now + 90             # 연달아 뜨지 않게
+        for _ in range(2):                    # 기록 갱신은 반짝임
+            self._safe("fx", self._spawn_note, now, "spark")
+        self._say(text, 4.5)
+        self._gest_start("clap", force=True)
+        if self.has.get("smile"):
+            self.smile_until = now + 3.0
+        cols = ["#ff9ec4", "#ffd479", "#9ad7ff", "#b8e986", "#c9a7ff"]
+        for _ in range(14):
+            ang = random.uniform(-2.6, -0.55)
+            spd = random.uniform(3.0, 6.5)
+            self.particles.append([self.card_cx + random.uniform(-45, 45),
+                                   self.oy + 46,
+                                   math.cos(ang) * spd, math.sin(ang) * spd,
+                                   random.choice(cols), random.randint(35, 60)])
+        self._timer_save()
+
+    def _pick_pets(self):
+        """이번에 나올 반려동물 배역 — 2마리면 한 마리씩 또는 둘 다."""
+        names = [n for n in ("pet1", "pet2") if self.has.get(n)]
+        if len(names) < 2:
+            return [(n, 0.0) for n in names]
+        if self.cfg.get("pet_variants"):      # 같은 동물의 다른 포즈 — 하나만
+            return [(random.choice(names), 0.0)]
+        pick = random.choice([[names[0]], [names[1]], names])
+        return [(n, i * 0.35) for i, n in enumerate(pick)]
+
+    def _pet_img(self, name, dy):
+        """책상 윗선 아래는 잘라낸 반려동물 이미지 (내려간 만큼 가려짐)."""
+        key = (name, int(dy))
+        hit = self._pet_cache.get(key)
+        if hit is None:
+            if len(self._pet_cache) > 120:
+                self._pet_cache.clear()
+            pil = self._pil_cache[name]
+            x0, y0 = self._pet_xy[name]
+            y0 = y0 + dy
+            region = self._pet_mask.crop((x0, y0, x0 + pil.width, y0 + pil.height))
+            blank = Image.new("RGBA", pil.size, (0, 0, 0, 0))
+            cut = Image.composite(pil, blank, region)
+            if name not in self._soft_parts:
+                cut = self._hard(cut)
+            hit = ImageTk.PhotoImage(cut)
+            self._pet_cache[key] = hit
+        return hit
+
+    PET_BLUR = 16                    # 반려동물 그림자 블러 여백
+
+    def _pet_shadow_pil(self, name, dy):
+        """반려동물 그림자(책상선까지 잘린 실루엣을 흐린 것) — dy별 캐시."""
+        key = (name, int(dy))
+        hit = self._pet_sh_cache.get(key)
+        if hit is None:
+            from PIL import ImageFilter
+            if len(self._pet_sh_cache) > 40:
+                self._pet_sh_cache.clear()
+            pil = self._pil_cache[name]
+            x0, y0 = self._pet_xy[name]
+            region = self._pet_mask.crop((x0, y0 + dy, x0 + pil.width,
+                                          y0 + dy + pil.height))
+            blank = Image.new("RGBA", pil.size, (0, 0, 0, 0))
+            cut = Image.composite(pil, blank, region)
+            b = self.PET_BLUR
+            pad = Image.new("L", (pil.width + 2 * b, pil.height + 2 * b), 0)
+            pad.paste(cut.getchannel("A"), (b, b))
+            a = pad.filter(ImageFilter.GaussianBlur(7)).point(lambda v: int(v * 0.30))
+            black = Image.new("RGB", pad.size, (0, 0, 0))
+            hit = Image.merge("RGBA", (*black.split(), a))
+            self._pet_sh_cache[key] = hit
+        return hit
+
+    def _update_pet_shadow(self):
+        """반려동물이 나와 있는 동안만 그림자 창을 갱신 (약 15fps로 제한)."""
+        if self.shadow is None or self.shadow_img is None:
+            return
+        drawn = self._pet_drawn
+        now = time.time()
+        if not drawn:
+            if self._pet_sh_on:                  # 원래 그림자로 되돌린다
+                self.shadow.set_image(self._shadow_base or self.shadow_img)
+                self._pet_sh_on = False
+            return
+        if now - self._pet_sh_t < 0.065:
+            return
+        self._pet_sh_t = now
+        comp = (self._shadow_base or self.shadow_img).copy()
+        b, sp = self.PET_BLUR, SHADOW_PAD
+        for name, dy, x, y in drawn:
+            comp.alpha_composite(self._pet_shadow_pil(name, dy),
+                                 (round(x) + sp - b, round(y) + sp - b))
+        self.shadow.set_image(comp)
+        self._pet_sh_on = True
+
+    def _draw_pet(self, now):
+        """책상 뒤에서 뿅 — 올라와 빤히 보다가 쏙 들어간다."""
+        if not (self.fun and self.pet_t0):
+            return
+        c = self.canvas
+        for name, delay in self.pet_cast:
+            t = now - self.pet_t0 - delay
+            if t < 0:
+                continue
+            if t < self.PET_RISE:
+                f = t / self.PET_RISE
+            elif t < self.PET_RISE + self.PET_HOLD:
+                f = 1.0
+            else:
+                f = max(0.0, 1.0 - (t - self.PET_RISE - self.PET_HOLD) / self.PET_FALL)
+            if f <= 0:
+                continue
+            f = f * f * (3 - 2 * f)                     # 부드럽게
+            x, y = self._pet_xy[name]
+            y += self.oy
+            if f >= 1.0:                                # 빤히 보는 동안 살짝 들썩
+                bob = math.sin((now + delay * 3) * 2.4) * 2.0
+                c.create_image(x, y - bob, image=self._pet_img(name, 0),
+                               anchor="nw")
+                self._pet_drawn.append((name, 0, x, y - bob))
+            else:
+                dy = round(self._pet_hide.get(name, 0) * (1 - f) / 3) * 3
+                c.create_image(x, y + dy, image=self._pet_img(name, dy),
+                               anchor="nw")
+                self._pet_drawn.append((name, dy, x, y + dy))
+
+
+    def _draw_hat(self, yo):
+        """축하용 고깔모자 (hat.png 있으면 사용, 없으면 임시 도형)."""
+        if not (self.fun and time.time() < self.hat_until):
+            return
+        c = self.canvas
+        name = "head" if self.has.get("head") else "body_open"
+        if name not in self._pil_cache:
+            return
+        top = self._pos(name)[1] + yo
+        bb = self._pil_cache[name].split()[3].getbbox()
+        if bb:                          # 이미지 여백 제외한 실제 머리 꼭대기
+            top += bb[1]
+        dx, dy = self.cfg.get("hat_pos", [-44, 44])
+        hx = self.card_cx + dx          # 살짝 비껴 씌워 말풍선을 안 가리게
+        hat = self.im.get("hat")
+        if hat is not None:
+            c.create_image(hx, top + dy, image=hat, anchor="s")
+            return
+        c.create_polygon(hx - 19, top + 30, hx, top - 6, hx + 19, top + 30,
+                         fill="#ffb3c9", outline="#e07a9c", width=2)
+        c.create_oval(hx - 6, top - 16, hx + 6, top - 4,
+                      fill="#fff0a8", outline="#e0b84a", width=2)
+
+    def _draw_particles(self):
+        c = self.canvas
+        for x, y, _vx, _vy, col, _life in self.particles:
+            c.create_rectangle(x - 3, y - 2, x + 3, y + 2, fill=col, outline="")
+
+    @staticmethod
+    def _bubble_pts(x0, y0, x1, y1, r, tx, tw, th):
+        """둥근 사각형 + 아래쪽 V자 꼬리를 한 붓으로 이은 점 목록."""
+        pts = []
+
+        def arc(cx, cy, a0, a1, steps=6):
+            for i in range(steps + 1):
+                a = math.radians(a0 + (a1 - a0) * i / steps)
+                pts.extend((cx + math.cos(a) * r, cy + math.sin(a) * r))
+
+        arc(x1 - r, y0 + r, -90, 0)                 # 우상
+        arc(x1 - r, y1 - r, 0, 90)                  # 우하
+        pts.extend((tx + tw / 2, y1))               # 꼬리 시작
+        pts.extend((tx - tw * 0.18, y1 + th))       # 꼬리 끝
+        pts.extend((tx - tw / 2, y1))
+        arc(x0 + r, y1 - r, 90, 180)                # 좌하
+        arc(x0 + r, y0 + r, 180, 270)               # 좌상
+        return pts
+
+    def _draw_bubble(self, yo):
+        """머리 위 말풍선 — 둥근 모서리 + 아래 V자 꼬리.
+
+        새 글이 뜨는 순간 아래에서 톡 올라온다 (0.16초). 글이 바뀐 것을
+        여기서 알아채므로, 말풍선을 채우는 쪽 코드는 아무것도 몰라도 된다.
+        """
+        if not (self.can_talk and self.bubble):
+            return
+        text = self.bubble[0]
+        if text != self._bubble_text_last:
+            self._bubble_text_last = text
+            self._bubble_born = time.time()
+        u = min(1.0, max(0.0, (time.time() - self._bubble_born) / 0.16))
+        c, cd = self.canvas, self.card
+        # 말풍선은 카드와 달리 크기가 고정이 아니라, 글자에 맞춰 상자가 늘어난다.
+        # 그래서 글자 크기 설정을 그대로 따라도 겹칠 일이 없다. 다만 창보다
+        # 넓어지면 안 되니 그 선에서만 줄인다.
+        font = self._fit(text, 9, self.W - 46)
+        w = max(self._mw(text, font) + 34, 74)
+        h = max(36, self._mh(font) + 20)
+        cx = self.card_cx
+        if time.time() < self.hat_until:      # 고깔모자를 가리지 않게 옆으로
+            cx += 42
+        cx = min(max(cx, w / 2 + 4), self.W - w / 2 - 4)   # 창 밖으로 안 나가게
+        top = self._pos("head" if self.has.get("head") else "body_open")[1] + yo
+        # 카드와 겹치지 않게 카드 아래로 (머리 위쪽에 걸침)
+        card_bottom = self._card_geom()["y1"] if self.timer_on else self.oy
+        # 톡 등장 — max 로 자리를 정한 '뒤에' 더해야 한다. yo 에 더하면
+        # 카드 아래 기준(max 의 오른쪽)이 이겨서 오프셋이 통째로 사라진다.
+        by = max(top + 10, card_bottom + 40) + (1.0 - u) ** 2 * 8
+        x0, x1 = cx - w / 2, cx + w / 2
+        pts = self._bubble_pts(x0, by - h, x1, by, 13, cx + 4, 17, 13)
+        c.create_polygon([p + 2 for p in pts], fill="#e6e2e8", outline="")
+        c.create_polygon(pts, fill="#ffffff", outline=cd["border"], width=2)
+        c.create_text(cx, by - h / 2, text=text, font=font, fill=cd["text"])
+
+
+    def _end_workday(self):
+        """캐릭터 쪽에서 누른 작업 종료 — 기존 타이머에도 알려 기록으로 남긴다.
+
+        '혼자 측정 중'이었다면 그동안 캐릭터가 잰 시간을 함께 넘긴다. 기존
+        타이머는 그 시간을 모르기 때문에, 안 넘기면 그만큼이 통째로 빠진다.
+        명령 파일은 기존 타이머가 읽어 갈 때까지 남아 있으므로, 지금 꺼져
+        있어도 다음에 켜질 때 기록된다.
+        """
+        if self.ws_path is not None:
+            solo = (max(0, int(self.work_secs - self._solo_from))
+                    if self._ws_lost else 0)
+            path = os.path.join(os.path.dirname(self.ws_path), ".mascot_cmd")
+            try:
+                with open(path, "w", encoding="utf-8") as fp:
+                    json.dump({"cmd": "end", "solo_secs": solo,
+                               "ts": time.time()}, fp)
+            except Exception:
+                self._log_error("end_cmd")
+        # 방에 사람이 있으면 오늘의 단체사진을 남긴다 (혼자면 안 찍는다).
+        # _safe 는 돌려주는 값이 없어서 여기서는 직접 감싼다.
+        try:
+            if self._room_photo():
+                # 바로 말하면 아래 축하 말풍선에 덮인다. 축하가 지나간 뒤에.
+                if self._photo_after is not None:
+                    self.root.after_cancel(self._photo_after)
+                self._photo_after = self.root.after(
+                    6000, lambda: self._safe(
+                        "photo_say", self._say, "오늘의 단체사진을 남겼어요", 4.0))
+        except Exception:
+            self._log_error("room_photo")
+        self._celebrate()
+
+    # ── 제스처 ───────────────────────────────────────────────────────────
+    # 파츠를 새로 그리지 않고, 이미 있는 것들을 옮기고 돌려서 만든 동작들.
+    # 움직일 수 있는 것은 머리(목을 축으로 회전 + 상하), 몸 전체(상하),
+    # 그리고 두 손(늘어나는 팔이 따라온다)뿐이라 이 넷의 조합으로 짠다.
+    GESTURES = {"wave": 2.0, "clap": 1.9, "nod": 1.2,
+                "shake": 1.3, "stretch": 3.0, "groove": 3.6,
+                "yawn": 2.8, "doze": 3.0, "think": 3.6, "startle": 1.1,
+                "cheer": 2.4, "sway": 3.8}
+    # 아래 여섯은 config의 "gestures_plus"를 켠 캐릭터에서만 나온다.
+    GEST_PLUS = ("yawn", "doze", "think", "startle", "cheer", "sway")
+    STRETCH_EVERY = 20 * 60      # 기지개 간격 기본값 (환경설정에서 바꾼다)
+    # 환경설정에서 고를 수 있는 간격. 사람마다 집중 리듬이 달라 넓게 뒀다.
+    STRETCH_CHOICES = ("끄기", "10분마다", "20분마다", "30분마다",
+                       "45분마다", "60분마다", "90분마다")
+    # 기지개를 켜며 하는 말. 캐릭터별로 config의 "stretch_talk"로 덮어쓴다.
+    STRETCH_TALK = ("같이 쭉 펴 볼까요?", "어깨 한 번 풀어요.",
+                    "잠깐 기지개 켜요.", "허리도 한 번 펴 봐요.")
+    # 박수 자세 (캔버스 px 기준). 팔을 아래에서 위로 올려 붙이는 모양이
+    # 되도록 어깨를 몸 아래쪽에 두고, 손은 턱 바로 밑에서 만나게 한다.
+    CLAP_SWING = 26.0            # 손끝이 벌어지는 각도(도)
+    CLAP_SHY = 22.0              # 박수용 어깨를 얼마나 내릴지 (작을수록 위)
+    CLAP_LEN = 0.95              # 박수에서 쓰는 팔 길이 (원래 길이 대비)
+    WAVE_SHY = -8.0              # 손 흔들 때 어깨를 얼마나 올릴지
+    STRETCH_SHY = -22.0          # 기지개에서 어깨 높이 (작을수록 위)
+
+    def _gest_start(self, name, force=False):
+        """동작을 시작한다. 이미 하고 있으면 무시 — 겹치면 손이 튄다."""
+        if not self.gestures_on or name not in self.GESTURES:
+            return
+        if name in self.GEST_PLUS and not self.cfg.get("gestures_plus"):
+            return
+        now = time.time()
+        if not force and self.gest is not None \
+                and now < self.gest_t0 + self.gest_dur:
+            return
+        self.gest, self.gest_t0 = name, now
+        self.gest_dur = self.GESTURES[name]
+        # 프레임마다 지워야 하는 값은 여기서 되돌린다. 자세 계산 안에서만
+        # 만지면, 그 구역이 꺼졌을 때 마지막 값이 남아 자세가 굳는다.
+        self._doze_woke = False
+        if name == "yawn":
+            self._safe("fx", self._spawn_note, now, "yawn")
+        elif name == "startle":
+            self._safe("fx", self._spawn_note, now, "bang")
+        elif name == "cheer":
+            self._note_left = random.randint(2, 3)
+            self._note_next = now + 0.25
+        elif name == "think":
+            self._note_left = random.randint(1, 2)
+            self._note_next = now + 0.5
+            if self.can_talk and self.bubble is None:
+                self._say("...", 2.6)
+        if name == "groove":              # 음표는 두세 개만 — 많으면 지저분하다
+            self._note_left = random.randint(2, 3)
+            self._note_next = now + 0.35
+        elif (name == "stretch" and self.can_talk and self.bubble is None
+                and not self.stretch_pending):
+            pool = self.cfg.get("stretch_talk") or self.STRETCH_TALK
+            self._say(random.choice(list(pool)), 4.5)
+
+    def _gest_tick(self, now, sleeping):
+        """이번 프레임의 머리·몸·손 이동량을 정한다 (draw 맨 앞에서 호출)."""
+        self._g_dy = self._g_hdy = self._g_tilt = 0.0
+        self._g_hands = None
+        self._g_eyes_shut = self._g_smile = False
+        if not self.gestures_on:
+            return
+        # 그리거나 타자 치는 중에도 몸짓은 끝까지 한다. 팔이 잠깐 펜을
+        # 놓더라도 그린 획 수와 펜 소리는 _track_pen이 계속 센다.
+        if sleeping:
+            self.gest = None
+            return
+        if self.gest is not None and now >= self.gest_t0 + self.gest_dur:
+            self.gest = None
+        self._gest_schedule(now)
+        if self.gest is None:
+            return
+        try:
+            self._gest_pose(now)
+        except Exception:
+            self.gest = None
+            self._g_dy = self._g_hdy = self._g_tilt = 0.0
+            self._g_hands = None
+            self._g_eyes_shut = self._g_smile = False
+            self._log_error("gesture")
+
+    NOTE_STEPS = 7               # 파티클이 사라지기까지의 단계 수
+
+    def _fx_cloud(self, size, color="#8f8f97", lobes=5):
+        """하품 구름 — 덩어리를 합친 실루엣의 바깥 테두리만 남긴다.
+
+        호를 여러 개 겹쳐 그리면 안쪽 선까지 남아 별처럼 보인다. 그래서
+        실루엣을 만든 뒤 한 겹 깎아내 그 차이(테두리)만 쓰고, 덩어리가
+        만나는 오목한 자리에 작은 구멍을 뚫어 손그림 같은 틈을 낸다.
+        """
+        from PIL import ImageChops, ImageDraw, ImageFilter
+        n = int(size) + 4
+        lw = max(2, round(size * 0.062))
+        c = n * 0.5
+        rr = n * 0.26
+        dd = rr * 0.95
+        sil = Image.new("L", (n, n), 0)
+        sd = ImageDraw.Draw(sil)
+        sd.ellipse([c - dd, c - dd, c + dd, c + dd], fill=255)  # 가운데 구멍 방지
+        for k in range(lobes):
+            a = math.radians(-90 + k * (360.0 / lobes))
+            lx, ly = c + dd * math.cos(a), c + dd * math.sin(a)
+            sd.ellipse([lx - rr, ly - rr, lx + rr, ly + rr], fill=255)
+        ring = ImageChops.subtract(sil, sil.filter(ImageFilter.MinFilter(2 * lw + 1)))
+        half = math.radians(180.0 / lobes)
+        v = rr * rr - (dd * math.sin(half)) ** 2
+        if v > 0:
+            dn = dd * math.cos(half) + math.sqrt(v)
+            gd = ImageDraw.Draw(ring)
+            for k in range(lobes):
+                a = math.radians(-90 + 180.0 / lobes + k * (360.0 / lobes))
+                gx, gy = c + dn * math.cos(a), c + dn * math.sin(a)
+                g = lw * 0.9
+                gd.ellipse([gx - g, gy - g, gx + g, gy + g], fill=0)
+        out = Image.new("RGBA", (n, n), (0, 0, 0, 0))
+        out.paste(Image.new("RGBA", (n, n), color), (0, 0), ring)
+        return out
+
+    def _build_notes(self):
+        """머리 위로 떠오르는 작은 그림들 — 음표·하트·땀·물음표·반짝임·느낌표.
+
+        글꼴에 기대지 않고 도형으로 그린다 — 맥에서도 같은 모양. 색상키 창에서는
+        반투명이 그대로 안 나온다(반투명 픽셀이 배경색과 섞여 거뭇해진다).
+        그래서 옅어지는 대신 픽셀을 점점 솎아내 사라지게 한다.
+        """
+        self.fx_imgs = {}
+        try:
+            from PIL import ImageDraw, ImageFilter
+            h = max(20, round(self.W * 0.135))
+            col = self.card.get("fill", "#f2a7c5")
+            st = max(2, round(h * 0.085))          # 기둥 굵기
+            rx, ry = h * 0.21, h * 0.165           # 음표 머리 반지름
+
+            def head(d, cx, cy):
+                d.ellipse([cx - rx, cy - ry, cx + rx, cy + ry], fill=col)
+
+            def stem(d, x, y0, y1):
+                d.rectangle([x - st, y0, x, y1], fill=col)
+
+            notes = []
+            # ① 홑음표 — 머리 + 기둥 + 휘어진 깃발
+            w0 = round(h * 0.70)
+
+            def draw0(d):
+                cx, cy = rx + 1, h - ry - 1
+                top = h * 0.10
+                head(d, cx, cy)
+                stem(d, cx + rx, top, cy)
+                d.polygon([(cx + rx, top), (cx + rx + h * 0.26, top + h * 0.16),
+                           (cx + rx + h * 0.24, top + h * 0.44),
+                           (cx + rx + h * 0.10, top + h * 0.30),
+                           (cx + rx + h * 0.13, top + h * 0.17),
+                           (cx + rx, top + h * 0.24)], fill=col)
+            notes.append((w0, draw0))
+            # ② 두 음표 — 기둥 위를 굵은 대로 이었다
+            w1 = round(h * 1.05)
+
+            def draw1(d):
+                ax, ay = rx + 1, h - ry - 1
+                bx, by = w1 - rx - 1, h - ry - h * 0.16
+                ta, tb = h * 0.20, h * 0.06
+                head(d, ax, ay)
+                head(d, bx, by)
+                stem(d, ax + rx, ta, ay)
+                stem(d, bx + rx, tb, by)
+                d.polygon([(ax + rx - st, ta), (bx + rx, tb),
+                           (bx + rx, tb + h * 0.20),
+                           (ax + rx - st, ta + h * 0.20)], fill=col)
+            notes.append((w1, draw1))
+
+            # ③ 하트
+            wh = round(h * 0.92)
+
+            def drawh(d, c="#ff8fb0"):
+                r = wh * 0.26
+                d.ellipse([0, h * 0.14, 2 * r, h * 0.14 + 2 * r], fill=c)
+                d.ellipse([wh - 2 * r, h * 0.14, wh, h * 0.14 + 2 * r], fill=c)
+                d.polygon([(1, h * 0.34), (wh - 1, h * 0.34),
+                           (wh / 2, h * 0.97)], fill=c)
+
+            # ④ 땀방울
+            ws = max(6, round(h * 0.50))
+
+            def draws(d, c="#7fc4f2"):
+                d.ellipse([0, h * 0.40, ws, h * 0.40 + ws], fill=c)
+                d.polygon([(ws / 2, h * 0.04), (ws * 0.06, h * 0.62),
+                           (ws * 0.94, h * 0.62)], fill=c)
+
+            # ⑤ 물음표
+            wq = max(8, round(h * 0.66))
+
+            def drawq(d, c=col):
+                lw = max(2, round(h * 0.13))
+                d.arc([lw / 2, h * 0.04, wq - lw / 2, h * 0.52],
+                      150, 30, fill=c, width=lw)
+                d.line([(wq * 0.74, h * 0.40), (wq * 0.50, h * 0.64)],
+                       fill=c, width=lw)
+                d.ellipse([wq * 0.5 - lw * 0.9, h * 0.76,
+                           wq * 0.5 + lw * 0.9, h * 0.76 + lw * 1.8], fill=c)
+
+            # ⑥ 반짝임 (네 갈래 별)
+            wk = max(8, round(h * 0.78))
+
+            def drawk(d, c="#ffcf5e"):
+                cx, cy = wk / 2, h / 2
+                a = min(wk, h) * 0.46
+                b = a * 0.26
+                d.polygon([(cx, cy - a), (cx + b, cy - b), (cx + a, cy),
+                           (cx + b, cy + b), (cx, cy + a), (cx - b, cy + b),
+                           (cx - a, cy), (cx - b, cy - b)], fill=c)
+
+            # ⑦ 느낌표
+            wb = max(5, round(h * 0.34))
+
+            def drawb(d, c="#ff9770"):
+                d.polygon([(wb * 0.10, h * 0.04), (wb * 0.90, h * 0.04),
+                           (wb * 0.68, h * 0.62), (wb * 0.32, h * 0.62)],
+                          fill=c)
+                d.ellipse([wb * 0.12, h * 0.74,
+                           wb * 0.88, h * 0.74 + wb * 0.76], fill=c)
+
+            # ⑧ 하품 구름 — '하품 중'을 알리는 표시라 다른 것보다 크게.
+            hy = wy = round(h * 1.5)
+            cloud = self._fx_cloud(hy)
+
+            groups = {"note": notes, "heart": [(wh, drawh)],
+                      "yawn": [(wy, cloud, hy)],
+                      "sweat": [(ws, draws)], "question": [(wq, drawq)],
+                      "spark": [(wk, drawk)], "bang": [(wb, drawb)]}
+            for kind, group in groups.items():
+                made = []
+                for spec in group:
+                    w, fn = spec[0], spec[1]
+                    kh = spec[2] if len(spec) > 2 else h   # 종류마다 높이가 다를 수 있다
+                    base = Image.new("RGBA", (int(w) + 4, int(kh) + 4),
+                                     (0, 0, 0, 0))
+                    if isinstance(fn, Image.Image):   # 미리 만들어 둔 그림
+                        base.alpha_composite(fn)
+                    else:
+                        fn(ImageDraw.Draw(base))
+                    # 어떤 배경에서도 보이게 흰 테두리를 한 겹 두른다
+                    rim = base.split()[3].filter(ImageFilter.MaxFilter(3))
+                    out = Image.new("RGBA", base.size, (255, 255, 255, 0))
+                    out.putalpha(rim)
+                    out.alpha_composite(base)
+                    lv = []
+                    for k in range(self.NOTE_STEPS):
+                        keep = 1.0 - k / float(self.NOTE_STEPS)
+                        if self._fx_soft:
+                            # 알파를 그대로 낮춘다 — 레이어 창이 진짜 반투명을
+                            # 내주므로 부드럽게 옅어진다
+                            im = out.copy()
+                            im.putalpha(im.split()[3].point(
+                                lambda v, kk=keep: int(v * kk)))
+                            lv.append(im)
+                        else:
+                            # 색상키 창(맥 등)에서는 반투명이 안 나온다 —
+                            # 어쩔 수 없이 픽셀을 솎아내 옅어 보이게 한다
+                            im = out.copy()
+                            a = im.split()[3].load()
+                            px = im.load()
+                            for y in range(im.height):
+                                for x in range(im.width):
+                                    if a[x, y] and random.random() > keep:
+                                        px[x, y] = (0, 0, 0, 0)
+                            lv.append(ImageTk.PhotoImage(self._hard(im)))
+                    made.append(lv)
+                self.fx_imgs[kind] = made
+        except Exception:
+            self.fx_imgs = {}
+            self._log_error("notes")
+
+    def _spawn_note(self, now, kind="note", side=None, slow=1.0):
+        """머리 위로 작은 그림 하나를 푱 하고 띄운다.
+
+        side를 주면 그 쪽(-1 왼쪽 / 1 오른쪽)에 띄운다. 음악 음표는 한쪽씩
+        번갈아 내야 해서 자리를 지정한다.
+        slow를 1보다 작게 주면 그만큼 천천히 오른다. 같은 높이까지 가도록
+        수명도 함께 늘려, 느리게 올라가다 사라지는 모양이 된다.
+        """
+        lvs = self.fx_imgs.get(kind) or self.fx_imgs.get("note")
+        if not lvs:
+            return
+        hx0, hy0, hx1, hy1 = self._head_box
+        if side is None:
+            side = random.choice((-1, 1))
+        x = (hx0 + hx1) / 2 + side * (hx1 - hx0) * random.uniform(0.22, 0.44)
+        y = self.oy + hy0 + (hy1 - hy0) * random.uniform(0.05, 0.22)
+        slow = max(0.2, float(slow))
+        life = int(random.randint(34, 52) / slow)
+        # 그림 목록을 그대로 들고 있는다 — 종류가 늘어도 번호가 꼬이지 않는다.
+        self.notes.append([x, y, side * random.uniform(0.25, 0.7) * slow,
+                           random.uniform(1.1, 1.8) * slow,
+                           random.choice(lvs), life, life])
+
+    def _step_notes(self):
+        alive = []
+        for n in self.notes:
+            n[0] += n[2]
+            n[1] -= n[3]
+            n[2] *= 0.985
+            n[5] -= 1
+            if n[5] > 0 and n[1] > -20:
+                alive.append(n)
+        self.notes = alive
+
+    def _draw_notes(self):
+        """파티클을 그린다.
+
+        윈도우에서는 캐릭터 위에 얹은 레이어 창에 그려 부드럽게 옅어지게 하고,
+        안 되면 예전처럼 캔버스에 그린다(맥 등).
+        """
+        if not self._fx_soft:
+            for n in self.notes:
+                lv = n[4]
+                i = min(len(lv) - 1, int((1.0 - n[5] / max(n[6], 1)) * len(lv)))
+                self.canvas.create_image(n[0], n[1], image=lv[i], anchor="center")
+            return
+        if not self.notes:
+            if self._fx is not None:
+                self._fx.hide()
+            return
+        # 살아 있는 파티클을 감싸는 사각형만 만든다 — 창 전체를 만들면
+        # 프레임마다 수백 KB를 복사하게 된다
+        boxes = []
+        for n in self.notes:
+            lv = n[4]
+            i = min(len(lv) - 1, int((1.0 - n[5] / max(n[6], 1)) * len(lv)))
+            im = lv[i]
+            boxes.append((n[0] - im.width / 2.0, n[1] - im.height / 2.0, im))
+        x0 = int(math.floor(min(b[0] for b in boxes)))
+        y0 = int(math.floor(min(b[1] for b in boxes)))
+        x1 = int(math.ceil(max(b[0] + b[2].width for b in boxes)))
+        y1 = int(math.ceil(max(b[1] + b[2].height for b in boxes)))
+        sheet = Image.new("RGBA", (max(1, x1 - x0), max(1, y1 - y0)), (0, 0, 0, 0))
+        for bx, by, im in boxes:
+            sheet.alpha_composite(im, (int(round(bx)) - x0, int(round(by)) - y0))
+        fx = self._fx_get()
+        if fx is None:                       # 레이어 창을 못 만들었다 — 캔버스로
+            self._fx_soft = False
+            return
+        self._safe("fx_layer", fx.show, sheet,
+                   self.root.winfo_rootx() + x0, self.root.winfo_rooty() + y0)
+
+    def _fx_get(self):
+        """파티클 레이어 창 (처음 쓸 때 만든다)."""
+        if self._fx is not None:
+            return self._fx if self._fx.ok else None
+        try:
+            self._fx = FxLayer(self.root)
+        except Exception:
+            self._fx = None
+            self._log_error("fx_layer")
+            return None
+        return self._fx if self._fx.ok else None
+
+    def _greet_tick(self, now, state):
+        """작업이 시작돼 타이머 초가 흐르기 시작하면 손을 흔들어 인사한다.
+
+        잠깐 쉬었다 돌아올 때마다 하면 성가시므로 쿨다운을 둔다.
+        """
+        if state == self._last_state:
+            return
+        if state == "work" and now >= self.gest_wave_next:
+            self.gest_wave_next = now + 600
+            self._gest_start("wave")
+        self._last_state = state
+
+    # 알림을 끄고 나서 하는 말. config의 "stretch_done_talk"로 덮어쓴다.
+    STRETCH_DONE = ("시원하다!", "좀 낫네요.", "개운해요.")
+    HINT_SUFFIX = " (눌러 주세요)"     # config의 "stretch_hint_suffix"로 덮어쓴다
+    TAP_HINT_AT = 30.0           # 이만큼 안 누르면 누르라는 표시가 뜬다(초)
+    TAP_CARD_AT = 60.0           # 이만큼 안 누르면 카드 문구까지 바뀐다(초)
+
+    def _stretch_secs(self):
+        """스트레칭 알림 간격(초). 0이면 알리지 않는다.
+
+        환경설정에는 '30분마다'처럼 사람이 읽는 말로 저장돼 있어 숫자만 뽑는다.
+        """
+        raw = str(self.us.get("stretch_every", "") or "")
+        if raw.startswith("끄"):
+            return 0
+        num = "".join(ch for ch in raw if ch.isdigit())
+        if not num:
+            return self.STRETCH_EVERY
+        return max(5, min(180, int(num))) * 60
+
+    def _stretch_raise(self, now):
+        """스트레칭 알림을 띄운다. 누를 때까지 안 꺼진다."""
+        if self.stretch_pending:
+            return                          # 이미 떠 있으면 겹쳐 쌓지 않는다
+        self.stretch_pending = True
+        self.stretch_shown = 0.0
+        self.stretch_replay = 0.0
+        self._stretch_last = now
+        line = random.choice(list(self.cfg.get("stretch_talk")
+                                  or self.STRETCH_TALK))
+        # 처음 몇 번만 '눌러 주세요'를 붙인다. 매번 붙이면 잔소리가 된다.
+        left = int(self.us.get("stretch_hint", 3) or 0)
+        if left > 0:
+            self.us["stretch_hint"] = left - 1
+            self._save_settings()
+            line += self.cfg.get("stretch_hint_suffix") or self.HINT_SUFFIX
+        self._stretch_line = line
+        self._gest_start("startle")       # 알림이 뜰 때 한 번 움찔
+
+    def _stretch_done(self, now):
+        """캐릭터를 눌러 알림을 껐다."""
+        self.stretch_pending = False
+        self.stretch_shown = 0.0
+        self.gest = None
+        self.bubble = None
+        pool = self.cfg.get("stretch_done_talk") or self.STRETCH_DONE
+        self._say(random.choice(list(pool)), 3.0)
+        self.smile_until = now + 3.0
+        self._safe("burst", self._burst, 10, 26)
+
+    def _on_screen(self):
+        """캐릭터가 실제로 보이는가 — 전체화면 프로그램에 덮였는지 확인.
+
+        안 보이는 동안 알림 시간이 흐르면, 나중에 화면을 나왔을 때 한참 전
+        알림이 그대로 떠 있게 된다. 그래서 보이는 동안만 시간을 센다.
+        """
+        if not IS_WIN or self.us.get("topmost", True):
+            return True                     # 항상 위면 덮일 일이 없다
+        try:
+            u = ctypes.windll.user32
+            fg = u.GetForegroundWindow()
+            if not fg or fg == self._main_hwnd:
+                return True
+            r = (ctypes.c_long * 4)()        # left, top, right, bottom
+            u.GetWindowRect(fg, ctypes.byref(r))
+            x, y = self.root.winfo_rootx(), self.root.winfo_rooty()
+            return not (r[0] <= x and r[1] <= y
+                        and r[2] >= x + self.W and r[3] >= y + self.H)
+        except Exception:
+            return True
+
+    def _stretch_tick(self, now, sleeping):
+        """알림이 떠 있는 동안 말풍선을 붙잡고 기지개를 되풀이한다."""
+        self._stretch_hover = False
+        if not self.stretch_pending:
+            return
+        dt = min(max(now - self._stretch_last, 0.0), 1.0)
+        self._stretch_last = now
+        if sleeping or not self._on_screen():
+            return          # 자리를 비웠거나 가려져 있으면 시간도 연출도 멈춘다
+        self.stretch_shown += dt
+        # 사라지지 않게 계속 붙잡아 두되, 다른 말이 떠 있으면 기다린다.
+        # 안 그러면 할 일 완료 같은 반응이 바로 덮여 안 보인다.
+        if self.bubble is None or self.bubble[0] == self._stretch_line:
+            self._say(self._stretch_line, 3.0)
+        if self.gest is None and now >= self.stretch_replay:
+            # 쉬지 않고 이어 붙이면 부산스러워서 한 박자 쉬었다 다시 켠다
+            self.stretch_replay = now + self.GESTURES["stretch"] + 4.5
+            self._gest_start("stretch", force=True)
+        cx, cy = cursor_pos()
+        x, y = self.root.winfo_rootx(), self.root.winfo_rooty()
+        self._stretch_hover = (x <= cx <= x + self.W
+                               and y + self.oy <= cy <= y + self.H)
+
+    def _draw_tap_ring(self, now):
+        """여기를 누르라는 표시 — 물결처럼 원이 퍼진다.
+
+        색상키 창이라 서서히 옅어지게는 못 만든다. 대신 퍼질수록 선을 얇게
+        해서 사라지는 것처럼 보이게 한다.
+        """
+        if not (self.stretch_pending and self.stretch_shown >= self.TAP_HINT_AT):
+            return
+        c = self.canvas
+        col = self.card.get("text", "#7a6a9e")   # 흰 몸통 위에서도 보이게 진한 색
+        hx0, hy0, hx1, hy1 = self._head_box
+        cx = (hx0 + hx1) / 2
+        cy = self.oy + hy1 - (hy1 - hy0) * 0.06
+        speed = 1.7 if self._stretch_hover else 0.95   # 커서를 올리면 빨라진다
+        for k in range(2):
+            p = ((now * speed) + k * 0.5) % 1.0
+            r = 11 + 32 * p
+            w = max(1, round(4.0 * (1.0 - p)))
+            c.create_oval(cx - r, cy - r, cx + r, cy + r, outline=col, width=w)
+        c.create_oval(cx - 5, cy - 5, cx + 5, cy + 5, fill=col, outline="")
+
+    def _gest_schedule(self, now):
+        """스스로 나오는 몸짓 — 리듬 타기와 기지개."""
+        if self._yt.get("playing"):
+            # 음악이 나오는 동안에는 15분에 한 번 리듬을 탄다.
+            # (음표는 그와 별개로 계속 떠다닌다 — _yt_notes)
+            if now >= self.gest_groove_next:
+                self.gest_groove_next = now + self.YT_GROOVE_EVERY
+                self._gest_start("groove")
+        elif self.gest_groove_next == 0.0:    # 켜자마자 움직이면 놀란다
+            self.gest_groove_next = now + random.uniform(120, 300)
+        elif now >= self.gest_groove_next:
+            self.gest_groove_next = now + random.uniform(480, 900)
+            self._gest_start("groove")        # 1시간에 네댓 번
+        self._gest_extra(now)
+        if not self.timer_on:
+            return
+        every = self._stretch_secs()
+        if not every:                          # 환경설정에서 껐다
+            self.gest_stretch_next = 0.0
+            if self.stretch_pending:           # 떠 있던 알림도 조용히 거둔다
+                self.stretch_pending = False
+                self.gest = None
+                self.bubble = None
+            return
+        if self.gest_stretch_next == 0.0:
+            self.gest_stretch_next = now + every
+        elif self.gest_stretch_next > now + every:
+            self.gest_stretch_next = now + every   # 간격을 줄이면 바로 반영
+        elif now >= self.gest_stretch_next:
+            self.gest_stretch_next = now + every
+            self._stretch_raise(now)           # 정해 둔 간격마다
+
+    def _gest_extra(self, now):
+        """새 몸짓의 방아쇠 — 하품·꾸벅·생각. (움찔은 놀랄 일이 있을 때만)
+
+        타이머 상태(_last_state)를 보고 어울리는 때에만 낸다. 처음 켠 직후에
+        바로 나오면 놀라므로 첫 시각은 넉넉히 뒤로 잡는다.
+        """
+        if not self.cfg.get("gestures_plus"):
+            return
+        state = self._last_state
+        if self._yawn_next == 0.0:
+            self._yawn_next = now + random.uniform(600, 1200)
+            self._doze_next = now + random.uniform(420, 900)
+            self._think_next = now + random.uniform(300, 700)
+            self._sway_next = now + random.uniform(300, 700)
+            self._heart_next = now + random.uniform(240, 480)
+            return
+        if state == "work" and now >= self._heart_next:
+            # 작업 중에는 흐뭇하게 지켜본다는 뜻으로 하트를 종종 띄운다
+            self._heart_next = now + random.uniform(540, 660)
+            for _ in range(random.randint(1, 2)):
+                self._spawn_note(now, "heart")
+        if now >= self._yawn_next:
+            self._yawn_next = now + random.uniform(900, 1800)
+            hour = time.localtime(now).tm_hour
+            # 새벽이거나 오래 앉아 있었을 때만 — 아무 때나 하면 뜬금없다
+            if 0 <= hour < 6 or self._shown_secs() > 3 * 3600:
+                self._gest_start("yawn")
+                return
+        if state != "work" and now >= self._doze_next:
+            self._doze_next = now + random.uniform(420, 900)
+            self._gest_start("doze")
+            return
+        if state in ("idle", "other") and now >= self._think_next:
+            self._think_next = now + random.uniform(300, 700)
+            self._gest_start("think")
+            return
+        if now >= self._sway_next:
+            self._sway_next = now + random.uniform(420, 900)
+            self._gest_start("sway")
+
+    def _talk_gesture(self, text):
+        """대사에 어울리는 고개짓 — 부정하는 말이면 도리도리, 아니면 끄덕임."""
+        t = str(text)
+        if any(k in t for k in ("아니", "몰라", "싫", "안 ", "못 ", "말고",
+                                "글쎄", "없어", "없어요")):
+            return "shake"
+        if any(k in t for k in ("좋", "그래", "맞", "하자", "가자", "해야",
+                                "!", "네", "응")):
+            return "nod"
+        return random.choice(("nod", "shake"))
+
+    def _gest_pose(self, now):
+        """진행도(0~1)에 따라 이번 프레임의 자세를 계산한다.
+
+        손 이동량은 PSD 캔버스 픽셀로 적고 마지막에 표시 배율(s)을 곱한다.
+        그래야 캐릭터를 크게/작게 해도 같은 자세가 나온다.
+        """
+        p = min(1.0, max(0.0, (now - self.gest_t0) / max(self.gest_dur, 0.01)))
+        ease = math.sin(p * math.pi)          # 시작과 끝에서 0 — 튀지 않게
+        tm = self._tilt_max or 0.0
+        s = self.s
+        g = self.gest
+        if g in self.GEST_PLUS:
+            self._pose_plus(g, p, now, s, tm)
+            return
+        if g == "nod":                        # 끄덕끄덕 — 머리만 아래위로
+            self._g_hdy = abs(math.sin(p * math.pi * 4)) * 18 * s * ease
+            return
+        if g == "shake":                      # 도리도리 — 목을 축으로 좌우
+            self._g_tilt = math.sin(p * math.pi * 6) * tm * ease
+            return
+        if g == "groove":                     # 리듬 타기 — 머리 기울기 + 통통
+            # 손은 건드리지 않는다. 제스처 중의 손은 머리 위에 그려지는데,
+            # 제자리 근처에서 그러면 평소 머리에 가려 있던 부분이 갑자기
+            # 드러나 툭 튀어 보인다. 크게 움직이는 동작에서만 손을 쓴다.
+            beat = math.sin(p * math.pi * 4)
+            self._g_tilt = beat * tm * 0.85 * ease
+            self._g_dy = -abs(math.sin(p * math.pi * 8)) * 5 * ease
+            self._g_smile = True
+            if self._note_left > 0 and now >= self._note_next:
+                self._note_left -= 1
+                self._note_next = now + random.uniform(0.65, 1.0)
+                self._spawn_note(now)
+            return
+        if g == "wave":                       # 손 흔들기 — 손끝을 위아래로
+            # 오른팔 손끝만 까딱까딱. 펜 쥔 손은 손끝에 붙어 함께 따라온다.
+            osc = math.sin(p * math.pi * 6)
+            self._g_hands = {"r": (-25 * s * ease,
+                                   (-90 + 55 * osc) * s * ease),
+                             "sh_dy": self.WAVE_SHY}
+            self._g_tilt = -tm * 0.45 * ease
+            return
+        if g == "stretch":
+            # 기지개 — 두 팔을 위로 쭉 올려 길게 뻗은 채로 버티다가, 팔 끝이
+            # 바르르 떨리고, 천천히 내려온다. 올라가고 내려오는 구간만
+            # 부드럽게 하고 가운데는 그대로 붙잡아 둔다(그냥 사인 곡선으로
+            # 하면 최대 자세가 한순간이라 버티는 느낌이 안 난다).
+            if p < 0.26:
+                u = p / 0.26
+            elif p < 0.74:
+                u = 1.0
+            else:
+                u = max(0.0, (1.0 - p) / 0.26)
+            u = math.sin(min(1.0, u) * math.pi / 2)
+            tre = (math.sin((p - 0.30) / 0.42 * math.pi)
+                   if 0.30 < p < 0.72 else 0.0)
+            jx = math.sin(now * 52.0) * 11 * s * tre
+            jy = math.sin(now * 47.0 + 1.1) * 9 * s * tre
+            self._g_hands = {"r": (-110 * s * u + jx, -260 * s * u + jy),
+                             "l": (110 * s * u - jx, -260 * s * u + jy),
+                             "sh_dy": self.STRETCH_SHY}
+            self._g_dy = -7 * u
+            self._g_eyes_shut = u > 0.25      # 시원하게 눈을 감는다
+            return
+        if g == "clap":
+            # 박수 — 어깨(팔이 몸에 붙는 자리)를 축으로 고정하고 팔 위쪽만
+            # 호를 그린다. 팔 길이는 원래대로 두어야 손이 눌려 보이지 않는다.
+            # 두 손이 만나는 자리는 어깨 간격과 팔 길이로 정해지는 삼각형의
+            # 꼭짓점이라, 자연히 어깨보다 위가 된다.
+            op = abs(math.sin(p * math.pi * 7))   # 0 = 맞붙음, 1 = 벌어짐
+            sr = self._gest_shoulder(self.arm_top, self.CLAP_SHY)
+            sl = self._gest_shoulder(self.armk_top, self.CLAP_SHY)
+            cx, cy = (sr[0] + sl[0]) / 2.0, (sr[1] + sl[1]) / 2.0
+            ux, uy = sl[0] - sr[0], sl[1] - sr[1]
+            span = math.hypot(ux, uy) or 1.0
+            half = span / 2.0
+            L = max(math.hypot(*self._arm_nat) * self.CLAP_LEN, half * 1.08)
+            h = math.sqrt(max(L * L - half * half, 1.0))
+            nx, ny = -uy / span, ux / span       # 어깨선의 수직 방향
+            if ny > 0:
+                nx, ny = -nx, -ny                # 위쪽으로
+            meet = (cx + nx * h, cy + ny * h)
+            out = {}
+            for side, sh, rest in (("r", sr, self.arm_bottom),
+                                   ("l", sl, self.armk_bottom)):
+                # 벌어지는 방향 = 그 팔의 어깨가 있는 바깥쪽. 만나는 점이
+                # 두 어깨의 한가운데라 '중심에서 멀어지는 쪽'으로 고르면
+                # 양팔이 같은 방향으로 돌아 손이 벌어지지 않는다.
+                want = 1.0 if sh[0] > cx else -1.0
+                far = meet
+                for d in (self.CLAP_SWING, -self.CLAP_SWING):
+                    cand = _arc(sh, meet, d)
+                    if (cand[0] - meet[0]) * want > 0:
+                        far = cand
+                        break
+                # 올리고 내리는 과정은 보여주지 않는다. 시작하자마자 팔이
+                # 올라가 있고 끝나면 툭 하고 제자리로 — 그래서 ease를 안 쓴다.
+                tip = (meet[0] + (far[0] - meet[0]) * op,
+                       meet[1] + (far[1] - meet[1]) * op)
+                out[side] = (tip[0] - rest[0], tip[1] - rest[1])
+            out["sh_dy"] = self.CLAP_SHY
+            out["r_mirror"] = True               # 팔이 몸 안쪽을 향하게
+            out["hide_pen"] = True               # 박수 칠 땐 펜을 놓는다
+            self._g_hands = out
+            self._g_hdy = -4.0
+            return
+
+    @staticmethod
+    def _hold(p, rise, fall):
+        """0에서 1로 올랐다가 붙잡아 두고 다시 0으로 — 정점을 버티는 곡선."""
+        if p < rise:
+            u = p / max(rise, 1e-6)
+        elif p < fall:
+            u = 1.0
+        else:
+            u = max(0.0, (1.0 - p) / max(1.0 - fall, 1e-6))
+        return math.sin(min(1.0, u) * math.pi / 2)
+
+    def _pose_plus(self, g, p, now, s, tm):
+        """새로 넣은 넷 — 하품·꾸벅·생각·움찔."""
+        if g == "yawn":
+            # 하품 — 눈을 감고 고개를 살짝 든 채 한 손을 입가로 올린다.
+            u = self._hold(p, 0.30, 0.72)
+            self._g_eyes_shut = u > 0.2
+            self._g_tilt = -tm * 0.45 * u
+            self._g_hdy = -5 * s * u
+            self._g_dy = -3 * u
+            # 손이 크게 움직이는 동작이라 손을 써도 팔뿌리가 드러나지 않는다.
+            self._g_hands = {"r": (-34 * s * u, -150 * s * u),
+                             "sh_dy": 6.0, "hide_pen": True}
+            return
+        if g == "doze":
+            # 꾸벅 — 고개가 점점 빨리 떨어졌다가 화들짝 들리며 부르르 떤다.
+            if p < 0.72:
+                u = (p / 0.72) ** 1.7
+                self._g_eyes_shut = True
+            else:
+                k = (p - 0.72) / 0.28
+                u = max(0.0, 1.0 - k * 2.4)
+                self._g_tilt = math.sin(k * math.pi * 5) * tm * 0.5 * (1 - k)
+                if not self._doze_woke:
+                    self._doze_woke = True
+                    self._spawn_note(now, "bang")
+            self._g_hdy = 26 * s * u
+            self._g_dy = 4 * u
+            return
+        if g == "think":
+            # 턱 괴고 생각 — 한 손을 턱에 대고 고개를 기울인 채 멈춘다.
+            u = self._hold(p, 0.22, 0.78)
+            self._g_tilt = tm * 0.55 * u
+            self._g_hdy = 3 * s * u
+            self._g_hands = {"r": (-22 * s * u, -116 * s * u),
+                             "sh_dy": 8.0, "hide_pen": True}
+            if self._note_left > 0 and now >= self._note_next:
+                self._note_left -= 1
+                self._note_next = now + random.uniform(0.9, 1.4)
+                self._spawn_note(now, "question")
+            return
+        if g == "cheer":
+            # 만세 — 두 팔을 번쩍 들고 몸이 통통. 기지개와 달리 떨지 않는다.
+            u = self._hold(p, 0.18, 0.76)
+            self._g_dy = -10 * u - abs(math.sin(p * math.pi * 6)) * 5 * u
+            self._g_tilt = math.sin(p * math.pi * 2) * tm * 0.30 * u
+            self._g_smile = True
+            self._g_hands = {"r": (-124 * s * u, -300 * s * u),
+                             "l": (124 * s * u, -300 * s * u),
+                             "sh_dy": -14.0, "hide_pen": True}
+            if self._note_left > 0 and now >= self._note_next:
+                self._note_left -= 1
+                self._note_next = now + random.uniform(0.35, 0.6)
+                self._spawn_note(now, "spark")
+            return
+        if g == "sway":
+            # 좌우로 흔들기 — 리듬 타기보다 느리고 폭이 크다. 손은 쓰지 않는다
+            # (제자리 근처에서 손을 쓰면 평소 머리에 가려 있던 팔이 드러난다).
+            ease = math.sin(min(1.0, p * 3.0) * math.pi / 2) * \
+                math.sin(min(1.0, (1.0 - p) * 3.0) * math.pi / 2)
+            beat = math.sin(p * math.pi * 3)
+            self._g_tilt = beat * tm * ease
+            self._g_dy = -abs(beat) * 6 * ease
+            self._g_hdy = -abs(beat) * 3 * ease
+            return
+        if g == "startle":
+            # 움찔 — 짧게 튀어 올랐다가 떨림이 잦아든다.
+            k = math.exp(-p * 4.0)
+            self._g_dy = -15 * math.sin(min(1.0, p * 2.2) * math.pi) - 2 * k
+            self._g_tilt = math.sin(p * math.pi * 9) * tm * 0.7 * k
+            self._g_hdy = -6 * s * k
+
+    def _gest_shoulder(self, top, dy=16.0):
+        """제스처용 어깨 — 원래 접합점보다 몸 안쪽으로 묻어 둔 자리.
+
+        팔을 위로 들면 어깨 쪽 둥근 끝이 몸 윤곽 밖으로 돌아나가면서 그 사이로
+        머리카락과 배경이 비친다. 접합점을 몸 안에 넣어 두면 팔뿌리가 몸에
+        덮여 틈이 생기지 않는다. dy로 위아래 위치도 동작마다 달리 잡는다.
+        """
+        s = self.s
+        d = 1.0 if self.body_mid_x >= top[0] else -1.0
+        return (top[0] + 34 * s * d, top[1] + dy * s)
+
+    def _draw_gesture_arms(self, yo):
+        """제스처 중의 두 팔. 어깨는 그대로 두고 손끝만 원하는 자리로 보낸다.
+
+        '오른손'(펜 쥔 파츠)은 오른팔 손끝에 붙어 함께 움직인다 — 따로 돌리면
+        팔에서 떨어져 보인다. 왼팔은 옮길 때만 늘여 그리고, 아니면 평소 자리에
+        그대로 둔다(늘인 팔을 겹쳐 그리면 팔이 두 개로 보인다).
+        """
+        c = self.canvas
+        g = self._g_hands or {}
+        d4 = yo * 0.25
+        ddx, ddy = g.get("r", (0.0, 0.0))
+        sx, sy = self._gest_shoulder(self.arm_top, g.get("sh_dy", 16.0))
+        hx, hy = self.arm_bottom[0] + ddx, self.arm_bottom[1] + ddy
+        arm = self._stretched_arm(hx - sx, hy - sy,
+                                  "rm" if g.get("r_mirror") else "r")
+        if arm is not None:
+            c.create_image(sx - arm[1][0], sy - arm[1][1] + d4,
+                           image=arm[0], anchor="nw")
+        if not g.get("hide_pen"):
+            deg = self._arm_deg(hx - sx, hy - sy,
+                                "rm" if g.get("r_mirror") else "r")
+            if not self._pen_at_tip(hx, hy + d4, deg):
+                px, py = self._pos("arm_pen")
+                self._put("arm_pen", px + ddx, py + ddy + d4)
+
+        hk = self.hop.get("arm_key")
+        if "l" in g and "l" in self._arm_src:
+            lx, ly = g["l"]
+            sx2, sy2 = self._gest_shoulder(self.armk_top, g.get("sh_dy", 16.0))
+            hx2, hy2 = self.armk_bottom[0] + lx, self.armk_bottom[1] + ly
+            arm2 = self._stretched_arm(hx2 - sx2, hy2 - sy2, "l")
+            if arm2 is not None:
+                c.create_image(sx2 - arm2[1][0], sy2 - arm2[1][1] + d4,
+                               image=arm2[0], anchor="nw")
+        elif hk is not None:
+            kx, ky = self._pos("arm_key")
+            c.create_image(kx + self.arm_key_off[0] + hk["off"][0],
+                           ky + self.arm_key_off[1] + hk["off"][1] + d4,
+                           image=self._rotated_hop("arm_key", 0.0), anchor="nw")
+
+    def _burst(self, n=24, spread=45):
+        """카드 위로 색종이가 팡 터진다 (할 일 완료·기록 갱신 등 작은 축하용)."""
+        cols = ["#ff9ec4", "#ffd479", "#9ad7ff", "#b8e986", "#c9a7ff", "#ffa9a9"]
+        for _ in range(n):
+            ang = random.uniform(-2.7, -0.45)
+            spd = random.uniform(3.0, 7.0)
+            self.particles.append([self.card_cx + random.uniform(-spread, spread),
+                                   self.oy + 46,
+                                   math.cos(ang) * spd, math.sin(ang) * spd,
+                                   random.choice(cols), random.randint(35, 70)])
+
+    def _celebrate(self):
+        """작업 종료 — 고깔모자 + 폭죽 + 축하 말풍선, 잠시 뒤 브리핑."""
+        now = time.time()
+        self.celebrate_until = now + 4.0
+        self.hat_until = now + 14.0
+        self.smile_until = now + 5.0            # 말풍선이 떠 있는 동안 웃는 얼굴
+        self._gest_start("clap", force=True)
+        self.stretch_pending = False      # 일을 끝냈으니 알림도 내린다
+        # 브리핑에 쓸 값은 기록에 넣기 '전에' 찍어 둔다. _hist_add가 이번
+        # 세션 몫을 0으로 되돌리고, reset_on_end면 시간도 0이 되기 때문이다.
+        try:
+            self._brief = self._brief_data()
+        except Exception:
+            self._brief = None
+            self._log_error("brief_data")
+        self._safe("history", self._hist_add)
+        if self.cfg.get("reset_on_end"):  # 시간을 0으로 되돌린다
+            self.zero_at = self.work_secs
+            self._timer_save()
+        self._reset_records()                   # 작업 종료 = 이번 '오늘'의 끝
+        self._say("수고하셨습니다!", 5.0)
+        cols = ["#ff9ec4", "#ffd479", "#9ad7ff", "#b8e986", "#c9a7ff", "#ffa9a9"]
+        for _ in range(48):
+            ang = random.uniform(-2.7, -0.45)
+            spd = random.uniform(3.5, 8.5)
+            self.particles.append([self.card_cx + random.uniform(-70, 70),
+                                   self.oy + 46,
+                                   math.cos(ang) * spd, math.sin(ang) * spd,
+                                   random.choice(cols), random.randint(45, 85)])
+        self.root.after(1500, self._open_briefing)
+
+    # 누적 그린 거리 마일스톤 (m, 이름) — 기존 타이머와 같은 목록
+    MILESTONES = ((1, "고양이 한 마리"), (5, "중형 자동차"), (15, "시내버스"),
+                  (50, "10층 아파트"), (93, "자유의 여신상"), (250, "63빌딩"),
+                  (330, "에펠탑"), (828, "부르즈 할리파"), (1950, "한라산"),
+                  (2744, "백두산"), (8849, "에베레스트"),
+                  (42195, "마라톤 풀코스"), (325000, "서울에서 부산"))
+
+    @staticmethod
+    def _mix(a, b, k):
+        """두 색을 k만큼 섞는다 (0이면 a, 1이면 b)."""
+        try:
+            ca = [int(a[i:i + 2], 16) for i in (1, 3, 5)]
+            cb = [int(b[i:i + 2], 16) for i in (1, 3, 5)]
+            return "#%02x%02x%02x" % tuple(
+                max(0, min(255, int(ca[i] + (cb[i] - ca[i]) * k))) for i in range(3))
+        except Exception:
+            return a
+
+    def _tint(self, c, k):
+        return self._mix(c, "#ffffff", k)
+
+    def _shade(self, c, k):
+        return self._mix(c, "#000000", k)
+
+    @staticmethod
+    def _runs_of(mins):
+        """이어진 분 목록 → [시작, 끝] 구간들."""
+        out = []
+        for m in sorted(mins):
+            if out and m == out[-1][1] + 1:
+                out[-1][1] = m
+            else:
+                out.append([m, m])
+        return out
+
+    def _milestone(self, cum):
+        """누적 거리 → (지나온 것, 다음 것, 다음까지 m, 진행률)."""
+        prev = None
+        for m, name in self.MILESTONES:
+            if cum < m:
+                return prev, name, m, (cum / m if m else 0.0)
+            prev = name
+        return self.MILESTONES[-1][1], None, self.MILESTONES[-1][0], 1.0
+
+    def _brief_data(self):
+        """브리핑에 그릴 값 한 벌. 기록에 넣기 전에 찍어 둔다."""
+        s = self.stat
+        total = int(self._today_secs())     # 카드의 누적이 아니라 '오늘'
+        goal = max(float(self.us.get("goal_hours", 6)), 0.5) * 3600
+        days = self._hist_load() if self.cfg.get("history") else {}
+        today = self._session_day()
+
+        def shift(key, n):
+            t = time.mktime(time.strptime(key, "%Y-%m-%d")) + n * 86400
+            return time.strftime("%Y-%m-%d", time.localtime(t))
+
+        def work_of(key, extra=0):
+            return int(days.get(key, {}).get("work", 0)) + extra
+
+        last7 = []
+        for i in range(6, -1, -1):
+            k = shift(today, -i)
+            last7.append((k, work_of(k, total if i == 0 else 0)))
+        streak, i = 0, 0
+        while work_of(shift(today, -i), total if i == 0 else 0) >= 600:
+            streak += 1
+            i += 1
+        dist = self._dist_m()
+        return {
+            "day": today, "total": total, "goal": goal,
+            "pct": min(int(total / goal * 100), 999) if goal else 0,
+            "other": int(s.get("other", 0)), "idle": int(s.get("idle", 0)),
+            "best": int(s.get("best", 0)), "runs": int(s.get("runs", 0)),
+            "first": float(s.get("first", 0) or 0),
+            "last": float(s.get("last", 0) or 0),
+            "keys": int(s.get("keys", 0)), "strokes": int(s.get("strokes", 0)),
+            "clicks": int(s.get("clicks", 0)), "undo": int(s.get("undo", 0)),
+            "dist": dist, "cum": self._cum_m() + dist,
+            "mins": sorted(self._act), "last7": last7,
+            "yday": work_of(shift(today, -1)),
+            "week": sum(v for _, v in last7), "streak": streak,
+            "traced": self._kb is not None,   # 클릭·거리를 잴 수 있는 환경인가
+        }
+
+    def _open_briefing(self):
+        """오늘의 작업 브리핑 — 시계·구성·흔적·마일스톤·최근 7일."""
+        if getattr(self, "_brief_win", None) is not None \
+                and self._brief_win.winfo_exists():
+            self._brief_win.lift()
+            return
+        d = getattr(self, "_brief", None) or self._brief_data()
+        self._brief = None
+        cd = self.card
+
+        # ── 색: 큰 면은 옅게, 글자·테두리는 진하게 ──────────────────────
+        base = cd.get("fill", CARD_FILL)
+        W_INK = self._shade(base, 0.30)       # 작업 (캐릭터 색)
+        W_FIL = self._tint(base, 0.45)
+        # 시계는 링을 하나만 쓴다. 오전·오후는 자리가 아니라 색으로 가른다 —
+        # 오전은 테마색의 파스텔, 오후는 그보다 진한 색.
+        AM_INK = self._tint(W_INK, 0.72)   # 오전 — 옅은 칠
+        PM_INK = self._tint(W_INK, 0.38)   # 오후 — 진한 칠
+        A_INK, A_FIL = "#c57f1e", "#ffddb0"   # 딴짓
+        R_INK, R_FIL = "#2a9d8a", "#beede0"   # 휴식
+        LINE, SUB, TXT = cd["line"], cd["sub"], cd["text"]
+
+        def hm(sec):
+            sec = int(sec)
+            if sec >= 3600:
+                return "%d시간 %d분" % (sec // 3600, sec % 3600 // 60)
+            return "%d분" % (sec // 60)
+
+        def clock_t(ts):
+            return time.strftime("%H:%M", time.localtime(ts)) if ts else "-"
+
+        def dist_s(m):
+            return "%.2fkm" % (m / 1000.0) if m >= 1000 else "%dm" % round(m)
+
+        show_dist = d["traced"] and (d["cum"] > 0 or d["dist"] > 0)
+
+        # ── 창 크기: 화면에 안 들어가면 통째로 줄인다 ──────────────────
+        H0 = 758 if show_dist else 674
+        sh = self._screen_h()
+        k = min(1.0, (sh * 0.92) / max(self._ui(H0), 1))
+
+        def u(px):
+            return int(round(self._ui(px) * k))
+
+        def f(size, bold=False):
+            return self._uf(max(6, int(round(size * k))), bold)
+
+        W, PAD = u(400), u(18)
+        H = u(H0)
+        win = tk.Toplevel(self.root)
+        self._keep_front(win, focus=False)
+        self._brief_win = win
+        win.title("오늘의 작업")
+        win.attributes("-topmost", True)
+        win.resizable(False, False)
+        win.configure(bg=cd["panel"])
+        cv = tk.Canvas(win, width=W, height=H, bg=cd["panel"],
+                       highlightthickness=0)
+        cv.pack()
+
+        def rr(x0, y0, x1, y1, r, **kw):
+            pts = [x0 + r, y0, x1 - r, y0, x1, y0, x1, y0 + r, x1, y1 - r, x1, y1,
+                   x1 - r, y1, x0 + r, y1, x0, y1, x0, y1 - r, x0, y0 + r, x0, y0]
+            return cv.create_polygon(pts, smooth=True, **kw)
+
+        def card(y0, h):
+            rr(PAD, y0, W - PAD, y0 + h, u(16), fill=cd["bg"],
+               outline=LINE, width=1)
+            return y0 + h
+
+        def pill(x0, y0, txt, fg, bg, pad=None):
+            pad = u(9) if pad is None else pad
+            tw = self._mw(txt, f(8, True))
+            x1 = x0 + tw + pad * 2
+            rr(x0, y0, x1, y0 + u(21), u(10), fill=bg, outline="")
+            cv.create_text((x0 + x1) / 2, y0 + u(11), text=txt,
+                           font=f(8, True), fill=fg)
+            return x1
+
+        y = u(16)
+
+        # ── 머리글 ─────────────────────────────────────────────────────
+        ex, ey = PAD + u(3), y + u(6)
+        cv.create_polygon(ex, ey + u(15), ex + u(5), ey, ex + u(13), ey + u(13),
+                          fill=W_FIL, outline=W_INK, width=max(1, u(2)))
+        cv.create_polygon(ex + u(28), ey + u(15), ex + u(23), ey,
+                          ex + u(15), ey + u(13),
+                          fill=W_FIL, outline=W_INK, width=max(1, u(2)))
+        rr(ex - u(1), ey + u(10), ex + u(29), ey + u(23), u(6),
+           fill=cd["bg"], outline=W_INK, width=max(1, u(2)))
+        for dx in (u(8), u(20)):
+            cv.create_oval(ex + dx - u(2), ey + u(15), ex + dx + u(2), ey + u(19),
+                           fill=W_INK, outline="")
+        tx = PAD + u(40)
+        cv.create_text(tx, y + u(9), anchor="w", text="오늘도 수고했어요",
+                       font=f(12, True), fill=TXT)
+        cv.create_text(tx, y + u(28), anchor="w",
+                       text="%s · %s 작업일" % (self.cfg.get("name", self.char), d["day"]),
+                       font=f(8), fill=SUB)
+        # 오른쪽 알약(목표·연속)은 아래에서 오른쪽 끝을 알고 나서 그린다
+        head_y = y + u(6)
+        y += u(48)
+
+        # ── 시계 카드 ──────────────────────────────────────────────────
+        card(y, u(178))
+        # 워크스페이스의 '작업 흔적' 시계와 같은 모양에서 바깥 링만 뺐다.
+        # 평범한 시계 얼굴(눈금 + 12·3·6·9) 위에, 작업한 시간대를 안쪽에
+        # 부채꼴로 칠한다. 오전은 옅게, 오후는 진하게 — 색으로만 가른다.
+        R = u(62)
+        ccx, ccy = PAD + u(16) + R, y + u(89)
+        cv.create_oval(ccx - R, ccy - R, ccx + R, ccy + R,
+                       fill=cd["bg"], outline=LINE, width=max(1, u(2)))
+        r_face = R - u(5)
+
+        def draw_runs(mins, wash):
+            for a, b in self._runs_of(mins):
+                d1 = (a % 720) / 720.0 * 360.0
+                d2 = ((b + 1) % 720 or 720) / 720.0 * 360.0
+                ext = -(d2 - d1)
+                if abs(ext) < 1.2:            # 아주 짧아도 조각으로는 보이게
+                    ext = -1.2
+                cv.create_arc(ccx - r_face, ccy - r_face, ccx + r_face,
+                              ccy + r_face, start=90 - d1, extent=ext,
+                              style="pieslice", fill=wash, outline="")
+
+        # 오전을 먼저, 오후를 그 위에 — 같은 시각을 둘 다 일했으면 진한 쪽이 남는다
+        draw_runs([m for m in d["mins"] if m < 720], AM_INK)
+        draw_runs([m for m in d["mins"] if m >= 720], PM_INK)
+
+        for i in range(60):                    # 눈금 — 15분마다 굵게
+            major, mid = i % 15 == 0, i % 5 == 0
+            r0 = R - (u(14) if major else u(11) if mid else u(8))
+            a = math.radians(90 - i * 6)
+            cv.create_line(ccx + math.cos(a) * r0, ccy - math.sin(a) * r0,
+                           ccx + math.cos(a) * (R - u(5)),
+                           ccy - math.sin(a) * (R - u(5)),
+                           fill=TXT if major else SUB,
+                           width=max(1, u(2)) if major else 1,
+                           capstyle="round")
+        for lab, ang in (("12", 90), ("3", 0), ("6", 270), ("9", 180)):
+            a = math.radians(ang)
+            cv.create_text(ccx + math.cos(a) * (R - u(25)),
+                           ccy - math.sin(a) * (R - u(25)),
+                           text=lab, font=f(10, True), fill=TXT)
+        ts = d["last"] or time.time()          # 바늘은 일을 끝낸 시각에
+        lt = time.localtime(ts)
+        for frac, ln, col, wd in (((lt.tm_hour % 12 + lt.tm_min / 60) / 12,
+                                   0.42, TXT, u(5)),
+                                  (lt.tm_min / 60.0, 0.62, PM_INK, u(3))):
+            a = math.radians(90 - frac * 360)
+            cv.create_line(ccx, ccy, ccx + math.cos(a) * R * ln,
+                           ccy - math.sin(a) * R * ln,
+                           fill=col, width=max(2, wd), capstyle="round")
+        cv.create_oval(ccx - u(4), ccy - u(4), ccx + u(4), ccy + u(4),
+                       fill=TXT, outline="")
+        cv.create_oval(ccx - u(1), ccy - u(1), ccx + u(1), ccy + u(1),
+                       fill=cd["bg"], outline="")
+        lx = ccx - u(30)
+        cv.create_oval(lx, y + u(160), lx + u(7), y + u(167), fill=AM_INK, outline="")
+        cv.create_text(lx + u(11), y + u(163), anchor="w", text="오전",
+                       font=f(7), fill=SUB)
+        cv.create_oval(lx + u(36), y + u(160), lx + u(43), y + u(167),
+                       fill=PM_INK, outline="")
+        cv.create_text(lx + u(47), y + u(163), anchor="w", text="오후",
+                       font=f(7), fill=SUB)
+
+        rx = PAD + u(150)
+        cv.create_text(rx, y + u(22), anchor="w", text="작업 시간",
+                       font=f(8), fill=SUB)
+        cv.create_text(rx, y + u(48), anchor="w", text=hm(d["total"]),
+                       font=f(20, True), fill=W_INK)
+        rows = [("시작 · 마지막", "%s – %s" % (clock_t(d["first"]), clock_t(d["last"])), TXT),
+                ("최장 집중", hm(d["best"]), W_INK),
+                ("집중 구간", "%d회" % d["runs"], TXT)]
+        if d["yday"]:
+            gap = d["total"] - d["yday"]
+            rows.append(("어제보다", "%s%s" % ("+" if gap >= 0 else "-", hm(abs(gap))),
+                         R_INK if gap >= 0 else SUB))
+        ry = y + u(84)
+        for lab, val, col in rows:
+            cv.create_text(rx, ry, anchor="w", text=lab, font=f(8), fill=SUB)
+            cv.create_text(W - PAD - u(14), ry, anchor="e", text=val,
+                           font=f(9, True), fill=col)
+            ry += u(23)
+        # 머리글 오른쪽 알약 — 오른쪽 끝에서부터 왼쪽으로 붙인다
+        px = W - PAD
+        chips = [("목표 %d%%" % d["pct"], R_INK, R_FIL)]
+        if d["streak"] >= 2:
+            chips.append(("%d일 연속" % d["streak"], W_INK, W_FIL))
+        for txt, fg, bg in chips:
+            tw = self._mw(txt, f(8, True)) + u(18)
+            pill(px - tw, head_y, txt, fg, bg)
+            px -= tw + u(6)
+        y += u(178) + u(10)
+
+        # ── 하루의 구성 ────────────────────────────────────────────────
+        card(y, u(92))
+        cv.create_text(PAD + u(14), y + u(18), anchor="w", text="하루의 구성",
+                       font=f(8, True), fill=SUB)
+        segs = [("작업", d["total"], W_FIL, W_INK), ("딴짓", d["other"], A_FIL, A_INK),
+                ("휴식", d["idle"], R_FIL, R_INK)]
+        tot = max(sum(v for _, v, _, _ in segs), 1)
+        bx0, bx1 = PAD + u(14), W - PAD - u(14)
+        bw, by0 = bx1 - bx0, y + u(32)
+        cx = bx0
+        for name, v, fil, ink in segs:
+            wdt = bw * v / tot
+            if wdt < 1:
+                continue
+            rr(cx, by0, cx + max(wdt - u(3), u(4)), by0 + u(30), u(7),
+               fill=fil, outline=ink, width=max(1, u(2)))
+            if wdt > u(34):
+                cv.create_text(cx + wdt / 2 - u(2), by0 + u(15),
+                               text="%d%%" % round(v * 100.0 / tot),
+                               font=f(8, True), fill=ink)
+            cx += wdt
+        lgx = bx0
+        for name, v, fil, ink in segs:
+            cv.create_oval(lgx, y + u(72), lgx + u(7), y + u(79), fill=ink, outline="")
+            txt = "%s %s" % (name, hm(v))
+            cv.create_text(lgx + u(11), y + u(75), anchor="w", text=txt,
+                           font=f(8), fill=TXT)
+            lgx += self._mw(txt, f(8)) + u(26)
+        y += u(92) + u(10)
+
+        # ── 오늘의 흔적 (타일 4개) ─────────────────────────────────────
+        if d["traced"]:
+            tiles = [("그린 선", "%s획" % format(d["strokes"], ","), W_INK),
+                     ("클릭", format(d["clicks"], ","), TXT),
+                     ("되돌리기", format(d["undo"], ","), TXT),
+                     ("그린 거리", dist_s(d["dist"]), TXT)]
+        else:
+            tiles = [("그린 선", "%s획" % format(d["strokes"], ","), W_INK),
+                     ("키 입력", format(d["keys"], ","), TXT),
+                     ("집중 구간", "%d회" % d["runs"], TXT),
+                     ("목표", "%d%%" % d["pct"], TXT)]
+        tw = (W - PAD * 2 - u(9) * 3) / 4.0
+        for i, (lab, val, col) in enumerate(tiles):
+            tx0 = PAD + i * (tw + u(9))
+            rr(tx0, y, tx0 + tw, y + u(64), u(12), fill=cd["soft"], outline="")
+            cv.create_text(tx0 + u(11), y + u(18), anchor="w", text=lab,
+                           font=f(7), fill=SUB)
+            cv.create_text(tx0 + u(11), y + u(43), anchor="w", text=val, fill=col,
+                           font=self._fit(val, int(14 * k), tw - u(20), True))
+        y += u(64) + u(10)
+
+        # ── 누적 그린 거리 마일스톤 ────────────────────────────────────
+        if show_dist:
+            card(y, u(74))
+            prev, nxt, nxt_m, prog = self._milestone(d["cum"])
+            cv.create_text(PAD + u(14), y + u(18), anchor="w",
+                           text="누적 그린 거리", font=f(8, True), fill=SUB)
+            right = dist_s(d["cum"])
+            if nxt:
+                right += "  /  %s %s" % (nxt, dist_s(nxt_m))
+            cv.create_text(W - PAD - u(14), y + u(18), anchor="e", text=right,
+                           font=f(8, True), fill=TXT)
+            tx0, tx1, ty = PAD + u(14), W - PAD - u(14), y + u(38)
+            rr(tx0, ty, tx1, ty + u(10), u(5), fill=cd["track"], outline="")
+            fw = (tx1 - tx0) * max(0.0, min(prog, 1.0))
+            if fw > u(6):
+                rr(tx0, ty, tx0 + fw, ty + u(10), u(5), fill=W_FIL, outline=W_INK,
+                   width=max(1, u(1)))
+            cv.create_text(tx0, y + u(60), anchor="w",
+                           text=("%s 통과" % prev) if prev else "첫 목표를 향해",
+                           font=f(7), fill=SUB)
+            if nxt:
+                cv.create_text(tx1, y + u(60), anchor="e",
+                               text="%s까지 %s" % (nxt, dist_s(max(nxt_m - d["cum"], 0))),
+                               font=f(7), fill=SUB)
+            y += u(74) + u(10)
+
+        # ── 최근 7일 ───────────────────────────────────────────────────
+        card(y, u(132))
+        cv.create_text(PAD + u(14), y + u(18), anchor="w", text="최근 7일",
+                       font=f(8, True), fill=SUB)
+        cv.create_text(W - PAD - u(14), y + u(18), anchor="e",
+                       text="합계 %s" % hm(d["week"]), font=f(8, True), fill=SUB)
+        gx0, gx1 = PAD + u(16), W - PAD - u(16)
+        base_y, plot = y + u(112), u(62)
+        top_v = max(max(v for _, v in d["last7"]), int(d["goal"]), 1) * 1.12
+        slot = (gx1 - gx0) / 7.0
+        gy = base_y - plot * (d["goal"] / top_v)
+        cv.create_line(gx0, gy, gx1, gy, fill=LINE, width=1, dash=(3, 3))
+        cv.create_text(gx0, gy - u(8), anchor="w", text="목표 %s" % hm(d["goal"]),
+                       font=f(6), fill=SUB)
+        for i, (key, v) in enumerate(d["last7"]):
+            cxx = gx0 + slot * i + slot / 2
+            today = i == 6
+            bw2 = min(slot - u(8), u(34))
+            if v <= 0:
+                cv.create_line(cxx - bw2 / 2, base_y, cxx + bw2 / 2, base_y,
+                               fill=LINE, width=max(2, u(3)), capstyle="round")
+            else:
+                bh = max(u(4), plot * v / top_v)
+                rr(cxx - bw2 / 2, base_y - bh, cxx + bw2 / 2, base_y, u(6),
+                   fill=W_FIL if today else cd["soft"],
+                   outline=W_INK if today else LINE, width=max(1, u(2)) if today else 1)
+                cv.create_text(cxx, base_y - bh - u(9),
+                               text="%.1fh" % (v / 3600.0), font=f(6, today),
+                               fill=W_INK if today else SUB)
+            lab = "오늘" if today else "월화수목금토일"[time.strptime(key, "%Y-%m-%d").tm_wday]
+            cv.create_text(cxx, base_y + u(11), text=lab, font=f(7, today),
+                           fill=W_INK if today else SUB)
+        y += u(132) + u(10)
+
+        # ── 페이스 한 줄 ───────────────────────────────────────────────
+        if d["total"] > 60 and d["strokes"]:
+            per = d["strokes"] / (d["total"] / 60.0)
+            cv.create_text(PAD + u(4), y + u(8), anchor="w",
+                           text="분당 %d획 · 집중 구간 %d번으로 나눠 그렸어요"
+                                % (round(per), max(d["runs"], 1)),
+                           font=f(8), fill=SUB)
+        y += u(24)
+
+        # ── 버튼 ───────────────────────────────────────────────────────
+        def reset_and_close():
+            self.work_secs = 0.0
+            self.zero_at = 0.0
+            self.day_base = 0.0
+            for kk in ("work", "other", "idle", "best", "_run", "first", "last",
+                       "px"):
+                self.stat[kk] = 0.0
+            for kk in ("keys", "strokes", "clicks", "undo", "runs"):
+                self.stat[kk] = 0
+            self._act.clear()
+            self._reset_records()
+            self._timer_save()
+            win.destroy()
+
+        gap = u(12)
+        bwid = (W - PAD * 2 - gap) / 2
+        b1 = (PAD, y, PAD + bwid, y + u(42))
+        b2 = (PAD + bwid + gap, y, W - PAD, y + u(42))
+        rr(*b1, u(20), fill=cd["soft"], outline="")
+        cv.create_text((b1[0] + b1[2]) / 2, y + u(21), text="새로 시작",
+                       font=f(10, True), fill=SUB)
+        rr(*b2, u(20), fill=W_INK, outline="")
+        cv.create_text((b2[0] + b2[2]) / 2, y + u(21), text="닫기",
+                       font=f(10, True), fill="#ffffff")
+
+        def on_click(e):
+            if b1[0] <= e.x <= b1[2] and b1[1] <= e.y <= b1[3]:
+                reset_and_close()
+            elif b2[0] <= e.x <= b2[2] and b2[1] <= e.y <= b2[3]:
+                win.destroy()
+
+        cv.bind("<Button-1>", on_click)
+        win.bind("<Escape>", lambda _e: win.destroy())
+        self._place_near(win, u(60), u(120))
+
+    # ── 안 본 업데이트 표시 (빨간 점) ────────────────────────────────
+    # 켜짐/꺼짐을 저장하지 않는다. '어디까지 읽었나' 숫자 하나만 두고 점은
+    # 볼 때마다 계산한다 — 저장된 상태가 없으니 켜진 채로 굳을 수가 없다.
+    # '바뀌었을 때만 받아오기' — 지난번에 받은 ETag를 같이 보내면, 바뀐 게
+    # 없을 때 서버가 304(바뀐 것 없음)만 돌려주고 본문은 안 보낸다.
+    # 실측: 보통 요청 24,509바이트 / 안 바뀌었을 때 0바이트.
+    # 그래서 자주 물어봐도 부담이 없다. raw 쪽 캐시가 5분이라 그보다 짧게
+    # 잡으면 어차피 같은 답이 온다 — 그 값에 맞춰 5분으로 둔다.
+    UPDATE_POLL = 5 * 60         # 켜 둔 채로 새 소식을 확인하는 간격
+    UPDATE_FIRST = 90            # 켠 뒤 첫 확인까지 (시작을 방해하지 않게)
+    LOCAL_POLL = 60              # 제 폴더의 안내 파일을 다시 보는 간격
+
+    def _update_poll(self, now):
+        """켜 둔 채로도 새 소식을 알아챈다.
+
+        지금까지는 켜는 순간에만 확인했다. 며칠씩 켜 두는 사람은 그동안
+        아무것도 못 받는다. 받는 것은 런처가 다음에 켤 때 하므로, 여기서는
+        '알림'만 한다.
+
+        선물본은 배포 레포의 version.json을 본다(네트워크). 소스로 도는
+        캐릭터는 원격이 없으므로 제 폴더의 .version.json을 본다 — 그쪽이
+        곧 '바뀐 점'을 넘기는 통로다(지뢰 29). 파일 하나라 자주 봐도 된다.
+        """
+        if not self.cfg.get("update_dot"):
+            return
+        while self._upd_q:                   # 스레드가 넣은 것을 앞에서 꺼낸다
+            self._safe("update_news", self._update_news, self._upd_q.pop(0))
+        repo = UPDATE_REPOS.get(self.char)
+        if repo is None:
+            if now - self._upd_start < self.LOCAL_POLL:
+                return
+            self._upd_at = self._upd_start = now
+            try:
+                with open(os.path.join(self.dir, ".version.json"),
+                          encoding="utf-8") as fp:
+                    got = json.load(fp)
+                if isinstance(got, dict):
+                    self._upd_q.append(got)
+            except Exception:
+                pass
+            # 지난 안내 목록은 이쪽도 배포 레포에서 받아 둔다
+            threading.Thread(target=self._news_fetch, daemon=True).start()
+            return
+        wait = self.UPDATE_FIRST if self._upd_at == 0 else self.UPDATE_POLL
+        if now - self._upd_start < wait or self._upd_busy:
+            return
+        self._upd_at = self._upd_start = now
+        self._upd_busy = True
+        threading.Thread(target=self._update_check, daemon=True).start()
+        threading.Thread(target=self._news_fetch, daemon=True).start()
+
+    NEWS_FILE = ".update_news.json"   # 배포 쪽에서 받아 둔 지난 안내
+
+    def _news_load(self):
+        """받아 둔 지난 안내 (인터넷이 없어도 이걸로 보여 준다)."""
+        try:
+            with open(os.path.join(self.state_dir, self.NEWS_FILE),
+                      encoding="utf-8") as fp:
+                got = json.load(fp)
+            return [g for g in got if isinstance(g, dict) and g.get("notes")]
+        except Exception:
+            return []
+
+    def _news_fetch(self):
+        """배포 레포의 지난 안내 목록을 받아 둔다 (백그라운드).
+
+        친구 쪽 기록은 '그 컴퓨터가 켜져 있을 때 온 것'만 남는다. 늦게
+        설치했거나 조용한 배포만 받은 사람은 '업데이트 소식'이 텅 비어
+        있었다(개 제보). 배포 쪽 목록을 받아 두면 언제 설치했든 다 보인다.
+        """
+        import urllib.error
+        import urllib.request
+        repo = NEWS_REPOS.get(self.char)
+        if not repo:
+            return
+        try:
+            head = {"User-Agent": "mascot-news"}
+            if self._news_etag:
+                head["If-None-Match"] = self._news_etag
+            url = "https://raw.githubusercontent.com/%s/main/news.json" % repo
+            try:
+                with urllib.request.urlopen(
+                        urllib.request.Request(url, headers=head),
+                        timeout=12, context=_ssl_ctx()) as r:
+                    body = r.read()
+                    self._news_etag = r.headers.get("ETag") or self._news_etag
+            except urllib.error.HTTPError as e:
+                return                     # 304(그대로) · 404(아직 없음)
+            got = json.loads(body.decode("utf-8"))
+            if not isinstance(got, list):
+                return
+            keep = [g for g in got if isinstance(g, dict) and g.get("notes")]
+            _save_json(os.path.join(self.state_dir, self.NEWS_FILE), keep[-60:])
+        except Exception:
+            pass
+
+    def _update_check(self):
+        """배포 레포의 version.json을 물어본다 (백그라운드). 실패는 넘긴다.
+
+        지난번에 받은 표(ETag)를 같이 보낸다. 바뀐 게 없으면 서버가
+        '바뀐 것 없음(304)'만 돌려주고 본문은 아예 안 보내므로, 자주
+        물어봐도 실제로 내려받는 것은 새 배포가 있을 때뿐이다.
+        """
+        import urllib.error
+        import urllib.request
+        try:
+            repo = UPDATE_REPOS.get(self.char)
+            url = ("https://raw.githubusercontent.com/%s/main/version.json"
+                   % repo)
+            head = {"User-Agent": "mascot-poll"}
+            if self._upd_etag:
+                head["If-None-Match"] = self._upd_etag
+            try:
+                with urllib.request.urlopen(
+                        urllib.request.Request(url, headers=head),
+                        timeout=12, context=_ssl_ctx()) as r:
+                    body = r.read()
+                    self._upd_etag = r.headers.get("ETag") or self._upd_etag
+            except urllib.error.HTTPError as e:
+                if e.code == 304:
+                    return                 # 바뀐 것 없음 — 받아온 것도 없다
+                raise
+            man = json.loads(body.decode("utf-8"))
+            if isinstance(man, dict):
+                self._upd_q.append(man)
+        except Exception:
+            pass
+        finally:
+            self._upd_busy = False
+
+    def _update_news(self, man):
+        """새 버전이 올라와 있으면 빨간 점을 켜고 한마디 한다."""
+        ver = man.get("version")
+        notes = [str(s) for s in (man.get("notes") or []) if str(s).strip()]
+        if not ver or man.get("silent") or not notes:
+            return
+        seen_path = os.path.join(self.state_dir, SEEN_FILE)
+        try:
+            with open(seen_path, encoding="utf-8") as fp:
+                if json.load(fp).get("version") == ver:
+                    return                   # 이미 아는 소식
+        except Exception:
+            pass
+        got = man.get("link") or {}
+        url = str(got.get("url") or "")
+        link = ({"url": url, "label": str(got.get("label") or "새 버전 받기")}
+                if url.startswith("https://") else None)
+        _update_log_add(self.state_dir, ver, notes, link)
+        try:
+            _save_json(seen_path, {"version": ver})
+        except Exception:
+            pass
+        # 지금 도는 코드는 아직 옛 것이다. 받는 것은 다음에 켤 때 런처가 한다.
+        self._upd_restart = True
+        if self.can_talk:
+            self._say("새 소식이 있어요! 껐다 켜면 반영돼요", 6.0)
+
+    def _update_latest(self, pages=None):
+        """기록에 있는 가장 최신 안내 번호. 없으면 0."""
+        try:
+            vs = [int(g.get("ver") or 0)
+                  for g in (pages if pages is not None else self._update_pages())]
+            return max([v for v in vs if v > 0] or [0])
+        except Exception:
+            return 0
+
+    def _update_read_ver(self):
+        """어디까지 읽었는지. 파일이 없으면 메모리 값, 그것도 없으면 0."""
+        got = getattr(self, "_read_ver", None)
+        if got is not None:
+            return got
+        v = 0
+        try:
+            with open(os.path.join(self.state_dir, UPDATE_READ),
+                      encoding="utf-8") as fp:
+                v = int(json.load(fp).get("ver") or 0)
+        except Exception:
+            v = 0
+        self._read_ver = v
+        return v
+
+    def _update_mark_read(self):
+        """지금까지의 안내를 다 읽은 것으로 둔다.
+
+        저장이 실패해도 메모리 값은 올린다 — 최악이 '다음에 켤 때 한 번 더
+        뜨는 것'이 되게. 점이 안 사라지는 것보다 그쪽이 낫다.
+        """
+        v = max(self._update_latest(), self._update_read_ver())
+        self._read_ver = v
+        try:
+            _save_json(os.path.join(self.state_dir, UPDATE_READ), {"ver": v})
+        except Exception:
+            pass
+
+    def _update_unread(self):
+        """안 본 안내가 있는가 — 그릴 때마다 계산한다."""
+        if not self.cfg.get("update_dot"):
+            return False
+        latest = self._update_latest()
+        return latest > 0 and latest > self._update_read_ver()
+
+    def _update_pages(self):
+        """보여 줄 안내 묶음들 — 오래된 것부터.
+
+        배포 쪽에서 받아 둔 목록과 이 컴퓨터에 쌓인 기록을 합친다. 같은
+        번호는 배포 쪽을 쓴다(문구를 고쳐 올렸을 수 있다).
+        """
+        pages = []
+        try:
+            with open(os.path.join(self.state_dir, UPDATE_LOG),
+                      encoding="utf-8") as fp:
+                got = json.load(fp)
+            if isinstance(got, list):
+                pages = [g for g in got if g.get("notes")]
+        except Exception:
+            pass
+        served = self._news_load()
+        if served:
+            vers = {g.get("ver") for g in served}
+            pages = served + [g for g in pages if g.get("ver") not in vers]
+            pages.sort(key=lambda g: g.get("ver") or 0)
+        if not pages and self._update_notes:
+            pages = [{"ver": 0, "notes": list(self._update_notes),
+                      "link": getattr(self, "_update_link", None)}]
+        return pages
+
+    @staticmethod
+    def _note_split(note):
+        """안내 한 덩이를 (제목, 본문)으로 나눈다.
+
+        줄바꿈이 들어 있으면 첫 줄이 제목이다. 없으면 첫 문장을 제목으로
+        삼는다 — 배포할 때 첫 문장을 '무엇이 생겼는지'로 쓰는 관습에 맞춘 것.
+        """
+        s = str(note).strip()
+        if "\n" in s:
+            a, b = s.split("\n", 1)
+            return a.strip(), b.strip()
+        import re
+        m = re.match(r"^(.{4,70}?[.!?])\s+(\S.*)$", s, re.S)
+        if m:
+            return m.group(1).strip(), m.group(2).strip()
+        return s, ""
+
+    def _show_update_popup(self, mark=True):
+        """무엇이 바뀌었는지 알려 주는 창.
+
+        지난 안내도 화살표로 넘겨 볼 수 있다. 못 보고 지나간 사이에 다음
+        업데이트가 오면 예전 것이 덮여 사라지던 문제 때문이다.
+        내용이 길어질 수 있으므로 처음에는 적당한 높이로 띄우고, 창 아래를
+        잡아 끌어 늘릴 수 있게 한다. 그 높이는 다음에도 기억한다.
+        """
+        pages = self._update_pages()
+        self._update_notes = []
+        if not pages and mark:
+            # 사람이 메뉴에서 직접 열었는데 쌓인 안내가 없는 경우.
+            # 그냥 돌아가면 '눌러도 아무 일이 안 일어난다'가 된다 (개 제보).
+            # 조용한 배포만 받아 온 사람은 기록이 비어 있는 게 정상이다.
+            pages = [{"ver": 0, "notes": [
+                "아직 온 소식이 없어요\n"
+                "새로 바뀐 점이 생기면 여기에 쌓입니다. "
+                "그때는 캐릭터가 말풍선으로도 알려 드려요."]}]
+        # 사람이 직접 열었으면 그 순간 읽음으로 찍는다 — 닫을 때가 아니라.
+        # 그리다 터져도, X로 닫아도 이미 읽은 것이 된다.
+        # 반대로 저절로 뜬 창은 읽음으로 치지 않는다. 자리를 비운 사이에
+        # 떴을 수도 있어서, 그때는 점을 남겨 둬야 나중에 다시 볼 수 있다.
+        if mark:
+            self._safe("update_read", self._update_mark_read)
+        if not pages or self._update_win is not None:
+            return
+        cd, u = self.card, self._ui
+        W, PAD = u(330), u(20)
+        head_h = u(78)
+        btn_h = u(40) + u(40)
+        page = [len(pages) - 1]          # 처음에는 가장 최근 것
+
+        win = tk.Toplevel(self.root)
+        self._keep_front(win, focus=False)
+        self._update_win = win
+        win.title("업데이트")
+        win.attributes("-topmost", True)
+        win.resizable(False, True)       # 세로만 조절 (가로는 글줄이 흐트러진다)
+        win.configure(bg=cd["panel"])
+        top = tk.Frame(win, bg=cd["panel"])
+        top.pack(fill="both", expand=True)
+        cv = tk.Canvas(top, width=W, bg=cd["panel"], highlightthickness=0)
+        cv.pack(side="left", fill="both", expand=True)
+        sb = tk.Scrollbar(top, orient="vertical", command=cv.yview)
+        cv.config(yscrollcommand=sb.set)
+        bar = tk.Canvas(win, width=W, height=btn_h, bg=cd["panel"],
+                        highlightthickness=0)
+        bar.pack(fill="x")
+        hits = []
+        state = {"content": 0, "saved_at": 0.0}
+
+        F_TITLE = self._uf(10, True)
+        F_BODY = self._uf(9)
+        ROW_T, ROW_B = u(25), u(21)
+        GAP_TB, GAP_ITEM = u(10), u(16)   # 제목→본문, 항목→항목
+
+        def rr(c, x0, y0, x1, y1, r, **kw):
+            pts = [x0 + r, y0, x1 - r, y0, x1, y0, x1, y0 + r, x1, y1 - r,
+                   x1, y1, x1 - r, y1, x0 + r, y1, x0, y1, x0, y1 - r,
+                   x0, y0 + r, x0, y0]
+            return c.create_polygon(pts, smooth=True, **kw)
+
+        def wrap_one(text, font, inner):
+            """한 덩이를 그 글꼴 기준으로 줄바꿈한다."""
+            out, cur = [], ""
+            for word in str(text).split():
+                t = (cur + " " + word).strip()
+                tid = cv.create_text(-4000, -4000, text=t, font=font,
+                                     anchor="w")
+                x0, _, x1, _ = cv.bbox(tid)
+                cv.delete(tid)
+                if cur and x1 - x0 > inner:
+                    out.append(cur)
+                    cur = word
+                else:
+                    cur = t
+            if cur:
+                out.append(cur)
+            return out
+
+        def layout(notes):
+            """(종류, 글자) 목록과 전체 높이."""
+            inner = W - PAD * 2 - u(46)
+            rows, h = [], u(14)
+            for i, note in enumerate(notes):
+                if i:
+                    rows.append(("gap", ""))
+                    h += GAP_ITEM
+                title, body = self._note_split(note)
+                for j, t in enumerate(wrap_one(title, F_TITLE, inner)):
+                    rows.append(("title" if j == 0 else "title2", t))
+                    h += ROW_T
+                if body:
+                    rows.append(("gap2", ""))
+                    h += GAP_TB
+                    for t in wrap_one(body, F_BODY, inner):
+                        rows.append(("body", t))
+                        h += ROW_B
+            return rows, h + u(14)
+
+        def render():
+            cv.delete("all")
+            bar.delete("all")
+            hits.clear()
+            i = max(0, min(page[0], len(pages) - 1))
+            page[0] = i
+            rows, body_h = layout(pages[i].get("notes") or [])
+            link = pages[i].get("link") or {}
+            url = str(link.get("url") or "")
+            get_h = u(96) + u(14) if url.startswith("https://") else 0
+            content_h = u(20) + head_h + u(16) + get_h + body_h + u(20)
+            state["content"] = content_h
+            cv.config(scrollregion=(0, 0, W, content_h))
+
+            y = u(20)
+            rr(cv, PAD, y, W - PAD, y + head_h, u(16), fill=cd["soft"],
+               outline=cd["border"], width=2)
+            empty = not pages[i].get("ver") and len(pages) == 1
+            cv.create_text(W / 2, y + u(24),
+                           text="업데이트 소식" if empty
+                           else "새 버전으로 업데이트 됐어요",
+                           font=self._uf(11, True), fill=cd["text"])
+            try:
+                v = int(pages[i].get("ver") or 0)
+                when = time.strftime("%Y-%m-%d", time.localtime(v)) if v else ""
+            except Exception:
+                when = ""
+            sub = when or ("" if empty else "이번에 바뀐 점이에요")
+            if len(pages) > 1:
+                sub += "   (%d / %d)" % (i + 1, len(pages))
+            cv.create_text(W / 2, y + u(46), text=sub,
+                           font=self._uf(9), fill=cd["sub"])
+            if len(pages) > 1:               # 지난 안내로 넘기는 화살표
+                # 선 두 개만 그렸더니 눈에 안 띄어 '지난 것을 볼 수 있다'는
+                # 걸 아무도 몰랐다. 누를 수 있는 동그란 단추로 만든다.
+                for sign, cx in ((-1, PAD + u(22)), (1, W - PAD - u(22))):
+                    on = (i > 0) if sign < 0 else (i < len(pages) - 1)
+                    cy = y + head_h / 2
+                    rad = u(13)
+                    cv.create_oval(cx - rad, cy - rad, cx + rad, cy + rad,
+                                   fill=cd["bg"] if on else "",
+                                   outline=cd["fill"] if on else cd["line"],
+                                   width=2 if on else 1)
+                    col = cd["fill"] if on else cd["line"]
+                    for dy in (-u(5), u(5)):
+                        cv.create_line(cx - sign * u(3), cy + dy,
+                                       cx + sign * u(3), cy, width=3 if on else 2,
+                                       capstyle="round", fill=col)
+                    if on:
+                        hits.append((cx - u(16), cy - u(16), cx + u(16),
+                                     cy + u(16),
+                                     (lambda d: lambda: flip(d))(sign)))
+            y += head_h + u(16)
+            if get_h:
+                # 새 프로그램을 받아야 하는 업데이트 — 받는 곳을 맨 위에.
+                rr(cv, PAD, y, W - PAD, y + u(96), u(14), fill=cd["soft"],
+                   outline=cd["fill"], width=2)
+                cv.create_text(W / 2, y + u(17),
+                               text="새 프로그램을 받아야 하는 업데이트예요",
+                               font=self._uf(9, True), fill=cd["text"])
+                gb = (PAD + u(16), y + u(30), W - PAD - u(16), y + u(62))
+                rr(cv, gb[0], gb[1], gb[2], gb[3], u(15), fill=cd["fill"],
+                   outline="")
+                cv.create_text((gb[0] + gb[2]) / 2, (gb[1] + gb[3]) / 2,
+                               text=str(link.get("label") or "새 버전 받기"),
+                               font=self._uf(11, True), fill="#ffffff")
+                short = url.replace("https://", "")
+                cv.create_text(W / 2, y + u(78), text=short,
+                               font=self._fit(short, 8, W - PAD * 2 - u(24)),
+                               fill=cd["sub"])
+
+                def go(u2=url):
+                    self._safe("update_link", self._open_url, u2)
+
+                hits.append((PAD, y, W - PAD, y + u(96), go))
+                y += u(96) + u(14)
+
+            rr(cv, PAD, y, W - PAD, y + body_h, u(14), fill="#ffffff",
+               outline=cd["line"], width=1)
+            ly = y + u(14)
+            for kind, text in rows:
+                if kind == "gap":
+                    ly += GAP_ITEM
+                    continue
+                if kind == "gap2":
+                    ly += GAP_TB
+                    continue
+                if kind == "title":
+                    cv.create_oval(PAD + u(16), ly + u(9), PAD + u(22),
+                                   ly + u(15), fill=cd["fill"], outline="")
+                if kind in ("title", "title2"):
+                    cv.create_text(PAD + u(32), ly + u(12), anchor="w",
+                                   text=text, font=F_TITLE, fill=cd["text"])
+                    ly += ROW_T
+                else:
+                    cv.create_text(PAD + u(32), ly + u(10), anchor="w",
+                                   text=text, font=F_BODY, fill=cd["sub"])
+                    ly += ROW_B
+            cv.yview_moveto(0)
+
+            by = u(20)
+            # 받아 둔 새 버전이 있으면 그 자리에서 다시 켤 수 있게 한다.
+            # 받는 것은 켤 때 런처가 하므로, 다시 켜야 실제로 반영된다.
+            redo = bool(getattr(self, "_upd_restart", False))
+            if redo:
+                half = (W - PAD * 2 - u(10)) / 2
+                b = (PAD, by, PAD + half, by + u(40))
+                b2 = (W - PAD - half, by, W - PAD, by + u(40))
+                rr(bar, b2[0], b2[1], b2[2], b2[3], u(14), fill=cd["fill"],
+                   outline="")
+                bar.create_text((b2[0] + b2[2]) / 2, by + u(20),
+                                text="지금 다시 켜기",
+                                font=self._uf(10, True), fill="#ffffff")
+                rr(bar, b[0], b[1], b[2], b[3], u(14), fill=cd["soft"],
+                   outline=cd["border"], width=2)
+                bar.create_text((b[0] + b[2]) / 2, by + u(20), text="나중에",
+                                font=self._uf(10, True), fill=cd["sub"])
+            else:
+                b, b2 = (PAD, by, W - PAD, by + u(40)), None
+                rr(bar, b[0], b[1], b[2], b[3], u(14), fill=cd["fill"],
+                   outline="")
+                bar.create_text((b[0] + b[2]) / 2, by + u(20), text="확인",
+                                font=self._uf(10, True), fill="#ffffff")
+
+            def hit(e):
+                if b2 and b2[0] <= e.x <= b2[2] and b2[1] <= e.y <= b2[3]:
+                    return do_restart()
+                if b[0] <= e.x <= b[2] and b[1] <= e.y <= b[3]:
+                    close()
+
+            bar.bind("<Button-1>", hit)
+            fit_bar()
+
+        def fit_bar():
+            """내용이 창보다 길면 스크롤바를 붙이고, 아니면 뗀다."""
+            try:
+                if state["content"] > cv.winfo_height() + 2:
+                    if not sb.winfo_ismapped():
+                        sb.pack(side="right", fill="y")
+                elif sb.winfo_ismapped():
+                    sb.pack_forget()
+            except Exception:
+                pass
+
+        def do_restart():
+            """읽음으로 찍고 창을 닫은 뒤 다시 켠다.
+
+            창을 먼저 없애야 한다 — 닫기 전에 프로세스를 갈아 치우면 그리다
+            만 창이 화면에 남는다.
+            """
+            self._safe("update_read", self._update_mark_read)
+            save_h()
+            self._update_win = None
+            win.destroy()
+            self.root.after(80, lambda: self._safe("restart", self._restart))
+
+        def close(_e=None):
+            # 어떤 식으로 닫든(확인·X·Esc) 읽은 것으로 둔다
+            self._safe("update_read", self._update_mark_read)
+            save_h()
+            self._update_win = None
+            win.destroy()
+
+        def flip(d):
+            page[0] += d
+            render()
+
+        def on_click(e):
+            cy = cv.canvasy(e.y)             # 스크롤된 만큼 좌표를 맞춘다
+            for x0, y0, x1, y1, fn in list(hits):
+                if x0 <= e.x <= x1 and y0 <= cy <= y1:
+                    fn()
+                    return
+
+        def on_wheel(e):
+            if state["content"] > cv.winfo_height():
+                cv.yview_scroll(-1 if e.delta > 0 else 1, "units")
+
+        def on_resize(_e=None):
+            """사람이 창을 늘렸다 — 스크롤바를 다시 보고 높이를 기억한다.
+
+            여기서 after로 미뤄 두면 창이 없어진 뒤 그 예약이 불려
+            'invalid command name'이 난다. 예약 대신 시간으로 조인다.
+            """
+            fit_bar()
+            now = time.time()
+            if now - state["saved_at"] > 0.35:
+                state["saved_at"] = now
+                save_h()
+
+        def save_h():
+            try:
+                if not win.winfo_exists():
+                    return
+                h = int(win.geometry().split("+")[0].split("x")[1])
+                if h > u(200) and abs(h - int(self.us.get("update_h", 0) or 0)) > 4:
+                    self.us["update_h"] = h
+                    self._save_settings()
+            except Exception:
+                pass
+
+        cv.bind("<Button-1>", on_click)
+        for wgt in (win, cv, bar):
+            wgt.bind("<MouseWheel>", on_wheel)
+        win.bind("<Escape>", close)
+        win.protocol("WM_DELETE_WINDOW", close)
+        render()
+        win.update_idletasks()
+
+        # 처음 높이 — 내용이 길어도 적당한 크기로 띄운다
+        sh = self._screen_h()
+        want = int(self.us.get("update_h", 0) or 0)
+        if want < u(240):
+            want = min(state["content"] + btn_h, u(560))
+        H = max(u(240), min(want, int(sh * 0.85)))
+        win.geometry("%dx%d" % (W + u(16), H))
+        win.update_idletasks()
+        fit_bar()
+        win.bind("<Configure>", on_resize)
+        self._place_near(win)
+
+    def _uf(self, size, bold=False):
+        """별도 창(환경설정·브리핑·메뉴)용 글꼴 — 화면 배율을 그대로 따른다.
+
+        이 창들은 그림 위가 아니라 보통 창이라, 다른 프로그램처럼 배율을
+        반영해야 어느 컴퓨터에서든 적당한 크기로 보인다.
+        """
+        n = max(7, round(size * getattr(self, "ui_k", 1.0)))
+        return (UI_FONT, n, "bold") if bold else (UI_FONT, n)
+
+    def _ui(self, px):
+        """별도 창의 치수(px)도 같은 배율로."""
+        return round(px * getattr(self, "ui_k", 1.0))
+
+    def _cf(self, size, bold=False):
+        """글자 크기 설정을 반영한 글꼴."""
+        n = max(6, round(size * getattr(self, "font_k", 1.0)))
+        return (UI_FONT, n, "bold") if bold else (UI_FONT, n)
+
+    TW_CACHE_MAX = 400           # 글자 폭 캐시 상한
+
+    def _mw(self, text, font):
+        """그 글꼴로 글자를 그리면 폭이 얼마인지 (측정값 캐시)."""
+        key = (text, font)
+        w = self._tw_cache.get(key)
+        if w is None:
+            # 카드의 시간 글자는 1초마다 달라져서 열쇠가 끝없이 쌓인다.
+            # 하루 켜 두면 9만 개(25MB)까지 갔다 — 다른 캐시처럼 상한을 둔다.
+            # 다시 재는 값이라 비워도 그림은 그대로다.
+            if len(self._tw_cache) > self.TW_CACHE_MAX:
+                self._tw_cache.clear()
+            t = self.canvas.create_text(-3000, -3000, text=text, anchor="nw",
+                                        font=font)
+            bb = self.canvas.bbox(t)
+            w = (bb[2] - bb[0]) if bb else len(text) * 11
+            self.canvas.delete(t)
+            self._tw_cache[key] = w
+        return w
+
+    def _mh(self, font):
+        """그 글꼴의 글자 높이(px)."""
+        key = ("__height__", font)
+        h = self._tw_cache.get(key)
+        if h is None:
+            t = self.canvas.create_text(-3000, -3000, text="가", anchor="nw",
+                                        font=font)
+            bb = self.canvas.bbox(t)
+            h = (bb[3] - bb[1]) if bb else 16
+            self.canvas.delete(t)
+            self._tw_cache[key] = h
+        return h
+
+    def _fit(self, text, size, max_w, bold=False):
+        """카드 안에 들어가는 가장 큰 글꼴.
+
+        카드 크기는 고정이라, 글자 크기를 키우면 상태와 시간이 서로 파고든다.
+        그래서 정해진 폭을 넘으면 들어갈 때까지 한 단계씩 줄인다. 설정한
+        크기가 카드에 안 맞아도 겹치지는 않게 하는 안전장치다.
+        """
+        n = max(6, round(size * getattr(self, "font_k", 1.0)))
+        while n > 6:
+            f = self._cf_n(n, bold)
+            if self._mw(text, f) <= max_w:
+                return f
+            n -= 1
+        return self._cf_n(6, bold)
+
+    @staticmethod
+    def _cf_n(n, bold=False):
+        return (UI_FONT, n, "bold") if bold else (UI_FONT, n)
+
+    LV_PAD = 4                   # 칭호 알약과 카드 윗변 사이 여백
+
+    def _draw_lv_row(self, x0, x1, cy, band):
+        """카드 맨 윗줄 — 'Lv.42  선 긋는 사람'.
+
+        레벨은 진하게, 칭호는 옅게 해서 한 줄 안에서 위계를 준다. 둘을 한
+        덩어리로 보고 가운데에 놓는다 (가운데를 글자 사이에 맞추면 칭호
+        길이에 따라 좌우로 흔들린다).
+        """
+        c, cd = self.canvas, self.card
+        lv = "Lv.%d" % self._level()
+        title = self._title()
+        gap, pad = 6, 6
+        # 알약의 좌우 여백까지 미리 빼고 글자 크기를 정한다. 안 그러면
+        # 글자는 들어가는데 알약이 카드 밖으로 삐져나온다.
+        budget = (x1 - x0) - 28
+        f1 = self._fit(lv, 9, budget * 0.42, True)
+        w1 = self._mw(lv, f1)
+        room = budget - w1 - gap - pad * 2
+        f2 = self._fit(title, 8, max(room, 20), True) if title else f1
+        w2 = self._mw(title, f2) if title else 0
+        total = w1 + (gap + w2 + pad * 2 if title else 0)
+        sx = (x0 + x1) / 2 - total / 2
+        c.create_text(sx, cy + INK_DY, anchor="w", text=lv, font=f1,
+                      fill=cd["text"])
+        if title:
+            # 칭호는 다른 글자와 같은 모양이라 그냥 두면 묻힌다. 뒤에 옅은
+            # 알약을 깔아 '이건 이름표'라고 읽히게 한다. 테마색을 흰색에
+            # 섞어 캐릭터마다 어울리는 파스텔이 나온다.
+            bx = sx + w1 + gap
+            # 알약이 카드 윗변에 딱 붙지 않게, 줄 높이 안에서 여백을 남긴다
+            h = min(self._mh(f2) + 2, max(12, band - self.LV_PAD * 2))
+            self._rrect(bx, cy - h / 2, bx + w2 + pad * 2, cy + h / 2,
+                        h / 2, fill=self._mix("#ffffff", cd["fill"], 0.20),
+                        outline="")
+            c.create_text(bx + pad, cy + INK_DY, anchor="w", text=title,
+                          font=f2, fill=self._shade(cd["fill"], 0.35))
+
+    def _goal_bar(self, bx0, right, row):
+        """목표 시간 진행바 + 퍼센트. 카드 종류와 상관없이 같은 모양으로."""
+        c, cd = self.canvas, self.card
+        goal = max(float(self.us["goal_hours"]), 0.5) * 3600
+        frac = min(self._shown_secs() / goal, 1.0)
+        txt = "%d%%" % int(frac * 100)
+        f = self._fit(txt, 7, 34, True)
+        bx1 = right - self._mw(txt, f) - 6
+        c.create_line(bx0, row, bx1, row, width=6, capstyle="round",
+                      fill=cd["track"])
+        if frac > 0.01:
+            c.create_line(bx0, row, bx0 + (bx1 - bx0) * frac, row, width=6,
+                          capstyle="round",
+                          fill="#7ccf8f" if frac >= 1.0 else cd["fill"])
+        c.create_text(right, row + INK_DY, anchor="e", text=txt, font=f,
+                      fill="#5aa86e" if frac >= 1.0 else cd["sub"])
+
+    def _draw_timer(self, state, sleeping, now):
+        c = self.canvas
+        cd = self.card
+        active = state == "work"
+        dot, status = self._status_of(state, sleeping)
+        t = int(self._shown_secs())
+        label = f"{t // 3600}:{t % 3600 // 60:02d}:{t % 60:02d}"
+        g = self._card_geom()
+        x0, y0, x1, y1 = g["x0"], g["y0"], g["x1"], g["y1"]
+        pad = 14
+
+        self._draw_deco(x0, y0, x1, y1)
+        self._rrect(x0 + 2, y0 + 3, x1 + 2, y1 + 3, 16, fill="#e3e6ee", outline="")
+        self._rrect(x0, y0, x1, y1, 16, fill=cd["bg"], outline=cd["border"], width=2)
+        if now < self._lv_glow + self.LV_GLOW:
+            self._safe("lv_glow", self._draw_lv_glow, x0, y0, x1, y1, now)
+
+        # 맨 윗줄 — 레벨과 칭호. 아래 칸들은 그만큼 내려간다.
+        lvh = self._lv_row()
+        if lvh:
+            # 카드 윗변에서 여백만큼 내려온 자리를 줄의 한가운데로 삼는다
+            band = lvh - self.LV_PAD
+            self._safe("level_row", self._draw_lv_row,
+                       x0, x1, y0 + self.LV_PAD + band / 2, band)
+            y0 += lvh - LV_TRIM
+
+        def status_dot(px, py):
+            pulse = 1.5 + math.sin(now * 4) * 1.5 if active else 0
+            r = 5 + pulse * 0.5
+            c.create_oval(px - r, py - r, px + r, py + r, fill=dot, outline="")
+
+        if self.has_clock and self.clock_open:
+            # 세로 카드: 상태(위) → 시계(가운데) → 시간(아래) — 모두 정중앙 정렬
+            cxm = (x0 + x1) / 2
+            f_stat = self._fit(status, 8, (x1 - x0) - 34)
+            tw = self._mw(status, f_stat)
+            gx = cxm - (16 + tw) / 2            # 점+간격+텍스트 그룹 중앙
+            status_dot(gx + 5, y0 + 16)
+            c.create_text(gx + 16, y0 + 16 + INK_DY, anchor="w", text=status,
+                          font=f_stat, fill=cd["sub"])
+            R = 38
+            clock_cy = y0 + 30 + R
+            self._draw_clock(cxm, clock_cy, R, now)
+            c.create_text(cxm, clock_cy + R + 18 + INK_DY, text=label,
+                          font=self._fit(label, 14, (x1 - x0) - 20, True),
+                          fill=cd["text"])
+            self._goal_bar(x0 + 14, x1 - 12, clock_cy + R + 42)
+        elif self.has_clock:
+            # 접힘: 상태 + 시간 한 줄 (게이지 없음)
+            row = y0 + 20
+            status_dot(x0 + pad + 5, row)
+            avail = (x1 - pad) - (x0 + pad + 16)
+            f_time = self._fit(label, 13, avail * 0.62, True)
+            f_stat = self._fit(status, 8,
+                               avail - self._mw(label, f_time) - 8)
+            c.create_text(x0 + pad + 16, row + INK_DY, anchor="w", text=status,
+                          font=f_stat, fill=cd["sub"])
+            c.create_text(x1 - pad, row + INK_DY, anchor="e", text=label,
+                          font=f_time, fill=cd["text"])
+            self._goal_bar(x0 + pad + 2, x1 - pad, row + 25)
+        else:
+            # 게이지형(준사): 상태+시간 윗줄 + 목표 진행바 아랫줄
+            row1 = y0 + 20
+            status_dot(x0 + pad + 5, row1)
+            # 마감은 카드가 아니라 말풍선 목록으로 보여 준다. 카드에 딱지를
+            # 넣었더니 그 폭만큼 상태·시간 글자가 줄어 읽기 힘들어졌다.
+            avail = (x1 - pad) - (x0 + pad + 16)
+            f_time = self._fit(label, 13, avail * 0.62, True)
+            f_stat = self._fit(status, 8,
+                               avail - self._mw(label, f_time) - 8)
+            c.create_text(x0 + pad + 16, row1 + INK_DY, anchor="w", text=status,
+                          font=f_stat, fill=cd["sub"])
+            c.create_text(x1 - pad, row1 + INK_DY, anchor="e", text=label,
+                          font=f_time, fill=cd["text"])
+            self._goal_bar(x0 + pad + 2, x1 - pad, y0 + 45)
+            # 작업 종료는 우클릭 메뉴로 옮겼다 — 카드에는 버튼이 없다
+
+    # ── 매 프레임 갱신 (~30fps) ──────────────────────────────────────────
+    def _boot_step(self, step):
+        """켜는 도중 어디까지 갔는지 남긴다 — 터지면 마지막 줄이 곧 자리다.
+
+        기록은 켤 때마다 새로 쓴다(a 가 아니라 w). 몇 줄 안 되는 것이
+        계속 쌓이면 정작 볼 때 찾기 어렵다.
+        """
+        try:
+            mode = "w" if step == "시작" else "a"
+            with open(os.path.join(self.state_dir, ".boot.log"), mode,
+                      encoding="utf-8") as fp:
+                fp.write("%s %s\n" % (time.strftime("%H:%M:%S"), step))
+        except Exception:
+            pass
+
+    # 구역 이름 → 사람이 알아들을 말. 없으면 조용히 넘어간다
+    # (안쪽 구역까지 다 알릴 필요는 없다 — 눈에 띄는 것만).
+    OFF_SAY = {"room": "홈 기능이 잠깐 멈췄어요",
+               "timer": "타이머 표시가 잠깐 멈췄어요",
+               "todo": "할 일 목록이 잠깐 멈췄어요",
+               "due": "마감 표시가 잠깐 멈췄어요",
+               "slime": "슬라임이 잠깐 멈췄어요",
+               "char_fx": "반응 연출이 잠깐 멈췄어요",
+               "music_btn": "음악 단추가 잠깐 멈췄어요"}
+
+    def _safe_off_told(self, where):
+        """구역이 처음 꺼질 때 한 번만 알린다.
+
+        조용히 사라지면 사람은 '원래 없는 기능인가' 하고 넘어간다.
+        한 번은 말해 줘야 제보라도 온다. 되풀이하면 성가시므로 한 번만.
+        """
+        if where in self._told_off:
+            return
+        self._told_off.add(where)
+        msg = self.OFF_SAY.get(where)
+        if not msg:
+            return
+        try:
+            self._say(msg + " (곧 다시 해 볼게요)", 5.0)
+        except Exception:
+            pass
+
+    def _health_tick(self, now):
+        """지금 무엇이 죽어 있는지 한 파일에 남긴다 (.health.txt).
+
+        홈은 `.room_diag.txt` 가 자세히 남기지만, 그 밖의 기능이 조용히
+        꺼졌을 때는 볼 것이 없었다. 구역 이름·횟수·마지막 이유만 있어도
+        '무엇이 언제부터 안 되는지'가 바로 갈린다.
+        """
+        if now - self._health_at < 30.0:
+            return
+        self._health_at = now
+        off = sorted(w for w in self._fail if self._safe_off(w))
+        rows = [time.strftime("%Y-%m-%d %H:%M:%S"),
+                "캐릭터=%s  켠 지 %.0f분  그린 프레임=%d"
+                % (self.char, (now - self._born_at) / 60.0,
+                   getattr(self, "_frames", 0)),
+                "지금 꺼진 구역=%s" % (", ".join(off) if off else "없음"),
+                ""]
+        bad = [(w, c) for w, c in sorted(self._fail.items()) if c]
+        if not bad:
+            rows.append("터진 구역 없음")
+        for w, c in bad:
+            ago = now - (self._fail_at.get(w) or 0)
+            rows.append("%-16s %d번  %.0f분 전  %s"
+                        % (w, c, ago / 60.0, self._fail_why.get(w, "")))
+        try:
+            _save_json_text(os.path.join(self.state_dir, ".health.txt"),
+                            "\n".join(rows) + "\n")
+        except Exception:
+            pass
+
+    def _safe_off(self, name):
+        """그 구역이 여러 번 터져서 꺼졌는가 (_safe 가 3번이면 끈다)."""
+        try:
+            n = self._fail.get(name, 0)
+            when = self._fail_at.get(name, 0.0)
+            return n >= 3 and (time.time() - when) < self.FAIL_FORGET
+        except Exception:
+            return False
+
+    def _log_boot(self, where):
+        """켜는 도중 터진 것을 남긴다.
+
+        아직 화면이 없어서 이 파일이 유일한 단서다. _log_error 는
+        self.s·self.W 같은 값을 쓰는데 이 시점에는 아직 없다.
+        """
+        try:
+            import traceback
+            with open(os.path.join(self.state_dir, ".error.log"), "a",
+                      encoding="utf-8") as fp:
+                fp.write("\n===== %s 시작 중 (%s)\n"
+                         % (time.strftime("%Y-%m-%d %H:%M:%S"), where))
+                fp.write("char=%s frozen=%s\n"
+                         % (getattr(self, "char", "?"),
+                            getattr(sys, "frozen", False)))
+                fp.write(traceback.format_exc())
+        except Exception:
+            pass
+
+    def _log_error(self, where):
+        """한 프레임이 터져도 프로그램은 계속 돌게 — 원인은 파일로 남긴다."""
+        self._err_count = getattr(self, "_err_count", 0) + 1
+        if self._err_count > 20:
+            return
+        try:
+            import traceback
+            path = os.path.join(self.state_dir, ".error.log")
+            # 몇 달을 쓰면 계속 쌓이기만 한다. 커지면 옛것을 버리고 새로 쓴다.
+            try:
+                if os.path.getsize(path) > 512 * 1024:
+                    os.replace(path, path + ".1")
+            except OSError:
+                pass
+            with open(path, "a", encoding="utf-8") as fp:
+                fp.write(f"\n===== {time.strftime('%Y-%m-%d %H:%M:%S')} {where}\n")
+                fp.write(f"char={self.char} frozen={getattr(sys, 'frozen', False)} "
+                         f"scale={self.s:.3f} oy={self.oy} WH={self.W}x{self.H}\n")
+                fp.write(f"timer_on={self.timer_on} fun={self.fun} "
+                         f"pets={list(getattr(self, '_pet_hide', {}))} "
+                         f"has={sorted(k for k, v in self.has.items() if v)}\n")
+                fp.write(f"settings={self.us}\n")
+                traceback.print_exc(file=fp)
+        except Exception:
+            pass
+
+    def _put(self, name, x, y, anchor="nw"):
+        """파츠 이미지 그리기. 파일이 없으면 조용히 건너뛴다(업데이트 끊김 대비)."""
+        im = self.im.get(name)
+        if im is None:
+            return False
+        self.canvas.create_image(x, y, image=im, anchor=anchor)
+        return True
+
+    FAIL_FORGET = 300            # 이 시간(초) 넘게 안 터졌으면 실패 횟수를 잊는다
+
+    def _safe(self, where, fn, *args):
+        """부분 실패가 화면 전체를 지우지 못하게 — 3번 터지면 그 구역만 끈다.
+
+        다만 영영 꺼지면 안 된다. 아침에 잠깐 터진 것 때문에 저녁까지 팔이
+        안 나오는 식이 되기 때문이다. 마지막 실패가 한참 전이면 다시 센다.
+        """
+        n = self._fail.get(where, 0)
+        if n and time.time() - self._fail_at.get(where, 0) > self.FAIL_FORGET:
+            n = 0
+            self._fail[where] = 0
+        if n >= 3:
+            return
+        try:
+            fn(*args)
+        except Exception as e:
+            self._fail[where] = n + 1
+            self._fail_at[where] = time.time()
+            # 왜 터졌는지 한 줄로 기억한다 (.health.txt 가 이걸 보여 준다).
+            # .error.log 를 뒤지지 않아도 무엇이 죽었는지 알 수 있게.
+            self._fail_why[where] = "%s: %s" % (type(e).__name__, str(e)[:70])
+            self._log_error(where)
+            if self._fail[where] >= 3:
+                self._safe_off_told(where)
+
+    def tick(self):
+        # 다음 프레임을 먼저 예약한다 — 중간에 예외가 나도 루프가 죽지 않게.
+        # 입력이 없으면 볼 것도 없으므로 프레임을 낮춰 CPU를 아낀다.
+        # (자는 중 10fps / 5초 이상 무입력 15fps / 작업 중 30fps)
+        quiet = time.time() - max(self.last_key, self.last_pointer)
+        self._tick_after = self.root.after(
+            100 if (self._sleeping or self._fs_hidden)
+            else (66 if quiet > 5.0 else 33), self.tick)
+        try:
+            self._tick_body()
+        except Exception:
+            self._log_error("tick")
+            try:
+                self.draw(time.time())      # 지워진 화면을 다시 채운다
+            except Exception:
+                self._log_error("redraw")
+
+    def _tick_body(self):
+        now = time.time()
+        if self._macin is not None:
+            self._safe("mac_input", self._poll_mac_input)
+        if self.key_events != self._seen_keys:
+            self._seen_keys = self.key_events
+            self.last_key = now
+            self.squash_until = now + 0.10
+            pen_typing = now - self.last_pointer > 2.0
+            self.tap_side = (not self.tap_side) if pen_typing else False
+            if pen_typing and self.tap_side:
+                self.pen_ang_t = random.uniform(*PEN_KB_ROT)
+                self.pen_down_until = now + 0.09
+            else:
+                self.key_ang_t = random.uniform(*KEY_ROT)
+                self.left_down_until = now + 0.09
+        if now >= self.next_blink:
+            self.blink_until = now + 0.12
+            self.next_blink = now + random.uniform(2.5, 5.5)
+        # 또 실행했는가 / 새 소식이 올라왔는가 / 전체화면 프로그램이 떴는가
+        self._safe("hello", self._hello_tick, now)
+        self._safe("update_poll", self._update_poll, now)
+        # 전체화면 비켜 주기는 _safe에 맡기지 않는다. 세 번 터져 그 구역이
+        # 꺼지면 '숨은 채로 굳어' 캐릭터가 영영 안 보인다 (지뢰 14).
+        # 터지면 무조건 되돌려 놓는다 — 최악이 '게임 위에 잠깐 보이는 것'.
+        try:
+            self._fs_tick(now)
+        except Exception:
+            self._log_error("fullscreen")
+            try:
+                self._fs_show()
+            except Exception:
+                pass
+        self._safe("z_pin", self._z_pin, now)
+        # 진단은 방 처리 밖에서 돈다. 안에 두면 방이 멈출 때 진단도 같이
+        # 멈춰서, 정작 알아야 할 '멈췄다'는 사실이 안 남는다 (실제로 겪음).
+        self._frames = getattr(self, "_frames", 0) + 1
+        try:      # 진단은 _safe 로 감싸지 않는다 — 같이 꺼지면 볼 것이 없다
+            self._health_tick(now)
+        except Exception:
+            pass
+        self._room_dead = self._safe_off("room")
+        if self._room_dead and now - self._fail_at.get("room", 0) > 60:
+            # 이 구역이 꺼져 있는 동안은 자리도 못 알리고 남도 못 받는다.
+            # 5분(FAIL_FORGET)은 너무 기니 1분마다 다시 해 본다.
+            self._fail["room"] = 0
+            self._room_dead = False
+        self._safe("room_diag", self._room_diag, now)
+        self._safe("room", self._room_tick, now)
+        # 그림자: 본체를 따라오고, 주기적으로 z순서(본체 바로 아래) 재고정
+        # 창이 실제로 움직였을 때만 따라 옮긴다. 위치가 그대로인데도 주기적으로
+        # z순서를 다시 밀어넣으면 그림자가 눈에 띄게 깜빡인다.
+        if not self._fs_hidden and (self.shadow is not None
+                                    or self.todo_panel is not None
+                                    or self.due_panel is not None):
+            pos = (self.root.winfo_rootx(), self.root.winfo_rooty())
+            if pos != self._last_pos:
+                self._last_pos = pos
+                self._z_check = now
+                if self.shadow is not None:
+                    self.shadow.place(*pos, self._main_hwnd)
+                if self.todo_panel is not None:
+                    self.todo_panel.place(*pos)
+            # 캐릭터를 누르면 그 창이 맨 앞으로 올라와 말풍선을 덮는다.
+            # 놓친 경우를 위해 짧은 주기로도 다시 올려 둔다.
+            if now - self._panel_z > 0.5:
+                self._panel_z = now
+                for _p in (self.todo_panel, self.due_panel):
+                    if _p is not None:
+                        _p.raise_above()
+            if self.due_panel is not None:
+                self._safe("due", self._due_tick)
+            elif self.shadow is not None and now - self._z_check > 8.0:
+                self._z_check = now          # z순서만 가끔 재고정
+                self.shadow.place(*pos, self._main_hwnd)
+        # 기존 타이머(에이전트)에게 '캐릭터 타이머가 살아 있다'고 알린다.
+        # 이게 없으면 에이전트가 자기 자식 프로세스만 보고 판단해, 따로 띄운
+        # 캐릭터가 있어도 창을 다시 띄워 둘이 같이 보인다.
+        if self.ws_path is not None and now - self._beat_t > 2.0:
+            self._beat_t = now
+            try:
+                base = os.path.dirname(self.ws_path)
+                with open(os.path.join(base, ".mascot_live"), "w") as fp:
+                    fp.write(str(now))
+                # PID는 따로 남긴다. 살아있음 신호에 같이 적으면 옛 타이머가
+                # 그 파일을 숫자로 못 읽어 '캐릭터가 죽었다'고 보고 스스로
+                # 종료해 버린다.
+                if not self._pid_written:
+                    self._pid_written = True
+                    with open(os.path.join(base, ".mascot_pid"), "w") as fp:
+                        fp.write(str(os.getpid()))
+            except Exception:
+                pass
+
+        # 음악 재생기가 보낸 상태 (재생기를 띄운 적 있을 때만)
+        if self._yt_q or self._yt_proc is not None:
+            self._safe("yt", self._yt_tick, now)
+
+        # 끝난 타자 소리 장치 정리
+        if self.sndpack is not None and now - getattr(self, "_snd_reap", 0) > 2.0:
+            self._snd_reap = now
+            try:
+                self.sndpack.reap()
+            except Exception:
+                pass
+        self.draw(now)
+
+    # ── 슬라임 (책상 위 말랑이) ──────────────────────────────────────────
+    # 책상 그림에는 키보드와 타블렛이 한 장으로 그려져 있어 그것만 지울 수는
+    # 없다. 그래서 상판 위에 매트를 펼쳐 덮고, 그 위에 슬라임을 올린다.
+    # 슬라임은 그림 파일이 아니라 둘레를 도는 입자 SL_N개다. 매 프레임
+    # 좌표만 옮기면 되므로 빠르고, 그림 캐시가 없어 메모리도 안 샌다(지뢰 18).
+    #
+    # 예전에는 '중심에서의 거리'만 늘였다 줄였다 했는데, 그러면 아무리 잡아
+    # 끌어도 원 언저리를 못 벗어난다. 지금은 입자마다 제 좌표를 들고
+    #   ① 변 길이  ② 넓이  ③ 원래 모양으로 돌아가려는 힘
+    # 세 가지 제약을 번갈아 풀어 자리를 잡는다. 그래서 잡아당기면 그쪽으로
+    # 길게 늘어나고 가운데가 가늘어지는, 진짜 슬라임 같은 모양이 나온다.
+    SL_N = 36                # 둘레 입자 개수
+    SL_ITER = 3              # 한 걸음에 제약을 몇 번 풀까
+    SL_EDGE = 0.55           # 변 길이를 지키는 힘 (덩어리가 안 찢어지게)
+    SL_STRETCH = 2.6         # 변이 늘어날 수 있는 최대 배율
+    SL_AREA = 0.45           # 넓이를 지키는 힘 (길게 늘이면 가늘어진다)
+    SL_SHAPE = 0.13          # 원래 모양으로 돌아가려는 힘
+    SL_HOME = 0.06           # 제자리로 돌아가려는 힘
+    SL_DAMP = 0.74           # 출렁임이 잦아드는 정도 (낮을수록 덜 촐랑인다)
+    SL_GRIP = 2              # 손가락이 집는 폭 (입자 몇 개를 함께 쥐는가)
+    SL_REACH = 2.2           # 제자리에서 이만큼(반지름 배수)까지만 따라간다
+    SL_STEP = 0.22           # 한 걸음에 손끝을 따라갈 수 있는 거리 (반지름 배수)
+    SL_NEAR = 1.35           # 가까운 이웃끼리 지켜야 할 간격 (변 길이 배수)
+    SL_FLAT = 0.50           # 비스듬히 내려다보는 책상이라 세로로 눌러 그린다
+    SL_IDLE = 90.0           # 이만큼 안 만지면 저절로 치운다
+    SL_GRAIN_PX = 26.0       # 끌 때 이 거리마다 소리 한 알
+    # 매트는 책상 상판을 통째로 덮는다. 열마다 책상의 위·아래 끝을 재어
+    # 그 사이의 비율로 잡으므로, 책상 그림이 바뀌어도 실루엣을 따라간다.
+    # 실측(도로롱): 상판과 앞면을 가르는 선이 열마다 위아래 폭의 74~77%에
+    # 있었다. 그래서 앞끝을 0.77로 두면 상판만 정확히 덮는다.
+    SL_BACK = 0.035          # 뒤 모서리에서 안쪽으로 (책상 테두리를 남긴다)
+    SL_SMOOTH = 0.055        # 실루엣을 이만큼 폭으로 평균 내어 다듬는다
+    SL_LIGHT = 208           # 슬라임 색의 밝기 하한 (파스텔 유지)
+    SL_FRONT = 0.775         # 매트 앞끝 — 상판까지만 덮고 책상 앞면은 남긴다
+    SL_BED = 0.775           # 슬라임이 앉는 선 (여기까지가 상판)
+    SL_REVEAL = 8            # 펼치는 연출을 몇 단계로 나눌까
+
+    def _slime_mat(self):
+        """슬라임을 놓을 자리와, 상판을 흰색으로 칠한 그림.
+
+        (칠한 그림들, (가운데x, 뒤끝y, 상판 앞끝y, 폭)) 을 돌려준다.
+        매트를 따로 된 도형으로 얹으면 모서리가 어색해서, 아예 **책상 상판을
+        흰 페인트로 칠한다**. 책상의 검은 외곽선은 남기고 밝은 면만 하얘지므로
+        그림체가 그대로 살고 원근도 맞는다. 아래쪽 옆면은 안 칠한다.
+
+        펼치는 연출용으로 위에서 아래로 조금씩 드러나는 단계도 함께 만든다.
+        배율이 그대로면 다시 만들지 않는다.
+        """
+        prof = self._desk_prof
+        src = self._pil_cache.get("desk") if hasattr(self, "_pil_cache") else None
+        if not self.has.get("desk") or not self._desk_bb or not prof or src is None:
+            return None
+        dx, dy = self._pos("desk")
+        key = (round(dx, 1), round(dy, 1), round(self.s, 4))
+        hit = self._slime_pts
+        if hit is not None and hit[0] == key:
+            return hit[1]
+        s = self.cfg.get("slime") if isinstance(self.cfg.get("slime"), dict) else {}
+        fb = float(s.get("bed", self.SL_BED))
+        bx0, by0, bx1, by1 = self._desk_bb
+        ox0, oy0 = dx + bx0, dy + by0
+        # 열마다 상판이 끝나는 선 (흔들림은 이웃 평균으로 다듬는다)
+        n = len(prof)
+        half = max(1, int(n * self.SL_SMOOTH))
+        sm = []
+        for i in range(n):
+            vals = [prof[q] for q in range(max(0, i - half), min(n, i + half + 1))
+                    if prof[q] is not None]
+            sm.append((sum(v[0] for v in vals) / len(vals),
+                       sum(v[1] for v in vals) / len(vals)) if vals else None)
+        im = src.copy()
+        px = im.load()
+        cols = [i for i in range(n) if sm[i] is not None]
+        if not cols:
+            return None
+        lo, hi = cols[0], cols[-1]
+        # 책상을 통째로 하얗게 칠한다 — 옆면까지 싹. 키보드도 타블렛도 같이
+        # 덮여 사라져서, 흰 매트를 씌워 둔 것처럼 보인다. 다만 바깥
+        # 테두리(가장자리 몇 px)는 남겨야 실루엣이 산다.
+        rim = max(2, int(round(self.s * 9)))
+        for i in cols:
+            t, b = sm[i]
+            side = i < lo + rim or i > hi - rim
+            y0i, y1i = int(by0 + t), min(by1, int(by0 + b))
+            for y in range(y0i, y1i):
+                a = px[bx0 + i, y][3]
+                if a < 8:
+                    continue
+                r, g, bl = px[bx0 + i, y][:3]
+                if side or y < y0i + rim or y > y1i - rim:
+                    # 테두리 구역이라도 '어두운 선'만 남긴다. 나무색이 섞인
+                    # 가장자리를 그대로 두면 갈색 자국이 남는다.
+                    if (r * 299 + g * 587 + bl * 114) / 1000.0 < 120:
+                        continue
+                px[bx0 + i, y] = (255, 255, 255, a)
+        mid = (lo + hi) // 2
+        t, b = sm[mid]
+        span = b - t
+        steps = []
+        full = by0 + int(round(b)) + 2
+        for q in range(1, self.SL_REVEAL + 1):
+            hgt = max(1, int(round((full - by0) * q / self.SL_REVEAL)))
+            steps.append(ImageTk.PhotoImage(im.crop((0, 0, im.width, by0 + hgt))))
+        bed = (ox0 + mid, oy0 + t + span * self.SL_BACK,
+               oy0 + t + span * fb, hi - lo)
+        got = (steps, bed)
+        self._slime_pts = (key, got)
+        return got
+
+    def _on_desk(self, x, y):
+        """책상 그림 위를 눌렀는가 (카드·캐릭터 몸이 아니라)."""
+        if not self.has.get("desk") or not self._desk_bb:
+            return False
+        dx, dy = self._pos("desk")
+        bx0, by0, bx1, by1 = self._desk_bb
+        return (dx + bx0 <= x <= dx + bx1) and (dy + by0 <= y <= dy + by1)
+
+    def _slime_dir(self, kind=None):
+        """그 종류의 소리가 있는 폴더."""
+        base = os.path.join(self.dir, "sounds", "slime")
+        k = self.us.get("slime_kind") if kind is None else kind
+        if k and os.path.isdir(os.path.join(base, k)):
+            return os.path.join(base, k)
+        return base                       # 종류를 안 나눈 옛 배치
+
+    def _list_slime_kinds(self):
+        """슬라임 종류 목록 — sounds/slime/ 아래 wav가 든 폴더가 곧 종류다.
+
+        폴더를 새로 넣으면 그대로 목록에 뜬다. 종류 없이 wav를 바로 둔
+        옛 배치도 그대로 돈다(목록은 빈 채로).
+        """
+        base = os.path.join(self.dir, "sounds", "slime")
+        out = []
+        if os.path.isdir(base):
+            for name in sorted(os.listdir(base)):
+                p = os.path.join(base, name)
+                if name.startswith(".") or not os.path.isdir(p):
+                    continue
+                if any(f.lower().endswith(".wav") for f in os.listdir(p)):
+                    out.append(name)
+        # config에 적어 둔 차례를 먼저 따르고, 없는 것은 뒤에 이름순으로
+        cfg = self._slime_cfg().get("kinds")
+        order = list(cfg) if isinstance(cfg, dict) else []
+        return ([k for k in order if k in out]
+                + [k for k in out if k not in order])
+
+    def _slime_cfg(self):
+        s = self.cfg.get("slime")
+        return s if isinstance(s, dict) else {}
+
+    def _slime_look(self):
+        """지금 고른 종류의 생김새·물성. 없는 값은 기본값을 쓴다."""
+        s = self._slime_cfg()
+        kinds = s.get("kinds") if isinstance(s.get("kinds"), dict) else {}
+        me = kinds.get(self.us.get("slime_kind")) or {}
+        look = dict(s)
+        look.pop("kinds", None)
+        look.update(me if isinstance(me, dict) else {})
+        return look
+
+    def _slime_color(self):
+        """(슬라임 색, 매트 색) — 캐릭터의 테마색에서 뽑는다.
+
+        슬라임은 테마색에 흰색을 섞은 파스텔, 매트는 같은 색을 어둡고
+        차분하게 낮춘 것이다. 매트를 슬라임의 옅은 색으로 두면 안 된다 —
+        같은 밝기끼리는 슬라임이 매트에 묻혀 안 보인다.
+        tint는 테마색을 얼마나 진하게 쓰는가다 (0이면 흰색, 1이면 테마색).
+        """
+        look = self._slime_look()
+        theme = look.get("theme") or self.card.get("fill") or "#f2a7c5"
+        tint = max(0.15, min(float(look.get("tint", 0.55)), 1.0))
+        # shade는 꾸덕한 종류를 한 단계 짙게 만드는 값이다. 종류가 색만
+        # 조금 다르면 사람 눈에는 같은 슬라임으로 보인다.
+        shade = max(0.0, min(float(look.get("shade", 0.0)), 0.4))
+        col = look.get("color") or self._shade(
+            self._mix("#ffffff", theme, tint), shade)
+        if not look.get("color"):
+            # 테마색이 어두운 캐릭터(준사 #4a4a52, 퀸시 #3c5488 …)는 흰색을
+            # 같은 비율로 섞어도 파스텔이 안 된다. 밝기 하한을 두어 어떤
+            # 캐릭터에서든 연한 색이 나오게 한다.
+            for _ in range(12):
+                r, g, b = (int(col[i:i + 2], 16) for i in (1, 3, 5))
+                if (r * 299 + g * 587 + b * 114) / 1000.0 >= self.SL_LIGHT:
+                    break
+                col = self._mix(col, "#ffffff", 0.18)
+        return (col, look.get("mat_color") or "#ffffff")
+
+    def _slime_open(self):
+        """슬라임을 꺼낸다 (작업 중에도 된다 — 잠깐 만지고 싶을 때가 있다)."""
+        if self.slime is not None:
+            return
+        got = self._slime_mat()
+        if not got:
+            return
+        look = self._slime_look()          # 고른 종류의 생김새·물성
+        cx, ytop, yfront, mw = got[1]
+        mh = yfront - ytop
+        # 상판 안에서 위쪽(캐릭터 쪽)에 놓는다. 가운데에 두면 앞 모서리에
+        # 딱 붙어 책상 밖으로 흘러내린 것처럼 보인다.
+        cy = ytop + mh * 0.30
+        # r은 가로 반지름이다. 매트가 비스듬해 세로로 얕으므로, 세로가 매트를
+        # 넘지 않는 선(mh의 80%)에서 가로를 최대한 키운다.
+        r = max(9.0, min(mw * 0.20, mh * 0.80 / (2 * self.SL_FLAT)))
+        # 종류마다 덩치가 다르다 (꾸덕한 쪽은 야무지게 작게)
+        r *= max(0.6, min(float(look.get("size", 1.0)), 1.3))
+        now = time.time()
+        n = self.SL_N
+        # 꾸덕한 종류는 천천히 굼뜨게 움직이고 모양을 더 오래 붙들고 있는다
+        # (thick 0이면 말랑, 1이면 꾸덕)
+        # thick(묵직함) — 손을 굼뜨게 따라오고 출렁임이 빨리 죽는다.
+        # stiff(단단함) — 제 모양을 강하게 붙들어 애초에 덜 변형된다.
+        # 둘은 다른 이야기다. 묵직하기만 하면 흐물흐물 늘어진 채로 굼뜨다.
+        thick = max(0.0, min(float(look.get("thick", 0.0)), 1.0))
+        stiff = max(0.0, min(float(look.get("stiff", 0.0)), 1.0))
+        # 단단한 고체는 출렁이지 않는다. 감쇠를 세게 걸어 속도를 바로 죽인다.
+        self._sl_stiff = stiff
+        self._sl_damp = self.SL_DAMP * (1.0 - 0.72 * thick)
+        # 굼뜨게 따라오는 것은 '무른데 묵직한' 것에만 준다. 단단한 고체가
+        # 손보다 느리면 뒤늦게 확 쏠려 오히려 출렁이는 것처럼 보인다
+        # (실측: 끄는 중 최대 속도가 무른 쪽의 두 배였다).
+        self._sl_step = self.SL_STEP * (1.0 - 0.55 * thick * (1.0 - stiff))
+        self._sl_shape = min(0.20 + 0.45 * stiff,
+                             self.SL_SHAPE * (1.0 + 3.2 * stiff))
+        self._sl_stretch = max(1.05, self.SL_STRETCH - 1.4 * stiff)
+        self._sl_edge = min(0.9, self.SL_EDGE + 0.3 * stiff)
+        self._sl_area = self.SL_AREA + 0.3 * stiff
+        # 단단한 종류는 애초에 멀리 끌려가지도 않는다. 글씨가 인쇄된
+        # 판이라 크게 늘어나면 글씨만 제자리에 남아 어색하다.
+        self._sl_reach = float(look.get("reach", self.SL_REACH))
+        # 무른 것은 집은 자리를 손끝에 딱 붙인다(가닥이 뽑힌다). 단단한
+        # 고체는 그러면 그 자리만 크게 일그러지므로 살짝만 당기고,
+        # 대신 덩어리째 끌려오게 한다.
+        self._sl_pin = 1.0 - 0.88 * stiff
+        # 종류마다 소리 높낮이를 달리 준다. 1보다 작으면 느리게 재생돼
+        # 음이 낮아지고 길어져서 더 묵직하게 들린다.
+        self._sl_pitch = max(0.5, min(float(look.get("pitch", 1.0)), 1.6))
+        # 기준 모양 — 돌아갈 자리이자 변 길이의 기준.
+        # "bar"면 버터 한 조각처럼 모서리가 둥근 네모, 아니면 납작한 타원.
+        if str(look.get("shape", "")) == "bar":
+            bw = r * float(look.get("bar_w", 1.18))
+            bh = r * self.SL_FLAT * float(look.get("bar_h", 0.86))
+            e = 2.0 / max(2.5, float(look.get("bar_edge", 5.0)))   # 클수록 각짐
+            rx, ry = [], []
+            for i in range(n):
+                a = math.tau * i / n
+                ca, sa = math.cos(a), math.sin(a)
+                rx.append(bw * (1 if ca >= 0 else -1) * abs(ca) ** e)
+                ry.append(bh * (1 if sa >= 0 else -1) * abs(sa) ** e)
+        else:
+            rx = [math.cos(math.tau * i / n) * r for i in range(n)]
+            ry = [math.sin(math.tau * i / n) * r * self.SL_FLAT for i in range(n)]
+        edge = [math.hypot(rx[(i + 1) % n] - rx[i], ry[(i + 1) % n] - ry[i])
+                for i in range(n)]
+        px = [cx + v for v in rx]
+        py = [cy + v for v in ry]
+        # 매트 밖으로 나가지 않게 가둬 둘 범위 (책상 위에서만 논다)
+        self.slime = {
+            "x": px, "y": py, "vx": [0.0] * n, "vy": [0.0] * n,
+            "rx": rx, "ry": ry, "edge": edge,
+            # 최소 간격의 기준은 변 길이의 평균이어야 한다. 버터바처럼
+            # 모서리가 있는 모양은 변 길이가 자리마다 크게 달라서, 한
+            # 변만 보면 평평한 쪽에서 기준이 너무 짧아진다.
+            "near": sum(edge) / n * self.SL_NEAR,
+            "area": self._poly_area(px, py),
+            "cx": cx, "cy": cy, "hx": cx, "hy": cy, "r": r,
+            # 위쪽(캐릭터 쪽)으로는 상판을 좀 넘어가도 된다 — 책상 뒤로
+            # 밀어 올리는 손짓이 자연스러우려면 여유가 있어야 한다.
+            "lim": (cx - mw * 0.52, cx + mw * 0.52,
+                    ytop - mh * 0.75, yfront - 2),
+            "born": now, "touch": now,
+        }
+        if look.get("label") == "cheese":
+            # 구멍은 꺼낼 때 한 번만 정한다. 매 프레임 새로 뽑으면 깜빡인다.
+            rnd = random.Random(int(now))
+            cnt = max(1, int(look.get("holes", 7)))
+            holes = []
+            for q in range(cnt):
+                # 각도는 칸을 나눠 하나씩 (아무렇게나 뽑으면 한쪽에 뭉친다).
+                a = math.tau * (q + rnd.uniform(0.15, 0.85)) / cnt
+                # 반지름은 제곱근을 취해야 넓이에 고르게 퍼진다. 그냥 뽑으면
+                # 가운데가 좁은데도 같은 수가 몰려 한복판에 뭉쳐 보인다.
+                rr = math.sqrt(rnd.uniform(0.09, 0.62))
+                holes.append((a, rr, rnd.uniform(0.10, 0.17)))
+            self.slime["holes"] = holes
+        self._slime_step = now
+        self._sl_touched = False
+        self._sl_fg = now
+        self._slime_sound("unroll")
+        self.smile_until = now + 1.6
+
+    @staticmethod
+    def _poly_area(px, py):
+        """다각형 넓이 (신발끈 공식). 부호는 도는 방향이라 절댓값을 쓴다."""
+        n = len(px)
+        s = 0.0
+        for i in range(n):
+            j = (i + 1) % n
+            s += px[i] * py[j] - px[j] * py[i]
+        return abs(s) * 0.5
+
+    def _slime_menu_sync(self):
+        """우클릭 메뉴의 체크·라디오를 지금 상태에 맞춘다."""
+        v = getattr(self, "_slime_on_var", None)
+        if v is not None:
+            v.set(self.slime is not None)
+        k = getattr(self, "_slime_kind_var", None)
+        if k is not None:
+            k.set(self.us.get("slime_kind") or "")
+
+    def _slime_toggle(self):
+        self._safe("slime_menu",
+                   self._slime_close if self.slime is not None
+                   else self._slime_open)
+        # 작업 중이라 안 나왔을 수도 있으니 체크 표시를 실제 상태로 되돌린다
+        self._safe("slime_menu_sync", self._slime_menu_sync)
+
+    def _slime_set_kind(self, name):
+        """슬라임 종류를 바꾼다 — 소리도 생김새도 그 종류의 것으로."""
+        if name == self.us.get("slime_kind") or name not in self.slime_kinds:
+            return
+        self.us["slime_kind"] = name
+        self._safe("slime_save", self._save_settings)
+        self._safe("slime_snd", self._init_sound)
+        if self.slime is not None:
+            # 꺼내 놓은 채로 바꾸면 그 자리에서 새 것으로 갈아 준다
+            self.slime = None
+            self._slime_grab = None
+            self._slime_hand = None
+            self._safe("slime_swap", self._slime_open)
+
+    def _slime_close(self):
+        if self.slime is None:
+            return
+        self.slime = None
+        self._slime_grab = None
+        self._slime_hand = None
+        self._slime_sound("pop", 0.9)
+
+    def _slime_sound(self, kind, pitch=1.0, level=2):
+        snd = self._slime_snd
+        if snd is None:
+            return
+        try:
+            snd.play(kind, pitch * self._sl_pitch, level)
+        except Exception:
+            pass
+
+    def _slime_xy(self, sl, i, d=None):
+        """제어점 i의 화면 좌표."""
+        return (sl["x"][i], sl["y"][i])
+
+    def _slime_pt(self, sl, a, rr):
+        """덩어리 '안'의 한 점(기준 모양에서의 각도 a, 중심에서의 비율 rr).
+
+        둘레 입자의 지금 자리를 섞어 쓰므로 늘어난 쪽 속살도 같이 딸려 간다.
+        고정 좌표로 그리면 덩어리만 움직이고 속은 제자리에 붙어 따로 논다.
+        """
+        n = self.SL_N
+        f = (a % math.tau) / math.tau * n
+        i = int(f)
+        k = f - i
+        bx = sl["x"][i % n] * (1.0 - k) + sl["x"][(i + 1) % n] * k
+        by = sl["y"][i % n] * (1.0 - k) + sl["y"][(i + 1) % n] * k
+        return (sl["cx"] + (bx - sl["cx"]) * rr,
+                sl["cy"] + (by - sl["cy"]) * rr)
+
+    def _slime_idx(self, sl, x, y):
+        """(x, y)에 가장 가까운 둘레 입자 번호."""
+        best, bd = 0, None
+        for i in range(self.SL_N):
+            d = (sl["x"][i] - x) ** 2 + (sl["y"][i] - y) ** 2
+            if bd is None or d < bd:
+                best, bd = i, d
+        return best
+
+    def _slime_inside(self, x, y, pad=6.0):
+        """다각형 안인가 — 자유롭게 찌그러지므로 원으로는 못 잰다.
+
+        가장자리를 조금 봐 주려고, 안이 아니면 둘레에서 pad 안쪽인지도 본다.
+        """
+        sl = self.slime
+        if sl is None:
+            return False
+        n = self.SL_N
+        px, py = sl["x"], sl["y"]
+        inside = False
+        j = n - 1
+        for i in range(n):                       # 반직선 교차 세기
+            if (py[i] > y) != (py[j] > y):
+                xx = px[i] + (y - py[i]) * (px[j] - px[i]) / (py[j] - py[i])
+                if x < xx:
+                    inside = not inside
+            j = i
+        if inside:
+            return True
+        for i in range(n):                       # 둘레 가까이도 잡아 준다
+            if (px[i] - x) ** 2 + (py[i] - y) ** 2 <= pad * pad:
+                return True
+        return False
+
+    def _slime_press(self, x, y):
+        """누른 순간 — 슬라임 위면 붙잡고, 그 자리를 움푹 들어가게 한다."""
+        sl = self.slime
+        if sl is None or not self._slime_inside(x, y):
+            return False
+        now = time.time()
+        sl["touch"] = now
+        self._sl_touched = True
+        i = self._slime_idx(sl, x, y)
+        # 집는 순간의 손끝과 입자 사이 어긋남을 기억해 둔다. 안 그러면 누르는
+        # 순간 덩어리가 손끝으로 톡 튄다.
+        self._slime_grab = {"i": i, "x": x, "y": y, "moved": 0.0,
+                            "ox": sl["x"][i] - x, "oy": sl["y"][i] - y}
+        self._slime_px = 0.0
+        self._slime_grain = now
+        # 누르는 순간 그 자리를 안쪽으로 살짝 눌러 준다. 집을 때의 어긋남을
+        # 그대로 두면 끌기 전까지 아무 일도 안 일어나 '눌러도 반응이 없다'가
+        # 된다 (어긋남은 덩어리가 손끝으로 톡 튀는 것을 막으려고 둔 것이다).
+        n = self.SL_N
+        dent = sl["r"] * 0.20 * (1.0 - self._sl_stiff * 0.5)
+        ccx = sum(sl["x"]) / n
+        ccy = sum(sl["y"]) / n
+        for k in range(-2, 3):
+            j = (i + k) % n
+            w = 1.0 - abs(k) / 3.0
+            ddx, ddy = ccx - sl["x"][j], ccy - sl["y"][j]
+            d = math.hypot(ddx, ddy) or 1.0
+            sl["vx"][j] += ddx / d * dent * w
+            sl["vy"][j] += ddy / d * dent * w
+        self._slime_sound("press", random.uniform(0.94, 1.08))
+        self.smile_until = max(self.smile_until, now + 0.9)
+        return True
+
+    def _slime_move(self, x, y):
+        """끄는 중 — 잡은 자리가 손끝을 따라 늘어난다."""
+        sl = self.slime
+        g = self._slime_grab
+        if sl is None or g is None:
+            return
+        now = time.time()
+        sl["touch"] = now
+        d = math.hypot(x - g["x"], y - g["y"])
+        g["x"], g["y"], g["moved"] = x, y, g["moved"] + d
+        self._slime_px += d
+        if self._slime_px >= self.SL_GRAIN_PX and now - self._slime_grain > 0.05:
+            self._slime_px = 0.0
+            self._slime_grain = now
+            lv = 2 if d > 6 else (1 if d > 2 else 0)
+            self._slime_sound("stretch", random.uniform(0.9, 1.15), lv)
+
+    def _slime_release(self):
+        """손을 뗀 순간 — 늘어난 만큼 튕겨 돌아온다."""
+        sl = self.slime
+        g = self._slime_grab
+        self._slime_grab = None
+        if sl is None or g is None:
+            return
+        # 놓는 순간 잡고 있던 쪽에 살짝 되튀는 기운을 준다. 자리를 잡아 주는
+        # 것은 어차피 모양 제약이므로, 여기서는 출렁임만 얹는다.
+        n = self.SL_N
+        for k in range(-n // 3, n // 3 + 1):
+            j = (g["i"] + k) % n
+            # 단단할수록 되튀지 않는다 (고체는 놓아도 출렁이지 않는다)
+            kick = 0.06 * (1.0 - self._sl_stiff)
+            sl["vx"][j] += (sl["cx"] - sl["x"][j]) * kick
+            sl["vy"][j] += (sl["cy"] - sl["y"][j]) * kick
+        if g["moved"] > 10:
+            self._slime_sound("pop", random.uniform(0.92, 1.10))
+        sl["touch"] = time.time()
+
+    def _slime_tick(self, now):
+        """말랑말랑 물리."""
+        sl = self.slime
+        if sl is None:
+            return
+        # 만지다가 다른 창을 클릭하면 그 자리에서 치운다 — 슬라임을 두고
+        # 작업으로 돌아간 것이므로 90초를 기다릴 이유가 없다.
+        #   · 한 번도 안 만졌으면 두는 것은, 메뉴로 꺼낸 직후에는 앞 창이
+        #     아직 작업 프로그램일 수 있어 꺼내자마자 사라지기 때문이다.
+        #   · 맥은 자기 창인지 가릴 방법이 없어(_fg_is_self가 늘 False)
+        #     여기서 빼 둔다. 아래 90초는 그대로 도니 결국은 치워진다.
+        if (IS_WIN and self._sl_touched and self._slime_grab is None
+                and now - self._sl_fg > 0.15):
+            self._sl_fg = now
+            if not self._fg_is_self():
+                self._slime_close()
+                return
+        if now - sl["touch"] > self.SL_IDLE:
+            self._slime_close()
+            return
+        # 프레임 간격이 30/15/10fps로 바뀌므로, 흐른 시간만큼 나눠 돌린다.
+        # 안 그러면 조용할 때 출렁임이 세 배로 느려진다.
+        steps = int(max(1, min(3, round((now - self._slime_step) / 0.033))))
+        self._slime_step = now
+        for _ in range(steps):
+            self._slime_solve(sl)
+        n = self.SL_N
+        sl["cx"] = sum(sl["x"]) / n
+        sl["cy"] = sum(sl["y"]) / n
+
+    def _slime_solve(self, sl):
+        """한 걸음 — 자리를 먼저 예측하고 제약을 몇 번 풀어 다시 앉힌다.
+
+        힘을 더하는 대신 자리를 직접 고치는 방식(위치 기반)이라, 세게 잡아
+        끌어도 발산하지 않는다. 제약은 세 가지다.
+          ① 변 길이 — 이웃끼리 너무 벌어지거나 붙지 않게 (찢어짐 방지)
+          ② 넓이   — 길게 늘이면 가운데가 가늘어지게 (부피가 있는 것처럼)
+          ③ 모양   — 원래 타원으로, 제자리로 돌아오려는 힘
+        잡고 있는 입자는 마지막에 손끝에 그대로 박아 둔다.
+        """
+        n = self.SL_N
+        x, y, vx, vy = sl["x"], sl["y"], sl["vx"], sl["vy"]
+        qx = [x[i] + vx[i] for i in range(n)]
+        qy = [y[i] + vy[i] for i in range(n)]
+        edge = sl["edge"]
+        g = self._slime_grab
+        pin = {}
+        if g is not None:
+            # 집은 자리는 손끝을 따라 '둘레를 타고' 한 칸씩 미끄러진다.
+            # 한 입자를 붙든 채로 덩어리를 가로지르면 그 입자가 반대편으로
+            # 넘어가 둘레가 8자로 꼬이고, 겹친 자리가 뚫린 것처럼 칠해진다.
+            # 사람이 슬라임 위에서 손가락을 미끄러뜨리는 것과 같은 모양이다.
+            # 집을 때의 어긋남은 걸음마다 지운다. 끌 때만 지우면 가만히
+            # 누르고 있을 때 핀이 원래 자리로 되당겨 아무 일도 안 난다.
+            g["ox"] *= 0.86
+            g["oy"] *= 0.86
+            gi = g["i"]
+            near = self._slime_idx(sl, g["x"], g["y"])
+            if near != gi:
+                fwd = (near - gi) % n
+                gi = (gi + (1 if fwd <= n - fwd else -1)) % n
+                g["i"] = gi
+            # 손가락은 점 하나가 아니라 좁은 면으로 집는다. 가운데와 양옆
+            # 몇 개를 함께 쥐어야 집힌 자리가 바늘처럼 안 뾰족해진다.
+            gx, gy = g["x"] + g["ox"], g["y"] + g["oy"]
+            # 손끝을 먼저 매트 안으로 들인다. 매트 밖을 짚게 두면 그 자리에
+            # 못 가는 입자들이 벽에 죄다 눌어붙어 모양이 납작하게 무너진다.
+            x0, x1, y0, y1 = sl["lim"]
+            gx = min(max(gx, x0), x1)
+            gy = min(max(gy, y0), y1)
+            # 너무 멀리는 못 따라간다 — 끝까지 늘어나면 손에서 미끄러진다
+            dx, dy = gx - sl["hx"], gy - sl["hy"]
+            far = math.hypot(dx, dy)
+            reach = sl["r"] * self._sl_reach
+            if far > reach:
+                gx = sl["hx"] + dx / far * reach
+                gy = sl["hy"] + dy / far * reach
+            # 한 걸음에 옮길 수 있는 거리를 제한한다. 손끝으로 곧장
+            # 순간이동시키면 덩어리를 관통해 둘레가 꼬인다 — 조금씩 끌려가야
+            # 이웃들이 따라올 틈이 생긴다.
+            step = sl["r"] * self._sl_step
+            dx, dy = gx - sl["x"][gi], gy - sl["y"][gi]
+            d = math.hypot(dx, dy)
+            if d > step:
+                gx = sl["x"][gi] + dx / d * step
+                gy = sl["y"][gi] + dy / d * step
+            if self._sl_stiff > 0.05:
+                # 단단할수록 통째로 끌려온다 — 한 자리만 늘어나지 않는다
+                mx = (gx - qx[gi]) * 0.5 * self._sl_stiff
+                my = (gy - qy[gi]) * 0.5 * self._sl_stiff
+                for i in range(n):
+                    qx[i] += mx
+                    qy[i] += my
+            for k in range(-self.SL_GRIP, self.SL_GRIP + 1):
+                j = (gi + k) % n
+                pin[j] = (gx + (sl["rx"][j] - sl["rx"][gi]) * 0.5,
+                          gy + (sl["ry"][j] - sl["ry"][gi]) * 0.5)
+        for _ in range(self.SL_ITER):
+            # ① 변 길이
+            k = self._sl_edge * 0.5
+            for i in range(n):
+                j = (i + 1) % n
+                dx, dy = qx[j] - qx[i], qy[j] - qy[i]
+                d = math.hypot(dx, dy) or 1e-6
+                want = min(d, edge[i] * self._sl_stretch)
+                want = max(want, edge[i] * 0.72)
+                s = (d - want) / d * k
+                ax, ay = dx * s, dy * s
+                qx[i] += ax
+                qy[i] += ay
+                qx[j] -= ax
+                qy[j] -= ay
+            # ② 파인 자리가 스스로 맞닿아 겹치지 않게 — 번호가 가까운
+            #    이웃끼리만 최소 간격을 둔다. 위로 잡아당기면 V자 홈이
+            #    생기는데 그 양쪽이 맞물리면 둘레가 꼬여 '영역이 뒤집힌'
+            #    모양이 된다. 가늘게 늘인 가닥의 양면은 번호가 반 바퀴만큼
+            #    떨어져 있으므로 이 제약에 걸리지 않는다.
+            near = sl["near"]
+            n2 = near * near
+            for i in range(n):
+                xi, yi = qx[i], qy[i]
+                for k in range(3, 12):
+                    j = (i + k) % n
+                    dx, dy = qx[j] - xi, qy[j] - yi
+                    d2 = dx * dx + dy * dy
+                    if 1e-9 < d2 < n2:
+                        d = math.sqrt(d2)
+                        push = (near - d) / d * 0.5
+                        ax, ay = dx * push, dy * push
+                        qx[i] = xi = xi - ax
+                        qy[i] = yi = yi - ay
+                        qx[j] += ax
+                        qy[j] += ay
+            # ③ 넓이 — 모자란 만큼 둘레를 바깥으로 밀어낸다
+            area = self._poly_area(qx, qy)
+            peri = 0.0
+            for i in range(n):
+                j = (i + 1) % n
+                peri += math.hypot(qx[j] - qx[i], qy[j] - qy[i])
+            if peri > 1e-6:
+                push = (sl["area"] - area) / peri * self._sl_area
+                for i in range(n):
+                    a, b = (i - 1) % n, (i + 1) % n
+                    tx, ty = qx[b] - qx[a], qy[b] - qy[a]
+                    d = math.hypot(tx, ty) or 1e-6
+                    qx[i] += ty / d * push        # 바깥쪽 법선
+                    qy[i] += -tx / d * push
+            # ④ 모양 — 원래 타원 자리로 조금씩 당긴다.
+            a0 = self._sl_shape
+            if pin:
+                # 잡고 있는 동안 무른 것은 손에서 먼 쪽이 매트에 붙어 버틴다 —
+                # 그래야 한쪽에서 가닥이 뽑힌다. 반대로 단단한 고체는 그러면
+                # 안 된다. 먼 쪽은 제자리로, 가까운 쪽은 손으로 당겨져 서로
+                # 줄다리기를 하면서 끄는 내내 출렁이기 때문이다. 단단할수록
+                # 기준점을 '지금 자리'로 옮겨 통째로 따라가게 한다.
+                gi = self._slime_grab["i"]
+                half = n * 0.5
+                # 기준점을 지금 자리 쪽으로 옮기되 끝까지 옮기지는 않는다.
+                # 완전히 옮기면 제자리로 돌아오려는 힘이 사라져 덩어리가
+                # 책상 위를 미끄러져 다닌다.
+                st = self._sl_stiff * 0.8
+                ax = sl["hx"] + (sum(qx) / n - sl["hx"]) * st
+                ay = sl["hy"] + (sum(qy) / n - sl["hy"]) * st
+                for i in range(n):
+                    far = min((i - gi) % n, (gi - i) % n) / half
+                    a = a0 * (0.10 + 0.90 * far + 0.90 * st * (1.0 - far))
+                    qx[i] += (ax + sl["rx"][i] - qx[i]) * a
+                    qy[i] += (ay + sl["ry"][i] - qy[i]) * a
+            else:
+                # 놓은 뒤에는 지금 중심을 기준으로 모양을 되찾으면서,
+                # 중심 자체도 제자리 쪽으로 천천히 끌려온다.
+                cx = sum(qx) / n
+                cy = sum(qy) / n
+                tx = cx + (sl["hx"] - cx) * self.SL_HOME
+                ty = cy + (sl["hy"] - cy) * self.SL_HOME
+                for i in range(n):
+                    qx[i] += (tx + sl["rx"][i] - qx[i]) * a0
+                    qy[i] += (ty + sl["ry"][i] - qy[i]) * a0
+            for i, (px_, py_) in pin.items():
+                qx[i] += (px_ - qx[i]) * self._sl_pin
+                qy[i] += (py_ - qy[i]) * self._sl_pin
+        # ⑤ 한 걸음에 옮길 수 있는 거리를 입자마다 제한한다.
+        #    ②처럼 거리로 밀어내는 제약은 '아직 안 겹친 것'만 막을 수 있고,
+        #    한 걸음에 서로를 뚫고 지나가 버린 둘레는 풀지 못한다 — 밀어내
+        #    봐야 이미 반대편에 가 있어서 겹친 채로 벌어질 뿐이다. 그래서
+        #    애초에 못 뚫도록 한 걸음 폭을 최소 간격보다 크지 않게 묶는다.
+        #    실측(마구 끌기 80판): 겹친 넓이 최대 2.9% → 0.1%,
+        #    늘어나는 정도(95px)와 가닥 굵기(40px)는 그대로였다.
+        cap = sl["near"]
+        for i in range(n):
+            dx, dy = qx[i] - x[i], qy[i] - y[i]
+            d = math.hypot(dx, dy)
+            if d > cap:
+                qx[i] = x[i] + dx / d * cap
+                qy[i] = y[i] + dy / d * cap
+        # 매트 밖으로는 못 나간다 (책상 위에서만 논다)
+        x0, x1, y0, y1 = sl["lim"]
+        for i in range(n):
+            qx[i] = min(max(qx[i], x0), x1)
+            qy[i] = min(max(qy[i], y0), y1)
+        damp = self._sl_damp
+        for i in range(n):
+            vx[i] = (qx[i] - x[i]) * damp
+            vy[i] = (qy[i] - y[i]) * damp
+            x[i], y[i] = qx[i], qy[i]
+        # 다 잦아들었으면 아주 작은 떨림은 지운다 (가만히 있을 때 안 떨리게)
+        if g is None and max(map(abs, vx)) < 0.05 and max(map(abs, vy)) < 0.05:
+            for i in range(n):
+                vx[i] = vy[i] = 0.0
+
+    def _draw_slime(self, now):
+        """매트를 펼치고 그 위에 슬라임을 그린다."""
+        sl = self.slime
+        c = self.canvas
+        got = self._slime_mat()
+        if not got:
+            self.slime = None
+            return
+        steps = got[0]
+        col, mat = self._slime_color()
+        # 펼쳐지는 0.35초 — 상판이 위에서 아래로 하얗게 칠해진다
+        t = min(1.0, (now - sl["born"]) / 0.35)
+        ease = 1.0 - (1.0 - t) ** 2
+        dxp, dyp = self._pos("desk")
+        q = min(len(steps) - 1, int(ease * len(steps)))
+        c.create_image(dxp, dyp, image=steps[q], anchor="nw")
+        if ease < 0.55:
+            return                        # 아직 다 안 펴졌으면 슬라임은 뒤에
+        self._draw_blob(now, col, mat, min(1.0, (ease - 0.55) / 0.45))
+
+    def _draw_blob(self, now, col, mat, grow=1.0):
+        sl = self.slime
+        c = self.canvas
+        n = self.SL_N
+        cx, cy = sl["cx"], sl["cy"]
+        k = 0.35 + 0.65 * grow            # 꺼낼 때 중심에서 부풀어 오른다
+        ring = [(cx + (sl["x"][i] - cx) * k, cy + (sl["y"][i] - cy) * k)
+                for i in range(n)]
+        xs = [p[0] for p in ring]
+        ys = [p[1] for p in ring]
+        # 바닥 그림자 — 슬라임보다 먼저. 지금 실루엣을 따라가되 아래쪽에만
+        # 깔리게 눌러 그린다 (덩어리 크기로 고정하면 늘였을 때 따로 논다).
+        c.create_oval(min(xs) + 2, cy + (max(ys) - cy) * 0.45,
+                      max(xs) - 2, cy + (max(ys) - cy) * 1.02,
+                      fill=self._shade(mat, 0.13), outline="")
+        flat = [v for p in ring for v in p]
+        c.create_polygon(*flat, fill=col, outline=self._shade(col, 0.52),
+                         width=2, smooth=True, splinesteps=6)
+        look = self._slime_look()
+        if look.get("label") == "butter":
+            # 버터 한 조각 — 불투명한 재질이라 윤기 점은 안 그린다.
+            self._draw_butter(col, ring, xs, ys, cx, cy)
+            return
+        if look.get("label") == "cheese":
+            self._draw_cheese(col, ring, cx, cy, k)
+            return
+        # 윤기 — 왼쪽 위에 두 점. 덩어리 안의 점이라 늘이면 같이 딸려 간다.
+        wob = math.sin(now * 2.3) * 0.05
+        hi = self._mix("#ffffff", col, 0.16)      # 거의 흰색이라야 윤기로 보인다
+        rr0 = sl["r"] * k
+        for a, rr, wx, wy in ((3.95, 0.58, 0.20, 0.11), (4.42, 0.50, 0.07, 0.04)):
+            hx, hy = self._slime_pt(sl, a + wob, rr)
+            hx, hy = cx + (hx - cx) * k, cy + (hy - cy) * k
+            c.create_oval(hx - rr0 * wx, hy - rr0 * wy,
+                          hx + rr0 * wx, hy + rr0 * wy,
+                          fill=hi, outline="")
+
+    def _draw_cheese(self, col, ring, cx, cy, k):
+        """치즈 한 덩이 — 윗면(밝은 띠)과 숭숭 뚫린 구멍.
+
+        구멍은 덩어리 안의 점이라 누르거나 늘이면 같이 딸려 간다. 매끈한
+        재질이라 반투명 윤기 대신 구멍의 그늘로 두께를 보인다.
+        """
+        c = self.canvas
+        sl = self.slime
+        n = len(ring)
+        top = [i for i in range(n) if sl["ry"][i] < 0]
+        if len(top) > 2:
+            band = [ring[i] for i in top]
+            band += [(px, cy + (py - cy) * 0.34) for px, py in reversed(band)]
+            c.create_polygon(*[v for p in band for v in p],
+                             fill=self._mix("#ffffff", col, 0.45), outline="",
+                             smooth=True, splinesteps=4)
+        deep = self._shade(col, 0.20)         # 구멍 안쪽 그늘
+        lip = self._mix("#ffffff", col, 0.35)  # 구멍 아래쪽에 닿는 빛
+        for a, rr, sz in sl.get("holes", ()):
+            hx, hy = self._slime_pt(sl, a, rr)
+            hx, hy = cx + (hx - cx) * k, cy + (hy - cy) * k
+            r0 = sl["r"] * sz * k
+            if r0 < 1.2:
+                continue
+            c.create_oval(hx - r0, hy - r0 * 0.82, hx + r0, hy + r0 * 0.82,
+                          fill=deep, outline="")
+            c.create_oval(hx - r0 * 0.62, hy - r0 * 0.10,
+                          hx + r0 * 0.62, hy + r0 * 0.62,
+                          fill=lip, outline="")
+
+    BUTTER_INK = "#2b4fd0"           # 버터 포장 글씨의 파랑
+
+    def _draw_butter(self, col, ring, xs, ys, cx, cy):
+        """버터 한 조각 — 윗면(밝은 띠)과 파란 글씨.
+
+        불투명한 재질이라 반투명 윤기는 안 넣는다. 글씨는 판에 인쇄된 것이라
+        덩어리를 따라 움직이기만 하고 일그러지지는 않는다 — 그래서 이 종류는
+        단단하게(stiff) 두어 모양이 크게 안 변하도록 짝을 맞춰 놓았다.
+        """
+        c = self.canvas
+        n = len(ring)
+        x0, x1, y0, y1 = min(xs), max(xs), min(ys), max(ys)
+        w, h = x1 - x0, y1 - y0
+        if w < 12 or h < 6:
+            return
+        # 윗면 — 둘레의 위쪽 절반을 안쪽으로 접어 만든 띠
+        # 기준 모양에서 위쪽이던 번호를 쓴다. '지금 y가 중심보다 위'로
+        # 고르면 찌그러졌을 때 번호가 흩어져 렌즈 같은 헛것이 그려진다.
+        sl = self.slime
+        top = [i for i in range(n) if sl["ry"][i] < 0]
+        if len(top) > 2:
+            band = [ring[i] for i in top]
+            band += [(px, cy + (py - cy) * 0.30) for px, py in reversed(band)]
+            c.create_polygon(*[v for p in band for v in p],
+                             fill=self._mix("#ffffff", col, 0.55), outline="",
+                             smooth=True, splinesteps=4)
+        # 포장 글씨 — 인쇄된 것이라 크기는 '원래 조각 크기'로 고정한다.
+        # 지금 실루엣에 맞추면 누를 때마다 글자가 커졌다 작아졌다 한다.
+        bw = sl["r"] * 2.0 * float(self._slime_look().get("bar_w", 1.30))
+        ink = self.BUTTER_INK
+        big = self._pt_fit("BUTTER", bw * 0.40, True)
+        if big is None:
+            return                        # 너무 작아 글자가 뭉개진다
+        left = self._pt_fit("4oz.", bw * 0.24, True)
+        salt = self._pt_fit("SALTED", bw * 0.26)
+        tiny = self._pt_fit("NET WT.(113G)", bw * 0.36)
+        row = cy + h * 0.06
+        c.create_text(cx + bw * 0.22, row, text="BUTTER", fill=ink,
+                      font=big, anchor="center")
+        if left:
+            c.create_text(cx - bw * 0.26, row, text="4oz.", fill=ink,
+                          font=left, anchor="center")
+        if salt:
+            c.create_text(cx + bw * 0.20, row - h * 0.28, text="SALTED",
+                          fill=ink, font=salt, anchor="center")
+        if tiny:
+            c.create_text(cx - bw * 0.20, row + h * 0.26, text="NET WT.(113G)",
+                          fill=ink, font=tiny, anchor="center")
+
+    def _pt_fit(self, text, max_w, bold=False):
+        """그 폭에 들어가는 가장 큰 Arial 글꼴. 6px 밑으로 가면 None."""
+        for n in range(14, 4, -1):
+            f = ("Arial", n, "bold") if bold else ("Arial", n)
+            if self._mw(text, f) <= max_w:
+                return f
+        return None
+
+    def _quad_xy(self, u, v):
+        (tlx, tly), (trx, try_), (brx, bry), (blx, bly) = self.quad
+        top = (tlx + (trx - tlx) * u, tly + (try_ - tly) * u)
+        bot = (blx + (brx - blx) * u, bly + (bry - bly) * u)
+        return (top[0] + (bot[0] - top[0]) * v,
+                top[1] + (bot[1] - top[1]) * v)
+
+    def _pos(self, name):
+        x, y = self.layout[name]["pos"]
+        return x * self.s + self.ox, y * self.s + self.oy
+
+    def _arm_deg(self, dx, dy, which="r"):
+        """어깨→손끝 방향으로 팔이 돌아간 각도 (손도 같은 각도로 돌린다)."""
+        e = self._arm_src.get(which)
+        if e is None:
+            return 0.0
+        nx, ny = e[1]
+        return math.degrees(math.atan2(dx, dy) - math.atan2(nx, ny))
+
+
+    def _pen_at_tip(self, tx, ty, deg):
+        """펜 쥔 손을 팔 손끝(tx, ty)에 붙여 팔과 같은 각도로 그린다."""
+        e = self._pen_rot
+        if e is None:
+            return False
+        k = round(deg)
+        if k not in e["cache"]:
+            if len(e["cache"]) > 90:
+                e["cache"].clear()
+            e["cache"][k] = ImageTk.PhotoImage(
+                self._hard(e["pil"].rotate(k, resample=self._resample())))
+        self.canvas.create_image(tx, ty, image=e["cache"][k], anchor="center")
+        return True
+
+    ARM_CACHE_MAX = 500          # 늘인 팔 그림 캐시 상한 (한 장이 꽤 크다)
+    TILT_CACHE_MAX = 30          # 기울인 머리 판 (한 장 1.1MB)
+
+    def _stretched_arm(self, dx, dy, which="r"):
+        """어깨에서 손끝까지를 잇도록 늘이고 돌린 팔 그림.
+
+        which — "r" 오른팔, "rm" 오른팔 좌우반전(안쪽으로 모을 때), "l" 왼팔.
+        """
+        e = self._arm_src.get(which)
+        if e is None:
+            return None
+        src, (nx, ny), atop, _abot = e
+        nat_len = max(math.hypot(nx, ny), 8.0)
+        cur_len = max(math.hypot(dx, dy), 8.0)
+        k = max(0.25, min(3.0, cur_len / nat_len))   # 늘이기 배율 상한선
+        deg = math.degrees(math.atan2(dx, dy) - math.atan2(nx, ny))
+        key = (round(k * 25), round(deg), which)
+        hit = self._arm_cache.get(key)
+        if hit is None:
+            if len(self._arm_cache) > self.ARM_CACHE_MAX:
+                # 통째로 비우면 다음 프레임부터 다시 수백 장을 만드느라
+                # 메모리가 계단처럼 뛴다(실측 200MB까지). 오래된 절반만
+                # 버리면 자주 쓰는 각도는 남아서 다시 만드는 양이 적다.
+                for _old in list(self._arm_cache)[:self.ARM_CACHE_MAX // 2]:
+                    del self._arm_cache[_old]
+            w, h = src.size
+            nh = max(8, round(h * k))
+            im = src.resize((w, nh), Image.LANCZOS)
+            im = im.rotate(deg, expand=True, resample=self._resample())
+            # 돌린 그림 안에서 '어깨 접합점'이 어디로 갔는지 따라간다. 이걸
+            # 안 하고 가운데에 맞춰 그리면 팔을 늘일수록 어깨가 몸에서 떨어져
+            # 그 사이로 머리카락과 배경이 비친다.
+            a = math.radians(deg)
+            ox_ = atop[0] - w / 2.0
+            oy_ = atop[1] * k - nh / 2.0
+            rx = ox_ * math.cos(a) + oy_ * math.sin(a) + im.width / 2.0
+            ry = -ox_ * math.sin(a) + oy_ * math.cos(a) + im.height / 2.0
+            hit = (ImageTk.PhotoImage(self._hard(im)), (rx, ry))
+            self._arm_cache[key] = hit
+        return hit
+
+    def draw(self, now):
+        c = self.canvas
+        c.delete("all")
+        f = self._force
+
+        idle = idle_seconds()
+        sleeping = idle > max(float(self.us["sleep_min"]), 1) * 60 or f.get("sleep", False)
+        self._sleeping = sleeping        # tick의 프레임 간격 조절용
+
+        if sleeping:
+            breathe = math.sin(now * 1.1) * 2.5     # 자는 동안은 느리고 깊게
+        else:
+            breathe = math.sin(now * 2.0) * 1.5
+        # 몸짓 값은 여기서 먼저 지운다. _gest_tick 안에서만 지우면, 그 구역이
+        # 세 번 터져 꺼졌을 때 마지막 자세가 그대로 남아 캐릭터가 굳는다.
+        self._g_dy = self._g_hdy = self._g_tilt = 0.0
+        self._g_hands = None
+        self._g_eyes_shut = self._g_smile = False
+        if self._tray_q:
+            self._safe("tray_tick", self._tray_tick)
+        self._safe("stretch", self._stretch_tick, now, sleeping)
+        self._safe("gesture", self._gest_tick, now, sleeping)
+        self._safe("goal", self._goal_tick, now)
+        squash = 3 if now < self.squash_until else 0
+        yo = breathe + squash + self._g_dy
+        if self.fun and now < self.click_bounce:      # 클릭 반응: 콩 하고 튐
+            t = (self.click_bounce - now) / 0.45
+            yo -= math.sin(t * math.pi) * 7
+
+        cx, cy = cursor_pos()
+        wx = self.root.winfo_rootx() + self.W // 2
+        wy = self.root.winfo_rooty() + self.H // 2
+        pdx = max(-5, min(5, (cx - wx) / 60))
+        pdy = max(-3, min(4, (cy - wy) / 90))
+        # 몸짓 중에는 눈동자를 가운데로 모은다. 고개를 기울이면 미리 합쳐 둔
+        # 머리(눈동자가 가운데에 구워져 있다)로 그려지는데, 기울기가 0 근처를
+        # 오갈 때마다 두 방식이 번갈아 쓰여 눈동자가 대각선으로 튄다.
+        if self.gest is not None:
+            pdx = pdy = 0.0
+
+        pen_typing = (now - self.last_pointer > 2.0) and (now - self.last_key < 1.8)
+        if "pen" in f or f.get("type"):
+            pen_typing = bool(f.get("type"))
+        # 타자 칠 때는 깃펜이 사라지므로 그 자리의 그림자도 같이 없앤다.
+        # 다만 pen_typing은 마우스가 조금만 움직여도 뒤집히므로, 상태가
+        # 잠시 유지된 뒤에만 교체한다 (매번 바꾸면 그림자가 깜빡인다).
+        if pen_typing != self._shadow_want:
+            self._shadow_want = pen_typing
+            self._shadow_since = now
+        elif (self.shadow is not None and self.shadow_img_type is not None
+                and pen_typing != self._shadow_typing
+                and now - self._shadow_since > 0.5
+                and now - self._shadow_swap > 0.7):
+            self._shadow_typing = pen_typing
+            self._shadow_swap = now
+            self._shadow_base = self.shadow_img_type if pen_typing else self.shadow_img
+            if not self._pet_sh_on:
+                self.shadow.set_image(self._shadow_base)
+
+        blinking = (sleeping or now < self.blink_until or self._g_eyes_shut
+                    or f.get("blink", False)) \
+            and (self.blink_cfg is not None or self.has.get("eyes_closed"))
+        smiling = bool(self.has.get("smile")
+                       and (now < self.smile_until or self._g_smile
+                            or self._stretch_hover
+                            or f.get("smile", False)))
+        if smiling:
+            blinking = False
+
+        self._pet_drawn = []
+        try:
+            state = self._timer_tick(now, idle) if self.timer_on else "idle"
+        except Exception:
+            state, _ = "idle", self._log_error("timer_tick")
+        # 아래는 모두 구역 격리 — 하나가 터져도 캐릭터 본체는 그려진다
+        self._safe("greet", self._greet_tick, now, state)
+        self._safe("inbox_back", self._inbox_welcome, now)
+        self._safe("fun_tick", self._fun_tick, now, state, sleeping)
+        if self.timer_on:
+            self._safe("timer", self._draw_timer, state, sleeping, now)
+            # 버튼 자리는 구역 밖에서 지운다. 이 구역이 꺼졌을 때 옛 자리가
+            # 남으면, 버튼이 안 보이는데도 그 자리를 누르면 음악이 켜진다.
+            self._yt_btn = None
+            self._safe("music_btn", self._draw_music_btn)
+            # 점 자리도 구역 밖에서 지운다 — 이 구역이 꺼졌을 때 옛 자리가
+            # 남으면 점이 안 보이는데도 그 자리를 누르면 창이 뜬다
+            self._dot_btn = None
+            self._safe("update_dot", self._draw_update_dot)
+
+        # ── 몸 (+머리 없는 캐릭터는 여기서 얼굴까지) ─────────────────────
+        # 개는 머리를 팔 위에 그려야 어깨가 안 튀어나오므로, 얼굴을 팔 뒤로 미룬다.
+        head_early = bool(self.cfg.get("arms_over_head") and self.has.get("head"))
+        # 몸 뒤 파츠(사가 양갈래·기뽀 날개) — 몸보다 먼저, 살아 있게 움직인다.
+        # 소품의 뒤쪽 조각(악마 꼬리·천사 날개)은 그 위에 겹쳐 그린다.
+        # 예전에는 둘 중 하나만 그렸다(elif). back.png 의 뜻이 캐릭터마다
+        # 달라서 — 기뽀는 날개지만 사가는 양갈래다 — 뒤조각 있는 소품이
+        # 뽑히면 사가의 머리카락이 통째로 사라졌다 (열넷 중 셋).
+        # 겹쳐 보이는 게 싫은 캐릭터는 config 의 back_hide_on_prop 로 끈다.
+        if self.has.get("back"):
+            self._safe("back", self._draw_back, now, yo)
+        if self.has.get("prop_back"):
+            self._safe("prop_back", self._draw_prop_back, now, yo)
+        bx, by = self._pos("body_open")
+        self._safe("body", self._put, "body_open", bx, by + yo)
+        if not self.has.get("head"):
+            self._safe("face", self._draw_face, yo, pdx, pdy, blinking, smiling)
+        elif head_early:                # 준사: 책상·팔이 머리 위 (PSD 순서)
+            self._safe("head", self._draw_head, now, yo, pdx, pdy,
+                       blinking, smiling, sleeping)
+
+        # 반려동물은 책상 바로 앞(=책상에 가려지게) 그린다
+        if not self.cfg.get("pet_front"):
+            self._safe("pet", self._draw_pet, now)
+
+        # ── 책상 (+옵션: 화면 낙서) ──────────────────────────────────────
+        dx_, dy_ = self._pos("desk")
+        self._safe("desk", self._put, "desk", dx_, dy_)
+        if self.slime is not None:
+            # 여기는 _safe에 맡기지 않는다. 구역이 꺼지면 매트만 덮인 채로
+            # 굳어 책상이 영영 안 돌아온다 (지뢰 14). 터지면 그냥 치운다.
+            try:
+                self._slime_tick(now)
+                if self.slime is not None:
+                    self._draw_slime(now)
+            except Exception:
+                self.slime = None
+                self._slime_grab = None
+                self._log_error("slime")
+        # 슬라임을 꺼내 놓은 동안에는 타블렛이 매트에 덮여 있으니 낙서도 없다
+        if self.us.get("trail") and self.slime is None:
+            if self.strokes and now - self.last_drag > 12:
+                self.strokes = []
+            for st in self.strokes:
+                if len(st) >= 2:
+                    c.create_line(*[v for p in st for v in p],
+                                  fill=self.cfg.get("trail_color", "#8fd0ff"),
+                                  width=2, smooth=True)
+                elif st:
+                    px, py = st[0]
+                    c.create_oval(px - 1, py - 1, px + 1, py + 1,
+                                  fill=self.cfg.get("trail_color", "#8fd0ff"),
+                                  outline="")
+        else:
+            self.strokes = []
+
+        # 앞으로 나오는 반려동물: 얼굴 위 · 팔 아래 (책상선 마스크는 그대로)
+        if self.cfg.get("pet_front"):
+            self._safe("pet", self._draw_pet, now)
+
+        self._safe("arms", self._draw_arms, now, f, yo, pen_typing, cx, cy)
+
+        if self.has.get("scarf"):       # 목도리 — 팔 위, 머리 아래
+            sx, sy = self._pos("scarf")
+            self._safe("scarf", self._put, "scarf", sx, sy + yo)
+
+        # ── 머리(팔 위) + 얼굴 — 개처럼 머리를 분리한 캐릭터 ──────────────
+        # 머리를 팔보다 위에 그려 어깨가 머리 밖으로 튀어나오지 않게 한다.
+        if self.has.get("head") and not head_early:
+            self._safe("head", self._draw_head, now, yo, pdx, pdy,
+                       blinking, smiling, sleeping)
+        if self.cfg.get("pen_over_head"):     # 퀸시: 깃펜이 맨 위 레이어
+            self._safe("pen_hand", self._draw_pen_hand)
+        if self._g_hands is not None:        # 제스처 손 — 머리보다 위
+            self._safe("gesture_arms", self._draw_gesture_arms, yo)
+
+        # 수면 모드: 머리 위쪽에 둥실거리는 zzZ (머리보다 위에 그린다)
+        if sleeping:
+            fs = self._fx_scale          # 앉은 모습을 구울 때는 크게 (홈 카드용)
+            hx0, hy0, hx1, hy1 = self._head_box
+            zx = min(hx1 - 14 * fs, self.W - 42 * fs)
+            zy = hy0 + self.oy + yo + 10
+            for i, (dx, dy, size, color) in enumerate((
+                    (0, 22, 10, "#aab7cc"),
+                    (13, 4, 13, "#93a4c2"),
+                    (28, -16, 16, "#7c90b5"))):
+                bob = math.sin(now * 1.6 + i * 0.9) * 3
+                c.create_text(zx + dx * fs, zy + dy * fs + bob,
+                              text="z" if i == 0 else "Z",
+                              font=(UI_FONT, int(size * fs), "bold"),
+                              fill=color)
+
+        if self.notes:                  # 음표는 머리보다 위로 떠오른다
+            self._safe("notes", self._draw_notes)
+        elif self._fx is not None:
+            # 다 사라졌는데 레이어를 안 감추면 마지막 모습이 그대로 남는다
+            self._safe("notes", self._fx.hide)
+
+        # ── 귀여운 연출: 고깔모자 → 폭죽 → 말풍선 (맨 위) ────────────────
+        if self.fun:
+            self._safe("hat", self._draw_hat, yo)
+        if self.stretch_pending:
+            self._safe("tap_ring", self._draw_tap_ring, now)
+        if self.can_talk:
+            self._safe("particles", self._draw_particles)
+            self._safe("bubble", self._draw_bubble, yo)
+        # 남이 눌러 준 연출은 캐릭터 위에 얹는다. draw() 안에서 그려야 한다 —
+        # 밖에서 그리면 다음 draw() 의 delete("all") 에 바로 지워진다.
+        self._snack_box = None      # 구역 밖에서 지운다 (지뢰 14)
+        self._safe("snack_on", self._draw_snack_on, now)
+        self._safe("char_fx", self._draw_char_fx, now)
+        self._safe("pet_shadow", self._update_pet_shadow)
+
+    AUTO_MON = "자동 (커서가 있는 화면)"
+
+    def monitor_names(self):
+        """환경설정에 보여 줄 화면 목록. 열 때마다 다시 잰다(연결이 바뀌므로)."""
+        out = [self.AUTO_MON]
+        for i, r in enumerate(list_monitors(), 1):
+            out.append(f"{i}번 화면 {r[2] - r[0]}x{r[3] - r[1]}")
+        return out
+
+    def _pen_mon_rect(self):
+        """펜이 따라갈 화면. 자동이거나 그 화면이 사라졌으면 None.
+
+        고르는 칸을 없앤 캐릭터는 저장돼 있던 값도 무시하고 늘 자동으로 둔다.
+        안 그러면 예전에 골라 둔 화면에 묶인 채 되돌릴 방법이 없어진다.
+        """
+        if not self.cfg.get("pen_monitor_pick"):
+            return None
+        raw = str(self.us.get("pen_monitor", "") or "")
+        if not raw or raw.startswith("자동"):
+            return None
+        try:
+            n = int(raw.split("번")[0])
+        except Exception:
+            return None
+        mons = list_monitors()
+        return mons[n - 1] if 1 <= n <= len(mons) else None
+
+    # 점으로 시작해야 한다 — 파츠 폴더에 생기는 파일이라, 점이 없으면
+    # make_manifest가 배포 payload에 그대로 실어 보낸다.
+    PEN_DIAG = ".pen_diag.txt"    # 진단 기록 파일
+    PEN_DIAG_MAX = 150            # 이 줄 수까지만 남긴다
+
+    def _pen_diag_head(self):
+        """진단 기록 첫머리 — 프로그램이 본 화면 구성 그대로."""
+        if self._diag_left <= 0:
+            return
+        try:
+            lines = [
+                "=== %s / %s ===" % (time.strftime("%Y-%m-%d %H:%M:%S"),
+                                     self.char),
+                "IS_WIN=%s IS_MAC=%s" % (IS_WIN, IS_MAC),
+                "mac_monitors() = %r" % (mac_monitors(),),
+                "list_monitors() = %r" % (list_monitors(),),
+                "Tk 화면 = %dx%d" % (self.root.winfo_screenwidth(),
+                                    self.root.winfo_screenheight()),
+                "pen_monitor 설정 = %r" % (self.us.get("pen_monitor"),),
+                "_pen_mon_rect() = %r" % (self._pen_mon_rect(),),
+                "시작 커서 = %r" % (cursor_pos(),),
+                "-- 아래는 마우스를 옮길 때마다 한 줄씩 --",
+            ]
+            with open(os.path.join(self.state_dir, self.PEN_DIAG), "w",
+                      encoding="utf-8") as fp:
+                fp.write("\n".join(lines) + "\n")
+        except Exception:
+            self._diag_left = 0
+
+    def _pen_diag_row(self, cx, cy, rect, u, v):
+        """커서가 어느 화면으로 잡혔고 타블렛 어디를 짚는지 한 줄 남긴다."""
+        if self._diag_left <= 0:
+            return
+        now = time.time()
+        key = tuple(rect)
+        if key == self._diag_last and now - self._diag_at < 3.0:
+            return                    # 같은 화면이면 3초에 한 줄만
+        self._diag_last, self._diag_at = key, now
+        self._diag_left -= 1
+        try:
+            with open(os.path.join(self.state_dir, self.PEN_DIAG), "a",
+                      encoding="utf-8") as fp:
+                fp.write("%s 커서=(%d,%d) 잡힌화면=%r 타블렛=(%.2f, %.2f)\n"
+                         % (time.strftime("%H:%M:%S"), cx, cy, key, u, v))
+        except Exception:
+            self._diag_left = 0
+
+    def _track_pen(self, now, f, cx, cy):
+        """펜 끝이 따라갈 자리를 구하고 그린 획 수·낙서 선을 기록한다.
+
+        팔을 그리는 것과 분리해 둔다 — 몸짓 중에는 팔이 딴짓을 하지만
+        사용자가 실제로 긋는 획은 그대로 세어야 하기 때문이다.
+        """
+        if "pen" in f:
+            target = self._quad_xy(*f["pen"])
+            drawing = True
+        else:
+            # 듀얼 모니터에서 어느 화면을 따라갈지 골랐으면 그 화면 기준으로,
+            # 아니면 커서가 놓인 화면 기준으로 손 위치를 잡는다.
+            ml, mt, mr, mb = self._pen_mon_rect() or monitor_at(cx, cy)
+            u = min(1.0, max(0.0, (cx - ml) / max(mr - ml, 1)))
+            v = min(1.0, max(0.0, (cy - mt) / max(mb - mt, 1)))
+            if self._diag_left > 0:
+                self._pen_diag_row(cx, cy, (ml, mt, mr, mb), u, v)
+            target = self._quad_xy(u, v)
+            drawing = self.mouse_pressed
+        self._pen_xy[0] += (target[0] - self._pen_xy[0]) * 0.55
+        self._pen_xy[1] += (target[1] - self._pen_xy[1]) * 0.55
+        tx, ty = self._pen_xy
+        if drawing and not getattr(self, "_stroke_prev", False):
+            self.stat["strokes"] = self.stat.get("strokes", 0) + 1
+        self._stroke_prev = drawing
+        if drawing:
+            if self._new_stroke or not self.strokes:
+                self.strokes.append([])
+                self._new_stroke = False
+            self.strokes[-1].append((tx, ty))
+            while sum(len(st) for st in self.strokes) > 300:
+                self.strokes.pop(0)
+        return tx, ty, drawing
+
+    def _draw_arms(self, now, f, yo, pen_typing, cx, cy):
+        """펜 추적 팔 또는 타이핑 팔 (환경 의존 코드가 많아 따로 격리)."""
+        c = self.canvas
+        # (펜 소리의 획 감지·속도 측정은 마우스 콜백이 맡는다 — 그리기 루프에서
+        #  재면 프레임 간격만큼 늦어진다. 여기선 페이드 진행만 tick으로 돌린다.)
+        # ── 오른손/오른팔: 펜 추적 또는 타이핑 파츠(어깨 축 회전) ────────
+        if self.arm_pil is None or "arm_key" not in self.hop:
+            return                      # 팔 파츠가 없으면 팔만 생략
+        if self._g_hands is not None and self._fail.get("gesture_arms", 0) < 3:
+            # 몸짓 중 — 손은 머리를 그린 뒤에 그린다. 머리가 창을 거의 다
+            # 채워서, 손을 조금만 들어도 머리 뒤로 숨어 버리기 때문이다.
+            # 팔은 몸짓을 하더라도 그린 획 수와 펜 소리는 계속 센다.
+            self._track_pen(now, f, cx, cy)
+            if self.pensnd is not None and self._pen_grain and "pen" not in f:
+                self.pensnd.tick(now, enabled=True)
+            return
+        if self.slime is not None:
+            # 슬라임을 꺼내 놓았으면 두 손 다 그쪽으로. 펜은 내려놓은 셈이라
+            # arm_pen(펜 쥔 손)을 안 그린다 — arm_right가 양끝 둥근 통이라
+            # 그것만 빼면 그대로 평범한 손이 된다.
+            # 팔을 먼저 그려 보고 성공했을 때만 _track_pen을 부른다. 실패해
+            # 평소 경로로 물러나면 거기서 또 부르게 되어 획이 두 번 세어진다.
+            try:
+                drew = self._draw_pen_arm_slime(now, yo * 0.25)
+            except Exception:
+                drew, _ = False, self._log_error("slime_pen_arm")
+            if drew:
+                self._track_pen(now, f, cx, cy)     # 획·거리 세기는 그대로
+                if self.pensnd is not None and self._pen_grain:
+                    # 슬라임을 쥐고 있을 때만 멈춘다 — 꺼내 놓은 채로
+                    # 그림을 그리면 펜 소리는 그대로 나야 한다.
+                    self.pensnd.tick(now, enabled=(self._slime_grab is None
+                                                  and "pen" not in f))
+                self._draw_left(now, f)
+                return
+        if (pen_typing and "pen" not in f and "arm_right_typing" in self.hop
+                and self.cfg.get("typing_arm", True)):
+            # 양손 타이핑: 왼손을 먼저(아래), 오른팔-타자를 나중(위) 그림
+            self._draw_left(now, f)
+            self.pen_ang += (self.pen_ang_t - self.pen_ang) * 0.5
+            bob = 4 if now < self.pen_down_until else 0
+            tx_, ty_ = self._pos("arm_right_typing")
+            offx, offy = self.hop["arm_right_typing"]["off"]
+            c.create_image(tx_ + offx, ty_ + offy + bob,
+                           image=self._rotated_hop("arm_right_typing", self.pen_ang),
+                           anchor="nw")
+            if self._pen_grain and self.pensnd is not None:
+                self.pensnd.tick(now, enabled=False)    # 타이핑 중엔 펜 소리 정지
+        else:
+            tx, ty, drawing = self._track_pen(now, f, cx, cy)
+            px, py = self._pos("arm_pen")
+            btx, bty = self.pen_base_tip
+            ddx, ddy = tx - btx, ty - bty
+            # 숨쉬기(yo)는 팔 '모양' 계산에서 뺀다. 넣으면 프레임마다 각도·길이가
+            # 미세하게 달라져 팔 이미지를 끝없이 새로 만들게 된다(메모리 증가).
+            # 어깨가 1~2px 오르내리는 것은 그린 위치만 옮겨 표현한다.
+            sx, sy = self.arm_top
+            hx_, hy_ = self.arm_bottom[0] + ddx, self.arm_bottom[1] + ddy
+            arm = self._stretched_arm(hx_ - sx, hy_ - sy)
+            if arm is not None:
+                c.create_image(sx - arm[1][0], sy - arm[1][1] + yo * 0.25,
+                               image=arm[0], anchor="nw")
+            self._pen_draw = (px + ddx, py + ddy)
+            if not self.cfg.get("pen_over_head"):
+                self._draw_pen_hand()
+            self._draw_left(now, f)
+            # 연필 사각거림
+            if self.pensnd is not None and "pen" not in f:
+                if self._pen_grain:
+                    # 획 감지·짧은 클립은 마우스 콜백에서 이미 즉시 처리됐다.
+                    # 여기서는 페이드 진행과 긴 획의 루프 전환만 맡는다.
+                    self.pensnd.tick(now, enabled="pen" not in f)
+                elif drawing:                     # 원샷: 스트로크마다 클립 한 번
+                    self._pen_release_t = None
+                    if not self._pen_playing:
+                        self.pensnd.play()
+                        self._pen_playing = True
+                elif self._pen_playing:
+                    # 펜압 흔들림으로 잠깐 떨어지는 것은 무시(70ms 유예)
+                    if self._pen_release_t is None:
+                        self._pen_release_t = now
+                    elif now - self._pen_release_t > 0.07:
+                        self._pen_playing = False
+
+
+    def _draw_pen_hand(self):
+        """펜 쥔 손. 퀸시처럼 펜이 맨 위 레이어인 캐릭터는 머리를 그린 뒤 호출.
+
+        늘어나는 오른팔은 목도리 아래로 들어가야 하므로 여기서 그리지 않는다.
+        """
+        d = self._pen_draw
+        if not d:
+            return
+        px, py = d
+        self._put("arm_pen", px, py)
+        self._pen_draw = None
+
+    HEAD_DIAG = ".head_diag.txt"     # 머리 자리 진단 기록
+    HEAD_DIAG_MAX = 120
+
+    def _head_diag(self, kind, got, want, extra=""):
+        """머리가 제자리에서 벗어난 프레임을 남긴다.
+
+        '머리가 몸에서 빠진다'는 제보를 내 컴퓨터에서 재현하지 못해, 실제로
+        쓰는 컴퓨터에서 어떤 값이 나오는지 받아 보려고 둔다.
+        """
+        if self._hd_left <= 0:
+            return
+        try:
+            path = os.path.join(self.state_dir, self.HEAD_DIAG)
+            if not self._hd_head:
+                self._hd_head = True
+                with open(path, "w", encoding="utf-8") as fp:
+                    fp.write("=== %s / %s ===\n" % (
+                        time.strftime("%Y-%m-%d %H:%M:%S"), self.char))
+                    fp.write("배율=%.3f 크기설정=%s 창=%dx%d oy=%s ox=%s\n" % (
+                        self.s, self.us.get("scale_pct"), self.W, self.H,
+                        self.oy, self.ox))
+                    fp.write("기울기상한=%s 목=%s 머리상자=%s pad=%d\n" % (
+                        self._tilt_max, self._neck, self._head_box,
+                        self.TILT_PAD))
+                    fp.write("-- 아래는 머리가 제자리를 벗어난 프레임 --\n")
+            now = time.time()
+            if now - self._hd_at < 0.25:      # 너무 촘촘히 남기지 않는다
+                return
+            self._hd_at = now
+            self._hd_left -= 1
+            with open(path, "a", encoding="utf-8") as fp:
+                fp.write("%s %-6s 그린자리=%s 기대=%s %s\n" % (
+                    time.strftime("%H:%M:%S"), kind, got, want, extra))
+        except Exception:
+            self._hd_left = 0
+
+    def _draw_head(self, now, yo, pdx, pdy, blinking, smiling, sleeping):
+        """머리 + 얼굴 (자는 중이면 목을 축으로 기울인 합성본)."""
+        c = self.canvas
+        hyo = yo + self._g_hdy          # 끄덕임은 머리만 움직인다
+        tilt = None
+        if sleeping and self._tilt_max >= 2:       # 꾸벅 — 살짝 기울여 잔다
+            m = self._tilt_max
+            tilt = -(m * 0.78 + m * 0.22 * math.sin(now * 0.55))
+        elif abs(self._g_tilt) >= 0.5 and self._tilt_max >= 2:
+            m = self._tilt_max
+            tilt = max(-m, min(m, self._g_tilt))
+        if tilt is not None:
+            # 기울인 머리를 못 만들면 안 기울인 머리라도 그린다. 여기서 그냥
+            # 터지면 머리 구역이 꺼져 얼굴이 통째로 사라진다.
+            try:
+                p = self.TILT_PAD
+                # 눈을 감은 채 고개를 기울이는 동작(하품·꾸벅)이 있다. 눈 뜬
+                # 판으로 그리면 감으라고 해도 눈이 떠진다 — 잘 때 쓰는 판이
+                # 곧 눈감은 판이라 그것을 쓴다.
+                mode = ("sleep" if sleeping
+                        else "shut" if blinking
+                        else "smile" if (smiling and self._tilt_base_smile is not None)
+                        else "awake")
+                img, tdx = self._sleep_head(tilt, mode)
+                # 합성판은 파츠를 ox 없이 붙여 만든다. 캐릭터가 작아 카드보다
+                # 좁으면 ox만큼 오른쪽으로 밀어 놓는데, 여기서 그 값을 빼먹으면
+                # 고개를 기울일 때마다 머리만 ox만큼 왼쪽으로 튄다
+                # (크기 50%에서 29px — '머리가 몸에서 빠진다' 제보의 원인).
+                gx, gy = tdx - p + self.ox, self.oy - p + hyo
+                c.create_image(gx, gy, anchor="nw", image=img)
+                if self._hd_left > 0 and (abs(gx + p) > 3 or abs(tdx) > 3):
+                    self._head_diag("기울임", (round(gx), round(gy)),
+                                    (-p, round(self.oy - p)),
+                                    "tilt=%.2f mode=%s tdx=%d hyo=%.1f 자는중=%s"
+                                    % (tilt, mode, tdx, hyo, sleeping))
+                if sleeping:
+                    self._draw_snot(now, hyo, tilt, tdx)
+            except Exception:
+                tilt = None
+                self._log_error("head_tilt")
+        if tilt is None:
+            hx, hy = self._pos("head")
+            if self._hd_left > 0:
+                want = self._pos("head")
+                if abs(hx - want[0]) > 3:
+                    self._head_diag("보통", (round(hx), round(hy + hyo)),
+                                    (round(want[0]), round(want[1])),
+                                    "g_tilt=%.2f 상한=%.1f" % (self._g_tilt,
+                                                              self._tilt_max))
+            self._put("head", hx, hy + hyo)
+            self._draw_face(hyo, pdx, pdy, blinking, smiling)
+
+    def _draw_face(self, yo, pdx, pdy, blinking, smiling=False):
+        """눈동자(시선) 또는 감은 눈/웃는 얼굴 + 눈 위 덮개들."""
+        c = self.canvas
+        if smiling:                       # 웃는 표정 파츠가 눈을 대신한다
+            drawn = False
+            for name in (self.layout.get("overlays") or []):
+                if name in ("body_mask", "lashes"):
+                    continue
+                if name == "eyes_closed":
+                    sx, sy = self._pos("smile")
+                    self._put("smile", sx, sy + yo)
+                    drawn = True
+                    continue
+                if not self.has.get(name) or name == "head":
+                    continue
+                ox, oy_ = self._pos(name)
+                self._put(name, ox, oy_ + yo)
+            if not drawn:
+                sx, sy = self._pos("smile")
+                self._put("smile", sx, sy + yo)
+            return
+        if not blinking:
+            ex, ey = self._pos("pupils")
+            self._put("pupils", ex + pdx, ey + yo + pdy)
+        elif self.blink_cfg is not None:
+            (x0, y0, x1, y1), color = self.blink_cfg
+            c.create_rectangle(x0, y0 + yo, x1, y1 + yo, fill=color, outline="")
+        overlays = self.layout.get("overlays") or \
+            ["body_mask", "lashes", "eyes_closed", "hair"]
+        for name in overlays:
+            if name == "head":
+                continue                # 머리는 별도 처리
+            if name == "eyes_closed":
+                if not (blinking and self.has.get("eyes_closed")):
+                    continue
+            elif not self.has.get(name):
+                continue
+            ox, oy_ = self._pos(name)
+            self._put(name, ox, oy_ + yo)
+
+    SL_HAND_EASE = 0.20      # 손이 목표 자리로 따라붙는 빠르기
+    SL_HAND_X = 0.52         # 두 손이 덩어리 가운데에서 좌우로 벌어지는 정도
+
+    def _slime_hand_at(self, now, side):
+        """슬라임을 만지는 손이 갈 자리. side는 +1이 오른손(키보드 쪽).
+
+        잡고 있으면 손끝에 가까운 쪽 손이 그 자리를 짚고, 다른 손은 제자리에
+        얹혀 있는다. 두 손이 같은 점으로 몰리면 팔이 겹쳐 보인다.
+        """
+        sl = self.slime
+        bob = math.sin(now * 1.5 + (0.0 if side > 0 else 1.7)) * sl["r"] * 0.05
+        # 손끝을 위쪽 가장자리에 두면 '얹은' 게 아니라 '떠 있는' 것으로 보인다 —
+        # 실제로 찍어 보고 덩어리 한가운데 가까이로 내렸다.
+        rest = (sl["cx"] + sl["r"] * self.SL_HAND_X * side,
+                sl["cy"] - sl["r"] * self.SL_FLAT * 0.15 + bob)
+        g = self._slime_grab
+        if g is None:
+            return rest
+        mine = abs(g["x"] - rest[0])
+        other = abs(g["x"] - (sl["cx"] - sl["r"] * self.SL_HAND_X * side))
+        if mine > other:
+            return rest                    # 반대 손이 더 가깝다 — 나는 그대로
+        return g["x"] + sl["r"] * 0.05 * side, g["y"] - sl["r"] * self.SL_FLAT * 0.10
+
+    def _slime_arm(self, now, side, which, shoulder, natural, yo):
+        """슬라임 쪽으로 늘인 팔 한 짝. 그렸으면 True.
+
+        못 그리면 부르는 쪽이 평소 팔로 물러난다 (지뢰 14 — 눈에 띄는 파츠는
+        실패해도 한 단계 소박한 그림으로).
+        """
+        if which not in self._arm_src or self.slime is None:
+            return False
+        want = self._slime_hand_at(now, side)
+        cur = self._slime_hand.get(side) if self._slime_hand else None
+        if cur is None:
+            cur = list(natural)               # 평소 자리에서 스르륵 옮겨 간다
+        cur = [cur[0] + (want[0] - cur[0]) * self.SL_HAND_EASE,
+               cur[1] + (want[1] - cur[1]) * self.SL_HAND_EASE]
+        if self._slime_hand is None:
+            self._slime_hand = {}
+        self._slime_hand[side] = cur
+        sx, sy = shoulder
+        arm = self._stretched_arm(cur[0] - sx, cur[1] - sy, which)
+        if arm is None:
+            return False
+        self.canvas.create_image(sx - arm[1][0], sy - arm[1][1] + yo,
+                                 image=arm[0], anchor="nw")
+        return True
+
+    def _draw_left_slime(self, now, yo):
+        """슬라임 위에 얹은 오른손(키보드 쪽 팔)."""
+        return self._slime_arm(now, 1, "l", self.armk_top, self.armk_bottom, yo)
+
+    def _draw_pen_arm_slime(self, now, yo):
+        """펜 쥔 쪽 팔도 슬라임으로 — 펜 든 손(arm_pen)은 그리지 않는다.
+
+        arm_right는 양끝이 둥근 통이라, 펜 파츠를 빼면 그대로 평범한 손이 된다.
+        """
+        return self._slime_arm(now, -1, "r", self.arm_top, self.arm_bottom, yo)
+
+    def _draw_left(self, now, f):
+        """왼손(키보드): 어깨 축 회전으로 키를 옮겨가며 타이핑."""
+        if self.slime is not None:
+            # 슬라임을 꺼내 놓았으면 키보드가 매트에 덮여 있다. 손은 거기로.
+            try:
+                # 평소 왼팔은 숨쉬기(yo)를 안 따르므로 여기서도 0으로 맞춘다
+                if self._draw_left_slime(now, 0.0):
+                    return
+            except Exception:
+                self._log_error("slime_hand")
+        elif self._slime_hand is not None:
+            self._slime_hand = None           # 치웠으면 다음엔 평소 자리부터
+        if now - self.last_key > 2.5:
+            self.key_ang_t = 0.0
+        self.key_ang += (self.key_ang_t - self.key_ang) * 0.5
+        kx, ky = self._pos("arm_key")
+        kx += self.arm_key_off[0]
+        ky += self.arm_key_off[1]
+        offx, offy = self.hop["arm_key"]["off"]
+        down = now < self.left_down_until or f.get("type")
+        self.canvas.create_image(kx + offx, ky + offy + (4 if down else 0),
+                                 image=self._rotated_hop("arm_key", self.key_ang),
+                                 anchor="nw")
+
+    # ── 환경설정 창 ──────────────────────────────────────────────────────
+    def open_settings(self):
+        """캔버스로 직접 그린 설정 창 — 그룹 카드 · 토글 · 스테퍼 · 목록."""
+        if self._settings_win is not None and self._settings_win.winfo_exists():
+            self._settings_win.lift()
+            return
+        self._settings_open = None       # 항상 접힌 상태로 열린다
+        self._fb_msg = ""
+        try:                             # 지난번에 끌어 정한 창 높이
+            self._set_h = int(self.us.get("settings_h", 0) or 0)
+        except (TypeError, ValueError):
+            self._set_h = 0
+        self._set_job = None             # 크기 변경을 모았다 그리는 예약
+        p = self.us.get("settings_pos")   # 지난번에 옮겨 둔 창 자리
+        self._set_pos = (tuple(p) if isinstance(p, (list, tuple)) and len(p) == 2
+                         else None)
+        cd = self.card
+        PANEL, SOFT, LINE = cd["panel"], cd["soft"], cd["line"]
+        W, PAD, ROW, IN = (self._ui(372), self._ui(20),
+                           self._ui(40), self._ui(18))
+        FONT = UI_FONT
+        FS = lambda n: max(7, round(n * self.ui_k))   # 설정 창 글꼴
+        win = tk.Toplevel(self.root)
+        self._keep_front(win, focus=False)
+        self._settings_win = win
+        win.title(f"{self.cfg.get('name', self.char)} 설정")
+        win.attributes("-topmost", True)
+        # 세로만 늘렸다 줄였다 — 가로는 안쪽 그림이 이 폭에 맞춰 그려져 있다.
+        # 창 끝을 끌어 줄이면 그만큼 스크롤로 넘어간다.
+        win.resizable(False, True)
+        win.configure(bg=PANEL)
+
+        st = dict(self.us)
+        st["show_timer"] = bool(self.timer_on)
+        if st.get("sound_pack") not in self.sound_packs and self.sound_packs:
+            st["sound_pack"] = self.sound_packs[0]
+
+        # 내용이 길어지면 화면 밖으로 나가므로, 위쪽은 스크롤되는 칸으로 두고
+        # 저장 버튼은 아래 띠에 따로 붙여 늘 보이게 한다.
+        top = tk.Frame(win, bg=PANEL)
+        top.pack()
+        cv = tk.Canvas(top, width=W, height=640, bg=PANEL, highlightthickness=0)
+        cv.pack(side="left")
+        vbar = tk.Scrollbar(top, orient="vertical", command=cv.yview)
+        cv.config(yscrollcommand=vbar.set, yscrollincrement=self._ui(6))
+        bar = tk.Canvas(win, width=W, height=1, bg=PANEL, highlightthickness=0)
+        bar.pack()
+        # 이 입력칸들의 부모는 반드시 캔버스여야 한다. 창의 자식으로 두면
+        # 캔버스가 잘라내지 못해, 스크롤하거나 창을 줄였을 때 칸이 캔버스
+        # 밖으로 삐져나와 아래 저장 버튼을 덮어 버린다.
+        apps_var = tk.StringVar(value=str(st.get("work_apps", "")))
+        apps_entry = tk.Entry(cv, textvariable=apps_var, font=(FONT, FS(8)),
+                              relief="flat", bg="#ffffff", fg=cd["text"],
+                              highlightthickness=0, borderwidth=0)
+        nick_var = tk.StringVar(value=str(st.get("room_nick", "")))
+        nick_entry = tk.Entry(cv, textvariable=nick_var, font=(FONT, FS(8)),
+                              relief="flat", bg="#ffffff", fg=cd["text"],
+                              highlightthickness=0, borderwidth=0)
+        msg_var = tk.StringVar(value=self._room_msg())
+        msg_entry = tk.Entry(cv, textvariable=msg_var, font=(FONT, FS(8)),
+                             relief="flat", bg="#ffffff", fg=cd["text"],
+                             highlightthickness=0, borderwidth=0)
+        code_var = tk.StringVar(value=str(st.get("room_code", "")))
+        code_entry = tk.Entry(cv, textvariable=code_var, font=(FONT, FS(8)),
+                              relief="flat", bg="#ffffff", fg=cd["text"],
+                              highlightthickness=0, borderwidth=0)
+        fb_on = bool(self._fb_url())
+        fb_text = None
+        if fb_on:
+            fb_text = tk.Text(cv, font=(FONT, FS(8)), relief="flat",
+                              bg="#ffffff", fg=cd["text"], wrap="word",
+                              highlightthickness=0, borderwidth=0)
+        hits, sliders, bar_hits = [], [], []
+        RX = W - PAD - IN            # 오른쪽 컨트롤 기준선
+        LX = PAD + IN                # 왼쪽 라벨 기준선
+
+        def rrect(x0, y0, x1, y1, r, on=None, **kw):
+            pts = [x0 + r, y0, x1 - r, y0, x1, y0, x1, y0 + r, x1, y1 - r, x1, y1,
+                   x1 - r, y1, x0 + r, y1, x0, y1, x0, y1 - r, x0, y0 + r, x0, y0]
+            return (on or cv).create_polygon(pts, smooth=True, **kw)
+
+        def header(y):
+            """캐릭터 귀 + 이름 헤더."""
+            hx0, hx1 = PAD, W - PAD
+            deco = cd.get("deco")
+            if deco == "scarf":                 # 퀸시: 귀 대신 목도리 띠
+                rrect(hx0 + 20, y - 6, hx1 - 20, y + 22, 10,
+                      fill=cd["border"], outline="")
+                span = (hx1 - hx0 - 96) / 4
+                for i in range(5):
+                    sx = hx0 + 56 + i * span
+                    cv.create_line(sx, y - 3, sx - 9, y + 20,
+                                   fill="#dfe5f0", width=4)
+                rrect(hx0, y + 10, hx1, y + 62, 18, fill=SOFT,
+                      outline=cd["border"], width=2)
+                cv.create_text(W / 2, y + 36,
+                               text=f"{self.cfg.get('name', self.char)} 설정",
+                               font=(FONT, FS(12), "bold"), fill=cd["text"])
+                return y + 78
+            # 캐릭터마다 제 데코를 쓴다 — 판다귀가 아닌 캐릭터에 검은 귀가
+            # 얹혀 있었다 (햄북이 제보). 타이머 카드의 _draw_deco 와 맞춘다.
+            mx = (hx0 + hx1) / 2
+            if deco == "burger":               # 햄북이: 미니 햄버거
+                cv.create_arc(mx - 26, y - 12, mx + 26, y + 26, start=0,
+                              extent=180, style="pieslice",
+                              fill="#ecbf6b", outline="#a8763e", width=2)
+                for dx2 in (-11, 0, 11):
+                    cv.create_oval(mx + dx2 - 2, y - 4 + abs(dx2) // 5,
+                                   mx + dx2 + 2, y - 1 + abs(dx2) // 5,
+                                   fill="#fdf3d9", outline="")
+                for i2 in range(6):
+                    lx = mx - 22 + i2 * 9
+                    cv.create_oval(lx - 4, y + 3, lx + 4, y + 11,
+                                   fill="#7cb956", outline="#578a35")
+                cv.create_rectangle(mx - 21, y + 8, mx + 21, y + 14,
+                                    fill="#8a5a34", outline="#6d4426")
+            elif deco == "sushi":              # 연어: 연어 초밥
+                cv.create_oval(mx - 24, y + 2, mx + 24, y + 24,
+                               fill="#fdfdf6", outline="#d8d0bf", width=2)
+                cv.create_oval(mx - 27, y - 9, mx + 27, y + 11,
+                               fill="#ef9d76", outline="#c96f4e", width=2)
+                for i2 in range(3):
+                    sx2 = mx - 14 + i2 * 13
+                    cv.create_arc(sx2 - 7, y - 7, sx2 + 9, y + 9, start=40,
+                                  extent=120, style="arc",
+                                  outline="#f8cfb6", width=2)
+            elif deco == "frog":               # 프고: 개구리 눈
+                for ex2 in (mx - 24, mx + 24):
+                    cv.create_oval(ex2 - 15, y - 8, ex2 + 15, y + 16,
+                                   fill="#69a63c", outline="#49781f", width=2)
+                    cv.create_oval(ex2 - 9, y - 4, ex2 + 9, y + 12,
+                                   fill="#ffffff", outline="#49781f", width=2)
+                    cv.create_oval(ex2 - 3, y + 1, ex2 + 3, y + 8,
+                                   fill="#20261c", outline="")
+            elif deco == "sprout":             # 기뽀: 새싹
+                cv.create_line(mx, y + 18, mx, y - 2, fill="#4c8a3f", width=3)
+                for sign in (-1, 1):
+                    cv.create_polygon(mx, y - 1, mx + 9 * sign, y - 12,
+                                      mx + 16 * sign, y - 3,
+                                      mx + 7 * sign, y + 4, smooth=True,
+                                      fill="#6db54e", outline="#4c8a3f",
+                                      width=1)
+            elif deco == "ribbon":             # 사가: 리본
+                for sign in (-1, 1):
+                    cv.create_polygon(mx, y + 5, mx + 18 * sign, y - 9,
+                                      mx + 20 * sign, y + 6,
+                                      mx + 15 * sign, y + 11, smooth=True,
+                                      fill="#f9b6d2", outline="#e07aa8",
+                                      width=2)
+                cv.create_oval(mx - 5, y, mx + 5, y + 10, fill="#f9b6d2",
+                               outline="#e07aa8", width=2)
+            elif deco == "dog":                # 개: 늘어진 강아지 귀
+                for ex2 in (hx0 + 30, hx1 - 30):
+                    cv.create_oval(ex2 - 14, y - 8, ex2 + 10, y + 30,
+                                   fill="#2b2b2b", outline="")
+                    cv.create_oval(ex2 - 8, y, ex2 + 2, y + 18,
+                                   fill="#4a4a4a", outline="")
+            else:
+                ec = {"cat": "#f5bdd2", "rose": "#f5bdd2"}.get(deco, "#2b2b2b")
+                for ex in (hx0 + 34, hx1 - 34):
+                    if deco == "cat":
+                        cv.create_polygon(ex - 13, y + 18, ex + 2, y - 8,
+                                          ex + 13, y + 17,
+                                          fill=ec, outline=cd["border"],
+                                          width=2)
+                    else:
+                        cv.create_oval(ex - 13, y - 8, ex + 13, y + 18,
+                                       fill=ec, outline="")
+            rrect(hx0, y + 10, hx1, y + 62, 18, fill=SOFT,
+                  outline=cd["border"], width=2)
+            cv.create_text(W / 2, y + 36, text=f"{self.cfg.get('name', self.char)} 설정",
+                           font=(FONT, FS(12), "bold"), fill=cd["text"])
+            return y + 78
+
+        def group(y, title, rows):
+            """제목 + 흰 카드 안에 행들을 균등 배치."""
+            cv.create_oval(PAD + 3, y - 4, PAD + 11, y + 4,
+                           fill=cd["fill"], outline="")
+            cv.create_text(PAD + 18, y, anchor="w", text=title,
+                           font=(FONT, FS(9), "bold"), fill=cd["fill"])
+            y += 16
+            # 행을 먼저 그리고 흰 카드를 뒤로 내린다. 펼친 목록이 있으면 높이가
+            # 달라지는데, 카드를 먼저 그리려면 높이를 미리 알아야 해서다.
+            ry = y + 7 + ROW / 2
+            extra = 0
+            for fn in rows:
+                e = fn(ry) or 0
+                ry += ROW + e
+                extra += e
+            h = ROW * len(rows) + 14 + extra
+            bg = rrect(PAD, y, W - PAD, y + h, 16, fill="#ffffff",
+                       outline=LINE, width=1)
+            cv.tag_lower(bg)
+            return y + h + 20
+
+        def label(y, text):
+            cv.create_text(LX, y, anchor="w", text=text,
+                           font=(FONT, FS(9)), fill=cd["text"])
+
+        def pill(x1, y, text, fn, strong=False):
+            """오른쪽 끝을 x1에 맞춘 작은 알약 버튼. 왼쪽 x를 돌려준다."""
+            pw = text_w(text, (FONT, FS(8))) + self._ui(20)
+            x0 = x1 - pw
+            rrect(x0, y - 12, x1, y + 12, 12,
+                  fill=cd["fill"] if strong else SOFT,
+                  outline="" if strong else cd["border"],
+                  width=1 if not strong else 0)
+            cv.create_text((x0 + x1) / 2, y, text=text,
+                           font=(FONT, FS(8), "bold") if strong else (FONT, FS(8)),
+                           fill="#ffffff" if strong else cd["text"])
+            hits.append((x0, y - 12, x1, y + 12, fn))
+            return x0
+
+        def caret(bx0, bx1, y, opened, text, key, on_open=None):
+            """펼침 상자 — 목록 고르기와 같은 모양. 눌리면 접었다 폈다."""
+            rrect(bx0, y - 14, bx1, y + 14, 14, fill=SOFT,
+                  outline=cd["border"], width=1)
+            nm, nf = fit_text(text, 8, (bx1 - 26) - (bx0 + 12), 6)
+            cv.create_text(bx0 + 12, y, anchor="w", text=nm, font=nf,
+                           fill=cd["text"])
+            ax, dy = bx1 - 15, (-3 if opened else 3)
+            cv.create_line(ax - 5, y - dy, ax, y + dy, ax + 5, y - dy,
+                           width=2, capstyle="round", joinstyle="round",
+                           fill=cd["fill"])
+
+            def flip():
+                self._settings_open = None if opened else key
+                if not opened and on_open:
+                    on_open()
+            hits.append((bx0, y - 14, bx1, y + 14, flip))
+
+        def toggle(y, text, key):
+            label(y, text)
+            on = bool(st.get(key))
+            x1, x0 = RX, RX - 46
+            rrect(x0, y - 11, x1, y + 11, 11,
+                  fill=cd["fill"] if on else "#e2e0e6", outline="")
+            kx = x1 - 12 if on else x0 + 12
+            cv.create_oval(kx - 8.5, y - 8.5, kx + 8.5, y + 8.5,
+                           fill="#ffffff", outline="")
+
+            def flip(k=key):
+                st[k] = not bool(st.get(k))
+            hits.append((x0 - 6, y - 16, x1 + 6, y + 16, flip))
+
+        def stepper(y, text, key, lo, hi, step, suffix=""):
+            label(y, text)
+            val = float(st.get(key, lo))
+            for sign, cx in ((1, RX - 13), (-1, RX - 99)):
+                cv.create_oval(cx - 13, y - 13, cx + 13, y + 13,
+                               fill=SOFT, outline=cd["border"], width=1)
+                cv.create_line(cx - 5, y, cx + 5, y, width=2,
+                               capstyle="round", fill=cd["text"])
+                if sign > 0:
+                    cv.create_line(cx, y - 5, cx, y + 5, width=2,
+                                   capstyle="round", fill=cd["text"])
+
+                def bump(s=sign, k=key, lo=lo, hi=hi, stp=step):
+                    v = float(st.get(k, lo)) + s * stp
+                    st[k] = max(lo, min(hi, round(v, 2)))
+                hits.append((cx - 15, y - 15, cx + 15, y + 15, bump))
+            cv.create_text(RX - 56, y, text=f"{val:g}{suffix}",
+                           font=(FONT, FS(9), "bold"), fill=cd["text"])
+
+        def slider(y, text, key, lo, hi):
+            label(y, text)
+            val = float(st.get(key, lo))
+            sx0, sx1 = RX - 148, RX - 46
+            cv.create_line(sx0, y, sx1, y, width=6, capstyle="round", fill="#efedf1")
+            frac = (val - lo) / max(hi - lo, 1)
+            if frac > 0.01:
+                cv.create_line(sx0, y, sx0 + (sx1 - sx0) * frac, y, width=6,
+                               capstyle="round", fill=cd["fill"])
+            kx = sx0 + (sx1 - sx0) * frac
+            cv.create_oval(kx - 9, y - 9, kx + 9, y + 9, fill="#ffffff",
+                           outline=cd["fill"], width=2)
+            cv.create_text(RX, y, anchor="e", text=f"{val:g}",
+                           font=(FONT, FS(9), "bold"), fill=cd["text"])
+            sliders.append((sx0, sx1, y, key, lo, hi))
+
+        def chevron(cx, y, sign):
+            """sign -1이면 ‹, +1이면 › 모양."""
+            for dy in (-5, 5):
+                cv.create_line(cx - sign * 3, y + dy, cx + sign * 3, y,
+                               width=2, capstyle="round", fill=cd["fill"])
+
+        def picker(y, text, key, options):
+            label(y, text)
+            if not options:
+                cv.create_text(RX, y, anchor="e", text="(없음)",
+                               font=(FONT, FS(8)), fill=cd["sub"])
+                return
+            cur = st.get(key, options[0])
+            idx = options.index(cur) if cur in options else 0
+            bx0, bx1 = RX - 176, RX
+            rrect(bx0, y - 14, bx1, y + 14, 14, fill=SOFT,
+                  outline=cd["border"], width=1)
+            name = options[idx]
+            if len(name) > 16:
+                name = name[:15] + "…"
+            cv.create_text((bx0 + bx1) / 2, y, text=name,
+                           font=(FONT, FS(8)), fill=cd["text"])
+            for sign, cx in ((-1, bx0 + 15), (1, bx1 - 15)):
+                chevron(cx, y, sign)
+
+                def cyc(s=sign, k=key, o=options):
+                    i = (o.index(st.get(k, o[0])) if st.get(k) in o else 0)
+                    st[k] = o[(i + s) % len(o)]
+                hits.append((cx - 13, y - 14, cx + 13, y + 14, cyc))
+
+        def fit_window(*_):
+            """창이 화면 밖으로 나가 저장 버튼이 잘리지 않게 위치 보정.
+
+            한 번이라도 직접 옮긴 적이 있으면 그 자리를 지킨다 — 열 때마다
+            캐릭터 옆으로 끌려가면 옮겨 놓고 쓰는 사람이 매번 다시 옮겨야 한다.
+            """
+            if not win.winfo_exists():
+                return
+            win.update_idletasks()
+            wh, ww = win.winfo_height(), win.winfo_width()
+            sl, st_, sr, sb = self._screen_box()
+            keep = self._set_pos
+            if keep:
+                px, py = keep
+                # 모니터 구성이 바뀌어 화면 밖이면 그 자리는 버린다
+                if not (-8000 < px < 16000 and -8000 < py < 16000):
+                    keep = None
+            if not keep:
+                return self._place_near(win, 70, 30)
+            win.geometry(f"+{int(px)}+{int(py)}")
+
+        def text_w(t, font):
+            tid = cv.create_text(-4000, -4000, text=t, font=font, anchor="w")
+            x0, _, x1, _ = cv.bbox(tid)
+            cv.delete(tid)
+            return x1 - x0
+
+        def fit_text(t, size, room, min_size):
+            """상자 안에 들어가는 (글자, 글꼴). 줄여도 넘치면 끝을 잘라 …로."""
+            t = str(t)
+            n = size
+            while n > min_size and text_w(t, (FONT, FS(n))) > room:
+                n -= 1
+            font = (FONT, FS(n))
+            if text_w(t, font) <= room:
+                return t, font
+            while len(t) > 1 and text_w(t + "…", font) > room:
+                t = t[:-1]
+            return t + "…", font
+
+        def open_picker(y, text, key, options):
+            """눌러서 펼치는 목록 — 좌우로 넘기지 않고 전부 보여 준다.
+
+            늘어난 높이를 돌려주면 group이 흰 카드를 그만큼 늘려 준다.
+            """
+            label(y, text)
+            if not options:
+                cv.create_text(RX, y, anchor="e", text="(없음)",
+                               font=(FONT, FS(8)), fill=cd["sub"])
+                return 0
+            cur = st.get(key, options[0])
+            if cur not in options:
+                cur = options[0]
+            bx0, bx1 = RX - 176, RX
+            opened = (self._settings_open == key)
+            rrect(bx0, y - 14, bx1, y + 14, 14, fill=SOFT,
+                  outline=cd["border"], width=1)
+            # 글자 수로 자르면 한글·괄호가 섞였을 때 상자 밖으로 넘친다.
+            # 실제 폭을 재서 글꼴을 줄이고, 그래도 넘치면 끝을 자른다.
+            room = (bx1 - 26) - (bx0 + 12)
+            nm, nf = fit_text(cur, 8, room, 6)
+            cv.create_text(bx0 + 12, y, anchor="w", text=nm,
+                           font=nf, fill=cd["text"])
+            ax, dy = bx1 - 15, (-3 if opened else 3)
+            cv.create_line(ax - 5, y - dy, ax, y + dy, ax + 5, y - dy,
+                           width=2, capstyle="round", joinstyle="round",
+                           fill=cd["fill"])
+
+            def flip(k=key):
+                self._settings_open = None if self._settings_open == k else k
+            hits.append((bx0, y - 14, bx1, y + 14, flip))
+            if not opened:
+                return 0
+            ih = max(20, round(23 * self.ui_k))
+            top = y + 16
+            for i, opt in enumerate(options):
+                iy = top + ih / 2 + i * ih
+                on = (opt == cur)
+                if on:
+                    rrect(bx0, iy - ih / 2 + 2, bx1, iy + ih / 2 - 2, 9,
+                          fill=cd["fill"], outline="")
+                nm2, nf2 = fit_text(opt, 8, (bx1 - 14) - (bx0 + 14), 6)
+                cv.create_text(bx0 + 14, iy, anchor="w", text=nm2,
+                               font=(nf2[0], nf2[1], "bold") if on else nf2,
+                               fill="#ffffff" if on else cd["text"])
+
+                def pick(k=key, v=opt):
+                    st[k] = v
+                    self._settings_open = None
+                hits.append((bx0, iy - ih / 2, bx1, iy + ih / 2, pick))
+            return 16 + ih * len(options)
+
+        # ── 스티커 (환경설정 안에서 바로 다룬다 — 따로 창을 띄우지 않는다) ──
+        def stk_list(y):
+            """붙여 둔 스티커 — 펼치면 하나씩 편집·잠금·삭제."""
+            app = self._sticker_app(make=False)
+            n = app.count() if app is not None else 0
+            label(y, "붙인 스티커")
+            bx0, bx1 = RX - self._ui(120), RX
+            opened = (self._settings_open == "stk")
+            caret(bx0, bx1, y, opened, f"{n}장", "stk",
+                  on_open=lambda: self._sticker_app())
+            if not opened:
+                return 0
+            app = self._sticker_app()
+            if app is None:
+                cv.create_text(LX, y + 30, anchor="w", text="스티커를 못 불러왔어요",
+                               font=(FONT, FS(8)), fill=cd["sub"])
+                return 16 + self._ui(28)
+            ih = max(24, round(30 * self.ui_k))
+            top = y + 16
+            items = list(app.wins.items())
+            if not items:
+                cv.create_text(LX, top + ih / 2, anchor="w",
+                               text="아직 없어요 — 아래 '새로 붙이기'에서 넣어 보세요",
+                               font=(FONT, FS(8)), fill=cd["sub"])
+                return 16 + ih
+            for i, (sid, w) in enumerate(items):
+                iy = top + ih / 2 + i * ih
+                x = pill(RX, iy, "삭제", lambda s=sid: app.remove_sticker(s))
+                x = pill(x - 6, iy, "풀기" if w.locked else "잠금",
+                         lambda s=sid: app.wins[s].set_locked(
+                             not app.wins[s].locked))
+                x = pill(x - 6, iy, "편집", lambda s=sid: app.edit_sticker(s))
+                nm, nf = fit_text(w.file, 8, (x - 10) - LX, 6)
+                cv.create_text(LX, iy, anchor="w", text=nm, font=nf,
+                               fill=cd["sub"] if w.locked else cd["text"])
+            return 16 + ih * len(items)
+
+        def stk_add(y):
+            """새 스티커 넣기 — 파일 / 클립보드 / 글자."""
+            label(y, "새로 붙이기")
+
+            def run(fn):
+                app = self._sticker_app()
+                if app is not None:
+                    app.dialog_parent = win     # 설정 창 위에 뜨게
+                    self._safe("sticker_add", fn, app)
+            x = pill(RX, y, "글자", lambda: run(lambda a: a.add_text()))
+            x = pill(x - 6, y, "붙여넣기", lambda: run(lambda a: a.paste_clipboard()))
+            pill(x - 6, y, "파일", lambda: run(lambda a: a.add_files()))
+            return 0
+
+        def stk_slots(y):
+            """슬롯 — 지금 배치를 이름 붙여 저장해 두고 갈아 끼운다."""
+            app = self._sticker_app(make=False)
+            names = sorted(app.presets) if app is not None else []
+            label(y, "슬롯")
+            bx0, bx1 = RX - self._ui(120), RX
+
+            def save_slot():
+                app2 = self._sticker_app()
+                if app2 is not None:
+                    app2.dialog_parent = win
+                    self._safe("sticker_slot", app2.preset_save)
+            x = pill(bx0 - 8, y, "저장", save_slot, strong=True)
+            opened = (self._settings_open == "stkslot")
+            caret(bx0, bx1, y, opened,
+                  f"{len(names)}개" if names else "없음", "stkslot")
+            if not opened or not names:
+                return 0
+            ih = max(24, round(30 * self.ui_k))
+            top = y + 16
+            for i, nm in enumerate(names):
+                iy = top + ih / 2 + i * ih
+                xx = pill(RX, iy, "삭제", lambda s=nm: drop_slot(s))
+                xx = pill(xx - 6, iy, "적용", lambda s=nm: use_slot(s))
+                t, f2 = fit_text(nm, 8, (xx - 10) - LX, 6)
+                cv.create_text(LX, iy, anchor="w", text=t, font=f2,
+                               fill=cd["text"])
+            return 16 + ih * len(names)
+
+        def use_slot(name):
+            app = self._sticker_app()
+            if app is None:
+                return
+            app.preset_combo_name = name
+            self._safe("sticker_slot", app.preset_apply_named, name)
+
+        def drop_slot(name):
+            app = self._sticker_app(make=False)
+            if app is None:
+                return
+            app.presets.pop(name, None)
+            app.save_config()
+
+        def send_feedback():
+            ok, msg = self._fb_send(fb_text.get("1.0", "end"))
+            self._fb_msg = msg
+            if ok:
+                fb_text.delete("1.0", "end")
+
+        def draw(fit=True):
+            cv.delete("all")
+            hits.clear()
+            sliders.clear()
+            y = header(24)
+            timer_rows = [
+                lambda ry: stepper(ry, "목표 작업시간", "goal_hours", 0.5, 16, 0.5, "h"),
+                lambda ry: stepper(ry, "휴식 전환", "idle_sec", 5, 600, 5, "초"),
+                lambda ry: stepper(ry, "잠들기", "sleep_min", 1, 120, 1, "분"),
+                lambda ry: open_picker(ry, "스트레칭 알림", "stretch_every",
+                                       list(self.STRETCH_CHOICES)),
+            ]
+            if self.cfg.get("history"):
+                timer_rows.append(
+                    lambda ry: stepper(ry, "하루 바뀌는 시각", "day_start",
+                                       0, 12, 1, "시"))
+            timer_rows += [
+                lambda ry: toggle(ry, "작업 타이머 표시", "show_timer"),
+                lambda ry: toggle(ry, "작업 프로그램에서만 측정", "work_apps_only"),
+            ]
+            mons = self.monitor_names()
+            if self.cfg.get("pen_monitor_pick") and len(mons) > 2:
+                timer_rows.append(
+                    lambda ry: open_picker(ry, "펜 따라갈 화면",
+                                           "pen_monitor", mons))
+            y = group(y, "타이머", timer_rows)
+            snd_rows = [
+                lambda ry: slider(ry, "타자 소리 볼륨", "sound_volume", 0, 100),
+                lambda ry: slider(ry, "펜 소리 볼륨", "pen_volume", 0, 100),
+                lambda ry: slider(ry, "클릭 소리 볼륨", "poke_volume", 0, 100),
+            ]
+            if self.cfg.get("slime"):
+                snd_rows.append(
+                    lambda ry: slider(ry, "슬라임 소리 볼륨", "slime_volume",
+                                      0, 100))
+                if len(self.slime_kinds) > 1:
+                    snd_rows.append(
+                        lambda ry: open_picker(ry, "슬라임 종류", "slime_kind",
+                                               self.slime_kinds))
+            y = group(y, "소리", snd_rows + [
+                lambda ry: toggle(ry, "타자 소리", "sound"),
+                lambda ry: open_picker(ry, "소리 팩", "sound_pack",
+                                       self.sound_packs),
+            ])
+            disp = []
+            if len(self.skins) > 1:
+                disp.append(lambda ry: open_picker(ry, "패션", "skin",
+                                                  self.skin_names))
+            disp += [
+                lambda ry: stepper(ry, "캐릭터 크기", "scale_pct", 50, 200, 10, "%"),
+                lambda ry: slider(ry, "타이머와 머리 사이 여백", "card_gap",
+                                  -20, 60),
+                lambda ry: stepper(ry, "글자 크기", "font_pct",
+                                   FONT_MIN, FONT_MAX, 5, "%"),
+                lambda ry: toggle(ry, "캐릭터 그림자", "shadow"),
+                lambda ry: toggle(ry, "타블렛 낙서 표시", "trail"),
+                lambda ry: toggle(ry, "항상 위에 표시", "topmost"),
+            ]
+            if getattr(sys, "frozen", False):
+                disp.append(lambda ry: toggle(ry, "윈도우 시작 시 자동 실행",
+                                              "autostart"))
+            y = group(y, "표시", disp)
+
+            if self._stickers_on():
+                # 따로 창을 띄우지 않고 여기서 바로 다룬다
+                y = group(y, "스티커", [
+                    stk_list,
+                    stk_add,
+                    stk_slots,
+                    lambda ry: toggle(ry, "화면에 보이기", "stickers_show"),
+                    lambda ry: toggle(ry, "잠금 (클릭 통과)", "stickers_lock"),
+                ])
+
+            cv.create_oval(PAD + 3, y - 4, PAD + 11, y + 4,
+                           fill=cd["fill"], outline="")
+            cv.create_text(PAD + 18, y, anchor="w", text="작업 프로그램",
+                           font=(FONT, FS(9), "bold"), fill=cd["fill"])
+            cv.create_text(W - PAD - 4, y, anchor="e", text="쉼표로 구분",
+                           font=(FONT, FS(8)), fill=cd["sub"])
+            y += 16
+            rrect(PAD, y, W - PAD, y + 50, 16, fill="#ffffff",
+                  outline=LINE, width=1)
+            cv.create_window(LX, y + 13, anchor="nw", window=apps_entry,
+                             width=W - PAD * 2 - IN * 2, height=24)
+            y += 50 + 22
+
+            # ── 같이 작업하는 방 ──────────────────────────────────────
+            y = group(y, "같이 작업하는 방", [
+                lambda ry: toggle(ry, "친구들과 같이 보기", "room_on"),
+                lambda ry: toggle(ry, "홈에서 내 캐릭터를 비활성화",
+                                  "room_hide_me"),
+            ])
+            y -= 12
+            cv.create_text(LX, y, anchor="w",
+                           text="켜면 별명·레벨·오늘 작업 시간·자는지가 방에 보입니다.",
+                           font=(FONT, FS(8)), fill=cd["sub"])
+            y += 15
+            y += 3
+            cv.create_text(LX, y, anchor="w",
+                           text="어떤 프로그램을 쓰는지, 창 제목은 보내지 않습니다.",
+                           font=(FONT, FS(8)), fill=cd["sub"])
+            y += 26
+            # 오늘 한 줄은 홈(내 칸 클릭)에서, 방 코드는 설정 파일에서만 —
+            # 입력란이 겹치고 헷갈려서 뺐다 (사용자 요청)
+            for cap, ent, hint in (("방에서 보일 이름", nick_entry,
+                                    "비우면 캐릭터 이름"),):
+                cv.create_text(LX, y, anchor="w", text=cap,
+                               font=(FONT, FS(8)), fill=cd["text"])
+                cv.create_text(W - PAD - 4, y, anchor="e", text=hint,
+                               font=(FONT, FS(8)), fill=cd["sub"])
+                y += 16
+                rrect(PAD, y, W - PAD, y + 44, 14, fill="#ffffff",
+                      outline=LINE, width=1)
+                cv.create_window(LX, y + 10, anchor="nw", window=ent,
+                                 width=W - PAD * 2 - IN * 2, height=24)
+                y += 44 + 16
+            y += 8
+
+
+            if fb_on:
+                cv.create_oval(PAD + 3, y - 4, PAD + 11, y + 4,
+                               fill=cd["fill"], outline="")
+                cv.create_text(PAD + 18, y, anchor="w",
+                               text="건의 사항 · 버그 보내기",
+                               font=(FONT, FS(9), "bold"), fill=cd["fill"])
+                # 제목이 길어 오른쪽에 붙이면 겹친다 — 설명은 아랫줄로
+                y += 15
+                cv.create_text(PAD + 18, y, anchor="w",
+                               text="불편한 점, 추가되었으면 하는 기능 등",
+                               font=(FONT, FS(8)), fill=cd["sub"])
+                y += 15
+                rrect(PAD, y, W - PAD, y + 96, 16, fill="#ffffff",
+                      outline=LINE, width=1)
+                cv.create_window(LX, y + 12, anchor="nw", window=fb_text,
+                                 width=W - PAD * 2 - IN * 2, height=52)
+                sb = (W - PAD - IN - 92, y + 68, W - PAD - IN, y + 68 + 26)
+                rrect(*sb, 13, fill=cd["fill"], outline="")
+                cv.create_text((sb[0] + sb[2]) / 2, (sb[1] + sb[3]) / 2,
+                               text="보내기", font=(FONT, FS(8), "bold"),
+                               fill="#ffffff")
+                cv.create_text(LX, (sb[1] + sb[3]) / 2, anchor="w",
+                               text=self._fb_msg or "",
+                               font=(FONT, FS(8)), fill=cd["sub"])
+                hits.append((*sb, send_feedback))
+                y += 96 + 22
+
+            # 화면에 들어가는 만큼만 보여 주고 나머지는 스크롤로 넘긴다.
+            # 창 높이를 내용에 맞춰 늘리기만 하면 아래가 잘려 저장을 못 누른다.
+            room = self._screen_h() - self._ui(190)
+            view_h = int(min(y, max(self._ui(240), room)))
+            if self._set_h:            # 사용자가 창 끝을 끌어 정한 높이가 우선
+                view_h = int(max(self._ui(160), min(self._set_h, room)))
+            cv.config(height=view_h, scrollregion=(0, 0, W, y))
+            scrolling = y > view_h + 1
+            if scrolling:
+                vbar.pack(side="right", fill="y")
+            else:
+                vbar.pack_forget()
+                cv.yview_moveto(0)
+            draw_bar(scrolling)
+            # 목록을 펼치면 창 높이가 달라진다 — 화면 밖으로 나가지 않게 위치를
+            # 다시 잡는다 (그리는 중에 재진입하지 않도록 예약).
+            # 단, 사람이 창 끝을 끌어 크기를 바꾸는 중에는 건드리지 않는다.
+            # 끄는 도중에 자리를 옮기면 창이 손에서 튀며 깜빡인다.
+            if fit:
+                win.after_idle(fit_window)
+
+        def draw_bar(scrolling):
+            """아래에 늘 붙어 있는 띠 — 스크롤해도 저장 버튼이 사라지지 않는다."""
+            bar.delete("all")
+            bar_hits.clear()
+            win.update_idletasks()
+            tw = W + (vbar.winfo_reqwidth() if scrolling else 0)
+            bar.config(width=tw, height=self._ui(78))
+            bar.create_line(0, 1, tw, 1, fill=LINE)
+            bar.create_text(tw / 2, self._ui(17),
+                            text="패션 · 크기 · 타이머는 저장 시 재시작",
+                            font=(FONT, FS(8)), fill=cd["sub"])
+            by = self._ui(30)
+            bx0, bx1 = tw / 2 - 64, tw / 2 + 64
+            rrect(bx0, by, bx1, by + 40, 18, on=bar, fill=cd["fill"], outline="")
+            bar.create_text(tw / 2, by + 20, text="저장",
+                            font=(FONT, FS(10), "bold"), fill="#ffffff")
+            bar_hits.append((bx0, by, bx1, by + 40, save))
+
+        def set_slider(key, x, sx0, sx1, lo, hi):
+            frac = min(1.0, max(0.0, (x - sx0) / max(sx1 - sx0, 1)))
+            step = 5 if hi > 20 else 1
+            st[key] = int(round((lo + (hi - lo) * frac) / step) * step)
+
+        def on_bar_click(e):
+            for x0, y0, x1, y1, fn in bar_hits:
+                if x0 <= e.x <= x1 and y0 <= e.y <= y1:
+                    fn()
+                    return
+
+        def on_wheel(e):
+            cv.yview_scroll(-3 if e.delta > 0 else 3, "units")
+
+        def on_click(e):
+            e.y = int(cv.canvasy(e.y))       # 스크롤한 만큼 좌표를 맞춘다
+            for x0, y0, x1, y1, fn in hits:
+                if x0 <= e.x <= x1 and y0 <= e.y <= y1:
+                    fn()
+                    if win.winfo_exists():
+                        draw()
+                    return
+            for sx0, sx1, sy, key, lo, hi in sliders:
+                if sx0 - 12 <= e.x <= sx1 + 12 and sy - 14 <= e.y <= sy + 14:
+                    set_slider(key, e.x, sx0, sx1, lo, hi)
+                    draw()
+                    return
+
+        def on_drag(e):
+            e.y = int(cv.canvasy(e.y))
+            for sx0, sx1, sy, key, lo, hi in sliders:
+                if sy - 16 <= e.y <= sy + 16:
+                    set_slider(key, e.x, sx0, sx1, lo, hi)
+                    draw()
+                    return
+
+        def save():
+            new = dict(st)
+            # st는 창을 열 때 떠 온 복사본이라 그 뒤에 바뀐 창 높이를 모른다.
+            # 그대로 저장하면 방금 끌어 정한 높이가 옛 값으로 되돌아간다.
+            new["settings_h"] = int(self._set_h)
+            if self._set_pos:
+                new["settings_pos"] = list(self._set_pos)
+            new["work_apps"] = apps_var.get().strip()
+            new["room_nick"] = nick_var.get().strip()[:14]
+            _msg = msg_var.get().strip()[:20]
+            new["room_msg"] = _msg
+            new["room_msg_day"] = self._my_workday() if _msg else ""
+            new["room_code"] = code_var.get().strip()[:40]
+            new["goal_hours"] = float(new["goal_hours"])
+            new["idle_sec"] = max(float(new["idle_sec"]), 5.0)
+            new["sleep_min"] = max(1, int(new["sleep_min"]))
+            new["day_start"] = max(0, min(12, int(new.get("day_start", 6))))
+            new["scale_pct"] = max(50, min(200, int(new["scale_pct"])))
+            new["card_gap"] = max(-20, min(60, int(new.get("card_gap", 0))))
+            new["font_pct"] = max(FONT_MIN, min(FONT_MAX,
+                                                int(new["font_pct"])))
+            for k in ("sound_volume", "pen_volume", "poke_volume",
+                      "slime_volume"):
+                if k in new:
+                    new[k] = max(0, min(100, int(new[k])))
+            need_restart = (new["scale_pct"] != self.us["scale_pct"]
+                            or new["font_pct"] != self.us.get("font_pct", 100)
+                            or new.get("skin") != self.us.get("skin")
+                            or bool(new["show_timer"]) != self.timer_on
+                            or bool(new["shadow"]) != bool(self.us.get("shadow", True)))
+            old_slime = self.us.get("slime_kind")
+            # 방 코드가 바뀌면 붙어 있던 연결을 끊는다 — 안 그러면 옛 방에
+            # 계속 앉아 있는다 (RoomNet 은 만들 때의 코드를 그대로 쓴다).
+            room_moved = (str(new.get("room_code", "")) != str(self.us.get("room_code", ""))
+                          or bool(new.get("room_on")) != bool(self.us.get("room_on")))
+            self.us.update(new)
+            if room_moved:
+                self._safe("room_move", self._room_reset)
+            self._save_settings()
+            self.idle_thr = self.us["idle_sec"]
+            self.root.attributes("-topmost", bool(self.us["topmost"]))
+            self._init_sound()
+            if self.slime is not None and self.us.get("slime_kind") != old_slime:
+                # 꺼내 놓은 채로 종류를 바꿨으면 그 자리에서 새 것으로 갈아 준다
+                self.slime = None
+                self._slime_grab = None
+                self._slime_hand = None
+                self._safe("slime_swap", self._slime_open)
+            self._apply_autostart()
+            self._safe("stickers_apply", self._apply_stickers)
+            # 여백 보정은 재시작 없이 그 자리에서 — 창이 위로 자라거나 줄어든다
+            self._safe("card_gap", self._relayout_card)
+            win.destroy()
+            if need_restart:
+                self._restart()
+
+        def redraw_resized():
+            self._set_job = None
+            if win.winfo_exists():
+                draw(fit=False)          # 자리는 그대로 — 끄는 중이라 튀면 안 된다
+
+        def on_resize(e):
+            """창 끝을 끌어 크기를 바꿨을 때 — 안쪽 칸을 그 높이에 맞춘다.
+
+            Tk는 안쪽 위젯 때문에 창 크기를 다시 잡기도 해서, 사람이 끈 것과
+            자동 조정을 구분해야 한다. 아래 띠 높이를 뺀 값이 실제로 보여 줄
+            높이이고, 그 값이 달라졌을 때만 다시 그린다(무한 반복 방지).
+
+            끄는 동안 이벤트가 수십 번 쏟아진다. 그때마다 전부 다시 그리면
+            창이 덜덜 떨리므로, 잠깐 모았다가 한 번만 그린다.
+            """
+            if e.widget is not win or not win.winfo_exists():
+                return
+            # 옮긴 자리를 기억해 둔다 (크기를 안 바꿔도 이 이벤트가 온다).
+            # winfo_rootx는 테두리 안쪽이라 geometry("+x+y")와 기준이 달라,
+            # 그대로 주고받으면 열 때마다 제목 표시줄만큼 밀린다.
+            try:
+                g = win.geometry().split("+")
+                self._set_pos = (int(g[1]), int(g[2]))
+                self.us["settings_pos"] = list(self._set_pos)
+            except Exception:
+                pass
+            want = int(e.height) - bar.winfo_height()
+            if want < self._ui(160) or abs(want - cv.winfo_height()) <= 2:
+                return
+            self._set_h = want
+            self.us["settings_h"] = want
+            if self._set_job is not None:
+                try:
+                    win.after_cancel(self._set_job)
+                except Exception:
+                    pass
+            self._set_job = win.after(70, redraw_resized)
+
+        cv.bind("<Button-1>", on_click)
+        cv.bind("<B1-Motion>", on_drag)
+        bar.bind("<Button-1>", on_bar_click)
+        for _w in (win, cv, bar):
+            _w.bind("<MouseWheel>", on_wheel)
+        draw()
+        fit_window()
+        # 처음 그린 뒤부터 크기 변화를 듣는다 — 그리는 도중에 들으면
+        # 내부 조정까지 '사람이 끈 것'으로 오해한다
+        win.after_idle(lambda: win.bind("<Configure>", on_resize))
+
+
+    def _sanitize_settings(self):
+        """저장된 설정 값이 빈 문자열·null·엉뚱한 형이면 기본값으로 되돌린다.
+
+        옛 설정 창은 텍스트 입력이라 ""가 저장될 수 있었고, 그대로 float()에
+        들어가면 매 프레임 예외가 나 화면이 통째로 비어 버린다.
+        """
+        for k, dv in DEFAULT_SETTINGS.items():
+            v = self.us.get(k, dv)
+            if isinstance(dv, bool):
+                self.us[k] = bool(v)
+            elif isinstance(dv, (int, float)):
+                try:
+                    self.us[k] = type(dv)(float(v))
+                except (TypeError, ValueError):
+                    self.us[k] = dv
+            elif isinstance(dv, str) and not isinstance(v, str):
+                self.us[k] = dv
+        self.us["sleep_min"] = max(1, int(self.us["sleep_min"]))
+        self.us["idle_sec"] = max(5.0, float(self.us["idle_sec"]))
+        self.us["goal_hours"] = max(0.5, float(self.us["goal_hours"]))
+        self.us["scale_pct"] = max(50, min(200, int(self.us["scale_pct"])))
+        self.us["font_pct"] = max(FONT_MIN, min(
+            FONT_MAX, int(self.us.get("font_pct", FONT_MAX))))
+
+    def _font_migrate(self):
+        """옛 눈금(70~160%)에 저장된 값을 새 눈금(45~100%)으로 옮긴다.
+
+        직접 고른 사람은 보이던 크기를 그대로 지킨다(숫자만 바뀐다).
+        손댄 적 없는 사람 — 예전에 화면 배율로 자동으로 정해진 값 그대로인
+        사람 — 은 새 기본값인 100%로 올린다. 이 판단은 딱 한 번만 한다
+        (지뢰 34: 옛 기본값과 똑같을 때만 갈아 준다).
+        """
+        if not getattr(self, "_font_v2_needed", False):
+            self.us["font_v2"] = True
+            return
+        # 저장된 값이 null·빈 글자·엉뚱한 형일 수 있다. _sanitize_settings
+        # 는 이 뒤에 도므로 여기서 스스로 다듬어야 한다 (실제로 null 하나에
+        # 프로그램이 아예 안 켜졌다).
+        try:
+            old = int(float(self.us.get("font_pct") or 100))
+        except (TypeError, ValueError):
+            old = 100
+        try:
+            auto = max(70, min(160, round(_screen_scale(None) * 100)))
+        except Exception:
+            auto = 100
+        if old == auto:                    # 고른 적이 없다 → 새 기본값
+            self.us["font_pct"] = FONT_MAX
+        else:                              # 고른 크기를 그대로 지킨다
+            self.us["font_pct"] = max(FONT_MIN, min(
+                FONT_MAX, int(round(old / FONT_SPAN / 5.0) * 5)))
+        self.us["font_v2"] = True
+        self._font_v2_needed = False
+
+    def _save_settings(self):
+        try:
+            _save_json(self.settings_path, self.us, indent=1)
+        except Exception:
+            pass
+
+    def _apply_autostart(self):
+        """로그인 시 자동 실행 등록/해제 (배포본만). 윈도우=레지스트리, 맥=LaunchAgent."""
+        if not getattr(sys, "frozen", False):
+            return                       # 소스 실행(로컬)에서는 의미 없음
+        if IS_MAC:
+            return self._apply_autostart_mac()
+        try:
+            import winreg
+            name = os.path.splitext(os.path.basename(sys.executable))[0]
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                                r"Software\Microsoft\Windows\CurrentVersion\Run",
+                                0, winreg.KEY_SET_VALUE) as key:
+                if self.us.get("autostart", True):
+                    winreg.SetValueEx(key, name, 0, winreg.REG_SZ,
+                                      f'"{sys.executable}"')
+                else:
+                    try:
+                        winreg.DeleteValue(key, name)
+                    except FileNotFoundError:
+                        pass
+        except Exception:
+            pass
+
+    def _apply_autostart_mac(self):
+        """~/Library/LaunchAgents 에 plist를 쓰거나 지운다 (맥 로그인 자동 실행)."""
+        try:
+            label = "com.ena.mascot." + self.char.replace("parts_", "")
+            d = os.path.expanduser("~/Library/LaunchAgents")
+            path = os.path.join(d, label + ".plist")
+            if not self.us.get("autostart", True):
+                if os.path.exists(path):
+                    os.remove(path)
+                return
+            os.makedirs(d, exist_ok=True)
+            app = sys.executable                  # .app 번들이면 open -a 로 실행
+            while app and app != "/" and not app.endswith(".app"):
+                app = os.path.dirname(app)
+            args = ["/usr/bin/open", "-a", app] if app.endswith(".app")                 else [sys.executable]
+            out = ['<?xml version="1.0" encoding="UTF-8"?>',
+                   '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"'
+                   ' "http://www.apple.com/DTDs/PropertyList-1.0.dtd">',
+                   '<plist version="1.0">', '<dict>',
+                   "    <key>Label</key>", f"    <string>{label}</string>",
+                   "    <key>ProgramArguments</key>", "    <array>"]
+            out += [f"        <string>{a}</string>" for a in args]
+            out += ["    </array>", "    <key>RunAtLoad</key>", "    <true/>",
+                    "</dict>", "</plist>", ""]
+            with open(path, "w", encoding="utf-8") as fp:
+                fp.write(os.linesep.join(out))
+        except Exception:
+            pass
+
+
+    def _restart(self):
+        """스스로 껐다 켠다. 저장 → 자물쇠 놓기 → 새로 띄우기 → 닫기 순서.
+
+        자물쇠를 안 놓으면 새로 뜬 쪽이 '이미 떠 있다'고 보고 물러나므로,
+        이쪽이 닫히는 순간 캐릭터가 하나도 안 남는다.
+        """
+        import subprocess
+        if self.timer_on:
+            self._timer_save()
+        self._safe("todo_save", self._todo_save)
+        release_instance_lock()
+        try:
+            if getattr(sys, "frozen", False):
+                subprocess.Popen([sys.executable])
+            else:
+                subprocess.Popen([sys.executable, os.path.abspath(__file__),
+                                  "--char", self.char_arg])
+        except Exception:
+            self._log_error("restart")
+            return                       # 못 띄웠으면 이쪽이라도 살려 둔다
+        self.close()
+
+    # ── 같이 작업하는 방 ─────────────────────────────────────────────────
+    # 아래 넷은 전부 맨 위 CHARS 표에서 뽑는다. 캐릭터를 늘릴 때는 그 표에만
+    # 한 줄 넣으면 된다 — 여기는 손대지 않는다.
+    #
+    # ROOM_ART   자리 이름(=파츠 폴더)으로 '앉은 모습'을 어디서 받아올지.
+    #            내 도로롱은 배포 레포가 선물본 쪽이라 폴더 이름이 다르다.
+    # ROOM_ALL   선물용 타이머를 받은 사람들. 접속해 있지 않아도 자리는 보인다.
+    # ROOM_TINT  남의 테마색. 그 사람 config.json 은 친구 컴퓨터에 없다
+    #            (없으면 방 카드가 전부 회색이 된다).
+    # ROOM_SIZE  얼굴이 넓적한 캐릭터는 같은 높이로 맞추면 옆으로 커 보인다.
+    ROOM_ART = dict((c["slot"], (c["repo"], c.get("art") or c["slot"]))
+                    for c in CHARS)
+    ROOM_ALL = tuple(c["slot"] for c in CHARS if c.get("gift", True))
+    ROOM_TINT = dict((c["slot"], c["tint"]) for c in CHARS)
+    ROOM_NAME = dict((c["slot"], c["name"]) for c in CHARS)
+    ROOM_SIZE = dict((c["slot"], c["size"]) for c in CHARS if c.get("size"))
+    ROOM_COLS, ROOM_CW, ROOM_CH, ROOM_TOP = 3, 230, 248, 84
+    ROOM_FIG = 112               # 방에서 캐릭터를 그리는 높이(px)
+
+    def _room_on(self):
+        return bool(self.us.get("room_on")) and bool(ROOM_URL) and bool(ROOM_KEY)
+
+    def _room_msg(self):
+        """오늘 한 줄. 작업일이 바뀌면 저절로 비워진다 ('오늘' 목표니까)."""
+        if str(self.us.get("room_msg_day") or "") != self._my_workday():
+            return ""
+        return str(self.us.get("room_msg") or "").strip()[:20]
+
+    @staticmethod
+    def _song_ok(url):
+        """유튜브 주소만 받는다 — 남의 말풍선을 눌러 여는 것이라 좁게 잡는다."""
+        try:
+            import urllib.parse
+            u = urllib.parse.urlparse(str(url).strip())
+            return (u.scheme == "https" and u.netloc.lower() in (
+                "www.youtube.com", "youtube.com", "m.youtube.com",
+                "music.youtube.com", "youtu.be"))
+        except Exception:
+            return False
+
+    def _room_song(self):
+        """오늘의 노래 (주소, 제목). 날이 바뀌면 비워진다."""
+        if str(self.us.get("room_song_day") or "") != self._my_workday():
+            return "", ""
+        return (str(self.us.get("room_song") or ""),
+                str(self.us.get("room_song_title") or ""))
+
+    def _room_song_set(self, url):
+        """오늘의 노래를 건다 (빈 글자면 내린다). 제목은 뒤에서 받아 온다."""
+        url = str(url or "").strip()
+        if not url:
+            self.us["room_song"] = self.us["room_song_title"] = ""
+            self.us["room_song_day"] = ""
+            self._save_settings()
+            self._room_push_now()
+            return True
+        if not self._song_ok(url):
+            self._say("유튜브 주소만 걸 수 있어요", 3.5)
+            return False
+        if str(self.us.get("room_song") or "") != url:
+            self.us["room_song_likes"] = {}    # 새 노래 — 좋아요도 새로
+        self.us["room_song"] = url
+        self.us["room_song_title"] = "…"       # 제목 받는 중
+        self.us["room_song_day"] = self._my_workday()
+        self._save_settings()
+        self._room_push_now()
+
+        def fetch():
+            # 유튜브 oEmbed — 열쇠 없이 제목만 받아 오는 공식 길
+            import urllib.parse
+            import urllib.request
+            try:
+                q = urllib.parse.quote(url, safe="")
+                api = ("https://www.youtube.com/oembed?format=json&url=" + q)
+                with urllib.request.urlopen(
+                        urllib.request.Request(api, headers={
+                            "User-Agent": "mascot-song"}),
+                        timeout=12, context=_ssl_ctx()) as r:
+                    got = json.loads(r.read().decode("utf-8"))
+                title = str(got.get("title") or "")[:40]
+            except Exception:
+                title = "노래 들으러 가기"
+            self.us["room_song_title"] = title
+            try:
+                self._save_settings()
+            except Exception:
+                pass
+            self._room_push_now()
+
+        threading.Thread(target=fetch, daemon=True).start()
+        return True
+
+    def _room_push_now(self):
+        """지금 상태를 곧바로 방에 알린다 (다음 주기를 안 기다린다)."""
+        try:
+            self.room_net.push(self._room_state_now())
+            self.room_net.wake()
+        except Exception:
+            pass
+        self._room_key_last = None
+
+    def _room_msg_set(self, text):
+        """오늘 한 줄을 정한다 (빈 글자면 지운다)."""
+        text = str(text or "").strip()[:20]
+        self.us["room_msg"] = text
+        self.us["room_msg_day"] = self._my_workday() if text else ""
+        try:      # 여는 순간 지워지는 open("w") 말고 _save_json 으로 (지뢰 35)
+            _save_json(self.settings_path, self.us, indent=1)
+        except Exception:
+            self._log_error("room_msg_save")
+        try:      # 통신층이 어떤 상태든 한 줄은 저장돼야 한다
+            self.room_net.push(self._room_state_now())
+            self.room_net.wake()          # 곧바로 남에게 보이게
+        except Exception:
+            pass
+        self._room_key_last = None
+        if self.room_win is not None:
+            self._safe("room_draw", self._room_draw)
+
+    def _paste_into(self, ent, clear=False):
+        """클립보드를 입력칸에 직접 넣는다 — Tk 기본 바인딩에 안 기댄다."""
+        try:
+            txt = str(self.root.clipboard_get())
+        except Exception:
+            return "break"
+        try:
+            if clear:
+                ent.delete(0, "end")
+            elif ent.selection_present():
+                ent.delete("sel.first", "sel.last")
+        except Exception:
+            pass
+        try:
+            ent.insert("insert", txt.strip())
+        except Exception:
+            pass
+        return "break"
+
+    def _room_msg_win(self):
+        """오늘 한 줄을 적는 작은 창 — 우클릭 메뉴에서 바로 연다."""
+        w = getattr(self, "_msg_win", None)
+        if w is not None:
+            try:
+                w.lift()
+                return
+            except Exception:
+                self._msg_win = None
+        cd, u = self.card, self._ui
+        win = tk.Toplevel(self.root)
+        self._msg_win = win
+        win.title("오늘 한 줄")
+        win.attributes("-topmost", True)
+        win.resizable(False, False)
+        win.configure(bg=cd["panel"])
+        tk.Label(win, text="홈에서 다른 사람들에게 보일 한 줄이에요.",
+                 bg=cd["panel"], fg=cd["text"], font=self._uf(10, True)
+                 ).pack(padx=u(20), pady=(u(16), u(2)))
+        tk.Label(win, text="날이 바뀌면 저절로 지워집니다.",
+                 bg=cd["panel"], fg=cd["sub"], font=self._uf(8)
+                 ).pack(padx=u(20), pady=(0, u(12)))
+        var = tk.StringVar(value=self._room_msg())
+        ent = tk.Entry(win, textvariable=var, font=self._uf(11),
+                       relief="flat", bg="#ffffff", fg=cd["text"],
+                       justify="center", width=20, highlightthickness=1,
+                       highlightbackground=cd["fill"],
+                       highlightcolor=cd["fill"])
+        ent.pack(ipady=u(7), padx=u(20))
+        tk.Label(win, text="\u266a 오늘의 노래 추천 (유튜브 주소)",
+                 bg=cd["panel"], fg=cd["sub"], font=self._uf(8, True)
+                 ).pack(padx=u(20), pady=(u(12), u(2)))
+        svar = tk.StringVar(value=self._room_song()[0])
+        sent = tk.Entry(win, textvariable=svar, font=self._uf(9),
+                        relief="flat", bg="#ffffff", fg=cd["text"],
+                        justify="center", width=30, highlightthickness=1,
+                        highlightbackground=cd["border"],
+                        highlightcolor=cd["fill"])
+        sent.pack(ipady=u(5), padx=u(20))
+        # 맥에서는 Cmd+V 기본 바인딩이 안 걸리는 Tk 판이 있어 링크를 못
+        # 붙여넣는다는 제보가 왔다. 손수 만든 바인딩 + 붙여넣기 단추의
+        # 두 겹으로 간다 (둘 다 클립보드를 직접 읽으므로 Tk 판과 무관).
+        for w2 in (ent, sent):
+            for seq in ("<Command-v>", "<Command-V>", "<Control-v>",
+                        "<Control-V>"):
+                try:
+                    w2.bind(seq, lambda _e, t=w2: self._paste_into(t))
+                except Exception:
+                    pass
+        if IS_MAC:
+            tk.Button(win, text="링크 붙여넣기", font=self._uf(8),
+                      relief="flat", bg="#ffffff", fg=cd["text"],
+                      activebackground="#ffffff", cursor="hand2",
+                      command=lambda: self._paste_into(sent, clear=True)
+                      ).pack(pady=(u(6), 0))
+        row = tk.Frame(win, bg=cd["panel"])
+        row.pack(pady=(u(14), u(16)))
+
+        def done(save):
+            if save:
+                self._safe("room_msg_set", self._room_msg_set, var.get())
+                self._safe("room_song_set", self._room_song_set, svar.get())
+            try:
+                win.destroy()
+            except Exception:
+                pass
+            self._msg_win = None
+
+        for cap, val, bg, fg in (("지우기", None, cd["panel"], cd["sub"]),
+                                 ("저장", True, cd["fill"], "#ffffff")):
+            def hit(v=val):
+                if v is None:
+                    var.set("")
+                done(True)
+            tk.Button(row, text=cap, command=hit, font=self._uf(9, True),
+                      bg=bg, fg=fg, relief="flat", bd=0, padx=u(18),
+                      pady=u(6), activebackground=bg, cursor="hand2"
+                      ).pack(side="left", padx=u(5))
+        win.bind("<Return>", lambda e: done(True))
+        ent.bind("<Return>", lambda e: done(True))
+        win.bind("<Escape>", lambda e: done(False))
+        win.protocol("WM_DELETE_WINDOW", lambda: done(False))
+        win.update_idletasks()
+        x = self.root.winfo_rootx() + (self.W - win.winfo_width()) // 2
+        y = self.root.winfo_rooty() + u(60)
+        win.geometry("+%d+%d" % (max(0, x), max(0, y)))
+        self._dialog_keep(win, "msg")
+        ent.focus_set()
+        ent.select_range(0, "end")
+
+    def _room_nick(self):
+        return (str(self.us.get("room_nick") or "").strip()
+                or str(self.cfg.get("name") or self.char))
+
+    def _room_state_now(self):
+        """방에 보낼 값. 어떤 프로그램을 쓰는지·창 제목은 절대 안 보낸다."""
+        goal = max(0.1, float(self.us.get("goal_hours") or 6.0)) * 3600.0
+        today = self._today_secs()
+        if self._sleeping:
+            st = "sleep"
+        elif self._last_state == "work":
+            st = "work"
+        else:
+            st = "away"
+        now = time.time()
+        act = ""
+        if st == "work":
+            # 최근에 무엇을 만졌는지 — 방에서 그 자세로 보여 준다
+            act = "key" if (now - self.last_pointer > 2.0
+                            and now - self.last_key < 1.8) else "pen"
+        t_min = int(today // 60)
+        pv = round(min(1.0, today / goal), 3)
+        # 오늘 이미 더 간 값이 있으면 그 아래로 안 내려간다 — 컴퓨터를 껐다
+        # 켜거나 작업 종료를 눌러 연동 시계가 0이 돼도, 홈의 게이지·시간은
+        # 하루가 넘어가기 전까지 오늘 최고치를 지킨다 (남들 것을 지키는
+        # _room_seen 과 같은 파일에 내 자리로 남긴다).
+        try:
+            seen = self._room_seen_get()
+            day = self._my_workday()
+            cap = self._day_min() + 5
+            if t_min > cap:            # 06시 경계 — 아직 안 넘어간 어제 누적
+                pv = round(pv * (cap / max(t_min, 1)), 3)
+                t_min = int(cap)
+            row = seen.get(self.char)
+            if self._seen_ok(row, day):
+                t_min = max(t_min, int(row[0]))
+                pv = max(pv, float(row[1]))
+            if (not isinstance(row, list) or len(row) < 3 or row[2] != day
+                    or t_min > int(row[0]) or pv > float(row[1])):
+                seen[self.char] = [t_min, pv, day, int(time.time())]
+                _save_json(self._room_seen_path(), seen)
+        except Exception:
+            pass
+        out = {"n": self._room_nick()[:14], "m": self._room_msg(),
+               "lv": self._level(),
+               "ti": self._title()[:14], "t": t_min, "s": st,
+               "p": pv,
+               "a": act, "sl": bool(self.slime)}
+        if self.us.get("stamp_share"):
+            # 도장판 공개 — 이번 달 도장(분)이 같이 실린다. 일기는 안 실린다.
+            try:
+                out["cal"] = self._stamp_pack()
+            except Exception:
+                pass
+        su, st2 = self._room_song()
+        if su:
+            out["sg"] = {"u": su, "t": st2}
+            d2 = self.us.get("room_song_likes") or {}
+            if d2.get("u") == su and int(d2.get("n") or 0) > 0:
+                out["sg"]["lk"] = int(d2["n"])
+        b64, ch = self._room_card_thumb()
+        if ch:
+            # 방 칸 꾸미기 — 해시는 늘 싣고, 그림 자체는 시간창으로만.
+            # 예전엔 '여섯 번에 한 번' 셈이었는데 화면 그리기도 이 함수를
+            # 불러 셈을 소모해, 정작 네트워크 박자에 그림이 안 실렸다.
+            # 40초마다 8초 창이면 어떤 박자든 곧 걸린다.
+            out["cdh"] = ch
+            now2 = time.time()
+            if getattr(self, "_cd_push", False) or (now2 % 40.0) < 8.0:
+                out["cd"] = b64
+                self._cd_push = False
+        return out
+
+    def _room_start(self):
+        if self.room_net is not None or not self._room_on():
+            return
+        # 보낼 값을 같이 넘긴다 — 첫 바퀴부터 자리를 알리게 (지뢰: 사가 사례)
+        try:
+            first = self._room_state_now()
+        except Exception:
+            first = None
+            self._log_error("room_first_state")
+        try:
+            self.room_net = RoomNet(self.char, self.us.get("room_code"), first)
+            self._room_push = time.time()
+        except Exception:
+            self.room_net = None
+            self._log_error("room_start")
+
+    def _room_stop(self):
+        if self.room_net is not None:
+            try:
+                self.room_net.close()
+            except Exception:
+                pass
+            self.room_net = None
+        self.room_people = []
+
+    def _room_tick(self, now):
+        """방과 주고받기 — 그리는 쪽은 절대 기다리지 않는다."""
+        if not self._room_on():
+            if self.room_net is not None:
+                self._room_stop()
+                self._room_close()
+            return
+        if self.room_net is None:
+            self._room_start()
+        if self.room_net is None:
+            return
+        # 홈 창이 닫혀 있으면 천천히 — 명단은 창이 떠 있을 때만 쓴다
+        # 멈춰 있으면 스스로 다시 시작한다. 한 번도 성공하지 못한 채
+        # 오래 지났으면 통신층이 그 자리에 걸린 것이다 — 맥에서 주소 조회가
+        # 걸리면 시간 제한이 안 먹어 영영 그대로다 (사가 사례).
+        net = self.room_net
+        last = max(getattr(net, "ok_at", 0.0) or 0.0,
+                   getattr(net, "born", 0.0) or 0.0)
+        # 자리는 90초가 지나면 남의 명단에서 사라진다. 한 바퀴에 한 번밖에
+        # 못 통하는 상태에서도 자리가 유지되도록 그보다 짧게 잡는다.
+        gap = 60.0 if self._room_retry < 20 else 300.0
+        if now - last > gap and now - self._room_retry_at > gap:
+            self._room_retry += 1
+            self._room_retry_at = now
+            self._room_stop()
+            self._room_start()
+            return
+        self.room_net.idle = (self.room_win is None)
+        if now - self._room_push > (10.0 if self.room_win is None else 2.0):
+            self._room_push = now
+            self.room_net.push(self._room_state_now())
+        # 서버가 받아 준 신호를 세어 둔다 (그 사람 칸에 보인다)
+        take = getattr(self.room_net, "take_sent", None)
+        if take is not None:
+            for to, _kind in take():
+                if to == "*":
+                    # 방 전체에 보낸 것은 지금 있는 사람들 몫으로 나눈다
+                    for q in self.room_people:
+                        sl = q.get("slot")
+                        if sl and sl != self.char and not q.get("off"):
+                            self._safe("sent_add", self._sent_add, sl)
+                elif to and to != self.char:
+                    self._safe("sent_add", self._sent_add, to)
+        people, events = self.room_net.drain()
+        if people:
+            self.room_people = people
+            # 방 창이 떠 있으면 안 켠 사람 그림도 받아 둔다. 안 그러면
+            # 그 자리가 회색 동그라미로만 남는다 (친구 쪽 제보).
+            self._room_want_art(
+                people if self.room_win is None else self._room_seats())
+        for ev in events:
+            self._safe("room_ev", self._room_event, ev)
+        self._safe("room_seen", self._room_seen_note, now)
+
+    def _room_seen_path(self):
+        return os.path.join(self.state_dir, ".room_seen.json")
+
+    def _room_seen_get(self):
+        """오늘 마지막으로 본 남들의 (시간, 게이지). 껐다 켜도 남는다."""
+        if self._room_seen is None:
+            got = {}
+            try:
+                with open(self._room_seen_path(), encoding="utf-8") as fp:
+                    got = json.load(fp)
+            except Exception:
+                got = {}
+            self._room_seen = got if isinstance(got, dict) else {}
+        return self._room_seen
+
+    def _day_min(self):
+        """오늘 작업일이 시작(06:00)한 뒤 흐른 분 — '오늘치'의 물리적 상한.
+
+        06시 직후에는 타이머가 하루를 넘기기 전 몇 초 동안 어제 누적이
+        '오늘' 날짜로 찍히는 시간차가 있다 (게이지 안 꺼짐 사건). 오늘
+        일한 분이 이 값을 넘으면 그 기록은 오염된 것이다.
+        """
+        now = time.time()
+        t = time.localtime(now - 6 * 3600)
+        start = time.mktime((t.tm_year, t.tm_mon, t.tm_mday, 6, 0, 0,
+                             0, 0, -1))
+        return max(0.0, (now - start) / 60.0)
+
+    def _seen_ok(self, row, day):
+        """오늘 기록으로 믿어도 되는 줄인가.
+
+        날짜·물리 상한에 더해, 쓴 시각(4번째 값)이 있으면 '그 시각까지
+        흐른 분'과도 견준다 — 06시 직후 굳은 오염 줄은 낮이 되면 현재
+        상한은 통과해 버리므로, 쓴 시각 기준이라야 영구히 가려진다.
+        """
+        # 쓴 시각이 없는 옛 형식(3칸)은 통째로 무효 — 06시 사건 때 굳은
+        # 오염 줄을 가려낼 방법이 없어서다 (준사 '유령 2시간' 제보).
+        # 새 형식은 어차피 바로 다시 쌓인다.
+        if not (isinstance(row, list) and len(row) >= 4 and row[2] == day
+                and int(row[0]) <= self._day_min() + 30):
+            return False
+        try:
+            ts = float(row[3])
+            t = time.localtime(ts - 6 * 3600)
+            start = time.mktime((t.tm_year, t.tm_mon, t.tm_mday,
+                                 6, 0, 0, 0, 0, -1))
+            if int(row[0]) > (ts - start) / 60.0 + 30:
+                return False
+        except Exception:
+            pass
+        return True
+
+    def _room_k(self):
+        """방 전용 배율 — 화면이 짧으면 3줄이 들어가게 살짝 줄인다.
+
+        사가 맥은 세로 여유가 2줄뿐이라 카드가 페이지로 밀렸다. 3열 3줄을
+        지키는 쪽이 우선이고, 줄이는 한계는 72%다 (그 밑으론 글자가 못 읽힘).
+        """
+        k = self.ui_k
+        try:
+            sh = self.root.winfo_screenheight()
+            need = (self.ROOM_TOP + 16 + 126 + 3 * self.ROOM_CH) * k
+            if need > 0:
+                fit = (sh * 0.92) / need
+                if fit < 1.0:
+                    k *= max(0.72, fit)
+        except Exception:
+            pass
+        return k
+
+    def _room_seen_note(self, now):
+        """접속 중인 사람들의 시간·게이지를 적어 둔다.
+
+        자리는 서버에서 90초면 사라져서, 접속을 끄면 그 사람 게이지가 0이
+        되고 '오늘 다 같이'에서 그만큼 깎였다. 오늘 본 마지막 값을 남겨
+        하루가 넘어가기 전에는 그대로 쓴다.
+        """
+        seen = self._room_seen_get()
+        day = self._my_workday()
+        changed = False
+        for q in self.room_people:
+            slot = q.get("slot") or ""
+            if not slot or slot == self.char:
+                continue
+            t2, p2 = int(q.get("t") or 0), float(q.get("p") or 0)
+            cap = self._day_min() + 5
+            if t2 > cap:               # 06시 경계의 시간차 — 어제 누적이 온다
+                p2 = p2 * (cap / max(t2, 1))
+                t2 = int(cap)
+            old = seen.get(slot)
+            if self._seen_ok(old, day):
+                # 같은 날 안에서는 큰 쪽만 남긴다 — 그 사람이 컴퓨터를
+                # 껐다 켜서 0을 보내와도 오늘 최고치가 안 깎인다
+                t2 = max(t2, int(old[0]))
+                p2 = max(p2, float(old[1]))
+            row = [t2, p2, day, int(now)]
+            if seen.get(slot, [None])[:3] != row[:3]:
+                seen[slot] = row
+                changed = True
+        # 오염으로 판명난 줄은 지운다 — 안 지우면 낮에 도로 살아난다
+        for slot2 in list(seen):
+            r2 = seen.get(slot2)
+            if (isinstance(r2, list) and len(r2) >= 3 and r2[2] == day
+                    and not self._seen_ok(r2, day)):
+                del seen[slot2]
+                changed = True
+        if changed and now - self._room_seen_at > 20.0:
+            self._room_seen_at = now
+            _save_json(self._room_seen_path(), seen)
+
+    def _room_diag(self, now):
+        """방 상태를 파일 하나에 적는다 (.room_diag.txt).
+
+        '왜 아무도 안 보이나'는 화면만 보고 가릴 수 없다. 서버 요청이
+        성공하는데도 아무도 안 보이는 경우가 여러 갈래라서, 어느 갈래인지
+        숫자로 남겨 둔다.
+        """
+        if now - getattr(self, "_diag_at", 0) < 10.0:
+            return
+        first = not getattr(self, "_diag_at", 0)
+        self._diag_at = now
+        net = self.room_net
+        code = str(self.us.get("room_code") or "")
+        lines = [
+            time.strftime("%Y-%m-%d %H:%M:%S"),
+            "캐릭터=%s  방기능켜짐=%s" % (self.char, self._room_on()),
+            "그린 프레임=%d  방처리=%s"
+            % (getattr(self, "_frames", 0),
+               "꺼짐(여러 번 터짐)" if getattr(self, "_room_dead", False)
+               else "정상"),
+            "터진 횟수=%s" % (dict((k, v) for k, v in self._fail.items() if v)
+                              or "없음"),
+            "통신층 다시 시작=%d번" % getattr(self, "_room_retry", 0),
+            "방 코드=%s (%d글자)"
+            % ("비어 있음(모두의 홈)" if not code else "적혀 있음", len(code)),
+            "방 번호=%s" % (getattr(net, "room", "-") if net else "-"),
+            "내 자리 이름=%s" % (getattr(net, "slot", "-") if net else "-"),
+        ]
+        if net is None:
+            lines.append("통신층이 없음 — 시작하지 못했다")
+        else:
+            # 진단이 진단하다 터지면 아무 소용이 없다. 값이 없어도 그냥 적는다.
+            st = getattr(net, "stat", None) or {}
+            ok_at = getattr(net, "ok_at", 0) or 0
+            lines += [
+                "심장=%s" % st.get("beat", "-"),
+                "명단=%s" % st.get("list", "-"),
+                "신호=%s" % st.get("take", "-"),
+                "부른 횟수=%s  마지막 성공=%s"
+                % (getattr(net, "calls", "-"),
+                   ("%.0f초 전" % (now - ok_at)) if ok_at else "없음"),
+                "마지막 오류=%s" % (getattr(net, "err", None) or "없음"),
+                "통신 스레드 살아있음=%s"
+                % (getattr(getattr(net, "_th", None), "is_alive", bool)()
+                   if getattr(net, "_th", None) else "-"),
+                "지금 보이는 사람=%s"
+                % ([q.get("slot") for q in self.room_people] or "없음"),
+            ]
+        # 한 장만 남기면 '켠 직후' 모습만 보고 끝난다. 최근 것들을 같이
+        # 남겨서, 숫자가 늘어나는지 멈춰 있는지가 한눈에 보이게 한다.
+        hist = getattr(self, "_diag_hist", None)
+        if hist is None:
+            hist = self._diag_hist = []
+        hist.insert(0, "\n".join(lines))
+        del hist[8:]
+        head = ["(새것부터. 켠 지 %.0f초, %d번째 기록)"
+                % (now - self._room_born, len(hist)), ""]
+        try:
+            _save_json_text(os.path.join(self.state_dir, ".room_diag.txt"),
+                            "\n".join(head + ["\n-----\n".join(hist)]) + "\n")
+        except Exception:
+            pass
+        if first:
+            pass
+
+    INBOX_MAX = 100          # 하루에 이만큼까지 쌓아 둔다
+    INBOX_SHOW = 7           # 목록에 한 번에 보이는 줄 수
+    # 종류 → (목록에 쓰는 말, 짧은 말, 색)
+    INBOX_WORD = {"poke": ("콕 찔렀어요", "콕", "#ff8fb8"),
+                  "cheer": ("응원했어요", "응원", "#ffbe55"),
+                  "blanket": ("쓰담쓰담 해 줬어요", "쓰담", "#ff9ec4"),
+                  "snack": ("간식을 놓고 갔어요", "간식", "#8fd18f"),
+                  "praise": ("칭찬해 줬어요", "칭찬", "#ffd75e"),
+                  "songlike": ("노래를 좋아해요", "♥노래", "#ff6f8e")}
+    # '인사'는 뺐다 — 보내는 길이 없어진 뒤로 아무도 못 쓴다. 아주 오래된
+    # 판이 보내더라도 '반응을 보냈어요'로 받아 준다 (_inbox_line).
+
+    def _inbox_path(self):
+        return os.path.join(self.state_dir, ".room_inbox.json")
+
+    def _inbox_get(self):
+        """오늘 받은 반응 꾸러미. 처음 부를 때 파일에서 읽는다."""
+        if self._inbox is None:
+            d = {"day": "", "seen": 0, "next": 0, "list": []}
+            try:
+                with open(self._inbox_path(), encoding="utf-8") as fp:
+                    got = json.load(fp)
+                if isinstance(got, dict):
+                    d.update(got)
+            except Exception:
+                pass
+            if not isinstance(d.get("list"), list):
+                d["list"] = []
+            if not isinstance(d.get("sent"), dict):
+                d["sent"] = {}
+            self._inbox = d
+        self._inbox_roll()
+        return self._inbox
+
+    def _inbox_roll(self):
+        """작업일이 바뀌면 비운다 — '하루'는 새벽 6시 경계다 (지뢰 1).
+
+        번호(next·seen)는 안 되돌린다. 되돌리면 어제 읽은 번호가 오늘
+        것보다 커서 새로 온 것을 이미 본 것으로 여긴다.
+        """
+        d = self._inbox
+        if d is None:
+            return
+        day = self._my_workday()
+        if d.get("day") != day:
+            d["day"] = day
+            d["list"] = []
+            d["sent"] = {}
+            d["snack"] = None
+            self._snack_on = False
+            self._inbox_save()
+
+    def _inbox_save(self):
+        try:      # 여는 순간 지워지는 open("w") 말고 _save_json 으로 (지뢰 35)
+            _save_json(self._inbox_path(), self._inbox, indent=1)
+        except Exception:
+            self._log_error("inbox_save")
+
+    def _inbox_add(self, slot, name, kind):
+        """받은 반응 하나를 쌓는다."""
+        d = self._inbox_get()
+        d["next"] = int(d.get("next") or 0) + 1
+        d["list"].append({"i": d["next"], "f": slot or "", "n": name or "",
+                          "k": kind or "", "t": time.time()})
+        if len(d["list"]) > self.INBOX_MAX:
+            d["list"] = d["list"][-self.INBOX_MAX:]
+        self._inbox_save()
+
+    def _sent_add(self, slot):
+        """그 사람에게 보낸 것이 서버에 닿았다."""
+        d = self._inbox_get()
+        if not isinstance(d.get("sent"), dict):
+            d["sent"] = {}
+        d["sent"][slot] = int(d["sent"].get(slot, 0)) + 1
+        self._inbox_save()
+
+    def _sent_count(self, slot):
+        """오늘 그 사람에게 보낸 수 (서버가 받아 준 것만)."""
+        try:
+            return int((self._inbox_get().get("sent") or {}).get(slot, 0))
+        except Exception:
+            return 0
+
+    def _sent_total(self):
+        try:
+            return sum(int(v) for v in
+                       (self._inbox_get().get("sent") or {}).values())
+        except Exception:
+            return 0
+
+    SNACK_DROP = 1.2         # 간식이 떨어지는 데 걸리는 시간(초)
+
+    def _snack_get(self):
+        """책상에 놓인 간식 (없으면 None). 첫 사용 때 파일에서 읽는다."""
+        if self._snack_on is None:
+            d = self._inbox_get()
+            got = d.get("snack")
+            self._snack_on = got if isinstance(got, dict) else False
+        return self._snack_on or None
+
+    def _snack_place(self, name):
+        """간식을 책상에 놓는다. 이미 있으면 최신 것으로 바꾼다."""
+        self._snack_on = {"k": str(name or ""), "t": time.time()}
+        d = self._inbox_get()
+        d["snack"] = self._snack_on
+        self._inbox_save()
+
+    # 간식 이름 → 소리 종류. 없는 이름은 munch(오물오물).
+    SNACK_CAT = {"apple": "crunch", "watermelon": "crunch", "bar": "crunch",
+                 "chocolate-chip-cookies": "crunch", "cartoon-cat": "crunch",
+                 "coconut": "crunch", "kiwi": "crunch",
+                 "carrot": "crunch", "cucumber": "crunch",
+                 "tonkatsu": "crunch",
+                 "drink": "drink"}
+
+    SNACK_CUP_RATE = 0.25    # 간식을 줄 때 스페셜 컵케이크가 나올 확률
+
+    def _cup_name(self):
+        """내 캐릭터의 스페셜 컵케이크 — 파일이 있어야 나온다.
+
+        기뽀 사용자가 캐릭터마다 하나씩 그려 준 그림. 이름은 그림(art)
+        기준이라 선물 도로롱(사탄)도 도로롱 컵케이크가 나온다.
+        """
+        art = self.ROOM_ART.get(self.char)
+        art = art[1] if isinstance(art, (tuple, list)) else (art or self.char)
+        short = str(art)
+        if short.startswith("parts_"):
+            short = short[6:]
+        if short == "dororong_gift":
+            short = "dororong"
+        name = "cup_" + short
+        p = os.path.join(self.dir, "snacks_special", name + ".png")
+        return name if os.path.isfile(p) else ""
+
+    def _sparkle_sound(self):
+        snd = getattr(self, "sparksnd", None)
+        if snd is not None:
+            snd.play()
+        else:                        # 소리가 없으면 평소 띠링으로 물러난다
+            self._room_sound()
+
+    def _snack_sound(self, name=""):
+        """간식에 맞는 먹는 소리 — 없으면 아무거나, 그것도 없으면 클릭 소리."""
+        pools = getattr(self, "snacksnd", None)
+        if isinstance(pools, dict) and pools:
+            cat = self.SNACK_CAT.get(str(name), "munch")
+            snd = pools.get(cat) or pools.get("munch") or pools.get("")                 or next(iter(pools.values()))
+            snd.play()
+            return
+        snd = pools or getattr(self, "pokesnd", None)
+        if snd is not None:
+            snd.play()
+
+    def _snack_eat(self):
+        """간식을 눌렀을 때 — 두 입 베어 물고, 세 번째에 다 먹는다.
+
+        (예전엔 두 번이었는데 세 입으로 늘렸다 — 소리도 매번 난다.)
+        """
+        sn = self._snack_get()
+        bites = int((sn or {}).get("b") or 0)
+        if sn and bites < 2:
+            sn["b"] = bites + 1          # 한 입 — 그림에 이빨 자국이 는다
+            d = self._inbox_get()
+            d["snack"] = sn
+            self._inbox_save()
+            self.smile_until = max(self.smile_until, time.time() + 2.0)
+            self._safe("snack_snd", self._snack_sound, sn.get("k") or "")
+            self._say("냠" if bites == 0 else "냠냠", 1.6)
+            return
+        kind_name = (sn or {}).get("k") or ""
+        self._snack_take()
+        self.smile_until = max(self.smile_until, time.time() + 2.5)
+        self._safe("snack_snd", self._snack_sound, kind_name)
+        self._say(random.choice(self.SNACK_EAT), 3.0)
+
+    SNACK_EAT = ("잘 먹었습니다!", "맛있다…", "고마워요!", "힘이 나요!")
+
+    def _snack_take(self):
+        """눌러서 먹었다 — 자리에서 치운다."""
+        self._snack_on = False
+        self._snack_box = None
+        d = self._inbox_get()
+        d["snack"] = None
+        self._inbox_save()
+
+    def _inbox_items(self):
+        """새것이 위로 오게 뒤집어 돌려준다."""
+        return list(reversed(self._inbox_get().get("list") or []))
+
+    def _inbox_unread(self):
+        """안 본 개수 — 깃발이 아니라 번호로 계산한다 (지뢰 30)."""
+        d = self._inbox_get()
+        seen = int(d.get("seen") or 0)
+        return sum(1 for it in (d.get("list") or [])
+                   if int(it.get("i") or 0) > seen)
+
+    def _inbox_read(self):
+        """읽음은 목록을 여는 순간 찍는다. 저장이 실패해도 값은 올린다."""
+        d = self._inbox_get()
+        top = max([int(it.get("i") or 0) for it in (d.get("list") or [])]
+                  or [0])
+        d["seen"] = max(int(d.get("seen") or 0), top)
+        self._inbox_save()
+
+    def _inbox_line(self, it):
+        """목록 한 줄 — '도로롱이 콕 찔렀어요'."""
+        who = str(it.get("n") or "") or self.ROOM_NAME.get(
+            str(it.get("f") or ""), "")
+        word, _short, col = self.INBOX_WORD.get(
+            str(it.get("k") or ""), ("반응을 보냈어요", "반응", "#c0b8c8"))
+        return ("%s %s" % (_josa(who), word) if who
+                else "누군가 %s" % word), col
+
+    def _inbox_welcome(self, now):
+        """자리를 비운 사이에 온 반응을 돌아왔을 때 한 번 알려 준다.
+
+        홈을 안 켜 두는 사람에게도 전달되도록 캐릭터가 말한다.
+        """
+        if not self._away_got:
+            return
+        last = max(getattr(self, "last_key", 0.0),
+                   getattr(self, "last_pointer", 0.0))
+        if now - last > 2.0:              # 아직 안 돌아왔다
+            return
+        got, self._away_got = self._away_got, []
+        if len(got) >= 3:
+            self._say("자리 비운 사이에 %d개 받았어요" % len(got), 5.0)
+            return
+        part = []
+        for i, (who, kind) in enumerate(got):
+            word, short, _c = self.INBOX_WORD.get(
+                kind, ("반응을 보냈어요", "반응", ""))
+            tail = word if i == len(got) - 1 else short
+            part.append("%s %s" % (_josa(who) if who else "누군가", tail))
+        self._say("자리 비운 사이에 " + ", ".join(part), 5.0)
+
+    def _room_event(self, ev):
+        """남이 보낸 신호 — 내 캐릭터가 반응한다."""
+        who = ""
+        mine = (ev.get("f") == self.char)     # 내가 나에게 (혼자 눌러 본 것)
+        cup = (ev.get("k") == "snack"
+               and str(ev.get("x") or "").startswith("cup_"))
+        if mine:
+            k = ev.get("k")
+            self.smile_until = max(self.smile_until, time.time() + 2.5)
+            self._say({"poke": "콕!", "cheer": "혼자 응원해 봤어요",
+                       "blanket": "혼자 쓰담쓰담 했어요",
+                       "snack": "간식을 먹었어요"}.get(k, "…"), 3.0)
+            self._room_flash[self.char] = time.time()
+            if k == "snack":
+                self._safe("snack_place", self._snack_place,
+                           ev.get("x") or self._snack_pick(time.time() * 1000))
+            self._char_fx_add(k, ev.get("x") or "")
+            if cup:                      # 혼자 뽑아도 반짝인다
+                self.smile_until = max(self.smile_until, time.time() + 6.0)
+                self._char_fx_add("praise", "")
+                self._safe("sparkle_snd", self._sparkle_sound)
+            else:
+                self._safe("self_poke_snd", self._room_sound)
+            return
+        if False:
+            pass
+        else:
+            for p in self.room_people:
+                if p.get("slot") == ev.get("f"):
+                    who = str(p.get("n") or "")
+                    break
+            # 홈이 닫혀 있으면 명단이 2분까지 묵는다. 이름이 없으면 표로 채운다.
+            who = who or self.ROOM_NAME.get(ev.get("f") or "", "")
+        kind = ev.get("k")
+        now = time.time()
+        self._safe("inbox_add", self._inbox_add, ev.get("f"), who, kind)
+        if kind == "snack":
+            # 간식은 책상에 남는다 — 눌러야 없어지고, 또 받으면 최신 것으로.
+            self._safe("snack_place", self._snack_place,
+                       ev.get("x") or self._snack_pick(time.time() * 1000))
+        # 자리를 비운 사이에 온 것은 따로 적어 둔다 (돌아오면 알려 준다)
+        last = max(getattr(self, "last_key", 0.0),
+                   getattr(self, "last_pointer", 0.0))
+        if now - last > max(60.0, float(getattr(self, "idle_thr", 120.0))):
+            self._away_got.append((who, kind))
+            del self._away_got[:-20]
+        # 타이머 화면에서 터진다. 칭찬은 금별 대신 쓰담 손이 나온다 —
+        # 아래 칭찬 분기에서 고깔·폭죽과 한 묶음으로 연출한다.
+        self._char_fx_add("blanket" if kind == "praise" else kind,
+                          ev.get("x") or "")
+        if cup:
+            # 스페셜 컵케이크 — 샤라랑 + 반짝임 + 한참 웃는 얼굴
+            self.smile_until = max(self.smile_until, now + 6.0)
+            self._char_fx_add("praise", "")
+            self._safe("sparkle_snd", self._sparkle_sound)
+        else:
+            self._safe("room_poke_snd", self._room_sound)  # 띠링 (평소와 다르게)
+        if self.stretch_pending:
+            # 스트레칭 알림이 말풍선을 붙잡고 기지개를 되풀이하는 동안에는
+            # 반응이 3초 만에 도로 덮이고, 기울인 머리가 연출을 가린다.
+            # 몸짓을 그 자리에서 멈추고 잠깐 쉰다 (알림 자체는 그대로).
+            self.gest = None
+            self.stretch_replay = now + 6.0
+        if kind == "poke":
+            self.smile_until = max(self.smile_until, now + 2.5)
+            self._say(("%s 콕 찔렀어요" % _josa(who)) if who
+                      else "누가 콕 찔렀어요", 3.0)
+        elif kind == "blanket":
+            self._say(("%s 쓰담쓰담 해 줬어요" % _josa(who)) if who
+                      else "쓰담쓰담 받았어요", 3.5)
+            # 쓰다듬는 동안 계속 웃는다 (연출이 끝날 때까지)
+            self.smile_until = max(self.smile_until, now + self.CHAR_FX)
+        elif kind == "cheer":
+            self.smile_until = max(self.smile_until, now + 3.0)
+            self._say(("%s 응원했어요" % _josa(who)) if who
+                      else "누가 응원했어요", 3.5)
+        elif kind == "songlike":
+            # 내 오노추에 좋아요 — '누가 눌렀나'로 세서 한 사람당 하나만.
+            # 누르는 쪽은 다시 보내도 되게 풀어 두었으므로 (옛 버전에게
+            # 흘린 좋아요를 재시도할 수 있게), 중복 거르기는 여기서 한다.
+            su, _t2 = self._room_song()
+            frm = str(ev.get("f") or "")
+            counted = False
+            if su:
+                d2 = self.us.get("room_song_likes") or {}
+                if d2.get("u") != su:
+                    d2 = {"u": su, "n": 0, "who": []}
+                likers = list(d2.get("who") or [])
+                if not frm or frm not in likers:
+                    if frm:
+                        likers.append(frm)
+                    self.us["room_song_likes"] = {
+                        "u": su, "n": int(d2.get("n") or 0) + 1,
+                        "who": likers[-30:]}
+                    self._save_settings()
+                    self._room_push_now()
+                    counted = True
+            if counted:
+                self.smile_until = max(self.smile_until, now + 3.0)
+                self._say(("%s 내 노래를 좋아해요 ♥" % _josa(who)) if who
+                          else "누가 내 노래를 좋아해요 ♥", 3.5)
+        elif kind == "praise":
+            # 목표를 다 채운 사람에게 오는 축하 — 웃는 얼굴로 쓰담을 받고,
+            # 고깔모자가 얹히고, 폭죽이 터진다.
+            self.smile_until = max(self.smile_until, now + 8.0)
+            self.hat_until = max(self.hat_until, now + 10.0)
+            self._safe("praise_burst", self._burst, 26, 60)
+            self._say(("%s 칭찬해 줬어요! 오늘 목표 달성!" % _josa(who))
+                      if who else "칭찬 받았어요! 오늘 목표 달성!", 4.5)
+        elif kind == "snack" and cup:
+            self._say(("%s 스페셜 컵케이크를 줬어요!" % _josa(who)) if who
+                      else "스페셜 컵케이크가 왔어요!", 5.0)
+            self.smile_until = max(self.smile_until, now + 6.0)
+        elif kind == "snack":
+            self._say(("%s 간식을 놓고 갔어요" % _josa(who)) if who
+                      else "간식이 놓여 있어요", 3.5)
+            self.smile_until = max(self.smile_until, now + 3.0)
+        if self.stretch_pending and self.bubble:
+            # 알림 문구가 곧 도로 덮으므로, 반응 말풍선을 조금 더 잡아 둔다
+            self.bubble = (self.bubble[0], now + 5.0)
+        self._room_flash[ev.get("f", "")] = now
+        # 받은 것은 내 칸에서 터진다
+        self._room_fx_add(self.char, kind, ev.get("x") or "")
+
+    def _poke_sound(self):
+        snd = getattr(self, "pokesnd", None)
+        if snd is not None:
+            snd.play()
+
+    def _room_sound(self):
+        """홈에서 남이 눌러 줬을 때. 파일이 없는 옛 파츠면 평소 소리로."""
+        snd = getattr(self, "roomsnd", None) or getattr(self, "pokesnd", None)
+        if snd is not None:
+            snd.play()
+
+    # ── 앉은 모습 그림 받아 두기 ────────────────────────────────────────
+    def _room_art_dir(self):
+        d = os.path.join(self.state_dir, ".room_art")
+        os.makedirs(d, exist_ok=True)
+        return d
+
+    def _room_want_art(self, people):
+        """없는 그림만 뒤에서 조용히 받아 둔다 (그리기와 따로)."""
+        need = []
+        for p in people:
+            slot = p.get("slot") or ""
+            if slot not in self.ROOM_ART or slot in self._room_art_bad:
+                continue
+            for tag in ("seat.png", "seat_idle.png", "seat_type.png",
+                        "seat_pen.png", "seat_pen2.png", "seat_meta.json"):
+                if os.path.isfile(os.path.join(HERE, slot, tag)):
+                    continue                      # 원본이 여기 있다
+                if not os.path.isfile(os.path.join(self._room_art_dir(),
+                                                   "%s_%s" % (slot, tag))):
+                    need.append((slot, tag))
+        if not need or self._room_art_th is not None:
+            return
+
+        def work():
+            for slot, tag in need:
+                repo, folder = self.ROOM_ART[slot]
+                url = ("https://raw.githubusercontent.com/rlfqjxm0-create/"
+                       "%s/main/%s/%s" % (repo, folder, tag))
+                try:
+                    req = urllib.request.Request(
+                        url, headers={"User-Agent": "mascot-room"})
+                    with urllib.request.urlopen(req, timeout=20,
+                                            context=_ssl_ctx()) as r:
+                        raw = r.read()
+                    if len(raw) < 200:
+                        raise ValueError("너무 작음")
+                    tmp = os.path.join(self._room_art_dir(),
+                                       "%s_%s.tmp" % (slot, tag))
+                    with open(tmp, "wb") as fp:
+                        fp.write(raw)
+                    os.replace(tmp, tmp[:-4])
+                except Exception:
+                    self._room_art_bad.add(slot)
+            self._room_art_th = None
+
+        self._room_art_th = threading.Thread(target=work, daemon=True)
+        self._room_art_th.start()
+
+    def _room_art_file(self, slot, name):
+        """받아 둔 것 먼저, 없으면 내 컴퓨터의 원본."""
+        p = os.path.join(self._room_art_dir(), "%s_%s" % (slot, name))
+        if os.path.isfile(p):
+            return p
+        local = os.path.join(HERE, slot, name)
+        return local if os.path.isfile(local) else None
+
+    def _room_deskline(self, slot):
+        """그림에서 책상이 시작되는 높이 (0~1). 모르면 None."""
+        if slot in self._room_meta:
+            return self._room_meta[slot]
+        v = None
+        p = self._room_art_file(slot, "seat_meta.json")
+        if p:
+            try:
+                with open(p, encoding="utf-8") as fp:
+                    v = float(json.load(fp).get("desk"))
+            except Exception:
+                v = None
+        self._room_meta[slot] = v
+        return v
+
+    def _room_img(self, slot, tag):
+        """방에 그릴 그림 — (몸, 책상) 두 조각. 아직 없으면 None.
+
+        숨쉬듯 위아래로 움직이는 것은 몸뿐이어야 한다. 통째로 흔들면
+        책상까지 떠올라 어색하다. 책상이 시작되는 높이는 그림을 만들 때
+        같이 적어 둔다(seat_meta.json). 없으면 통짜로 돌려준다.
+        """
+        k = (slot, tag)
+        got = self._room_img_cache.get(k)
+        if got is not None:
+            return got
+        p = self._room_art_file(slot, tag + ".png")
+        if p is None:
+            if tag not in ("seat", "seat_idle"):
+                return self._room_img(slot, "seat")   # 옛 배포본 — 기본 자세로
+            return None
+        try:
+            im = Image.open(p).convert("RGBA")
+            h = int(self.ROOM_FIG * self._room_k() * self.ROOM_SIZE.get(slot, 1.0))
+            im = im.resize((max(1, int(im.width * h / im.height)), h),
+                           Image.LANCZOS)
+            # 흰 테두리 — 방 칸에 그림을 깔면 캐릭터가 묻혀서 두른다.
+            # 아래(바닥 색 영역)로는 번지지 않게 맨 밑 두 줄은 지운다.
+            try:
+                from PIL import ImageDraw, ImageFilter
+                a2 = im.split()[3].point(lambda v: 255 if v > 60 else 0)
+                grow = a2.filter(ImageFilter.MaxFilter(5))
+                d3 = ImageDraw.Draw(grow)
+                d3.rectangle([0, im.height - 2, im.width, im.height],
+                             fill=0)
+                white = Image.new("RGBA", im.size, (255, 255, 255, 0))
+                white.putalpha(grow)
+                im = Image.alpha_composite(white, im)
+            except Exception:
+                pass
+            line = self._room_deskline(slot)
+            if line and 0.2 < line < 0.95:
+                # 몸은 통짜로 두고, 책상 조각을 그 위에 고정으로 덮는다.
+                # 몸을 잘라 올리면 잘린 자리가 그대로 드러난다 (실제로 겪음).
+                cut = int(h * line)
+                pair = (ImageTk.PhotoImage(im),
+                        ImageTk.PhotoImage(im.crop((0, cut, im.width, h))),
+                        h - cut)
+            else:
+                pair = (ImageTk.PhotoImage(im), None, 0)
+        except Exception:
+            self._room_art_bad.add(slot)
+            return None
+        if len(self._room_img_cache) > 40:      # 상한 (지뢰 18)
+            for old in list(self._room_img_cache)[:20]:
+                self._room_img_cache.pop(old, None)
+        self._room_img_cache[k] = pair
+        return pair
+
+    def _room_head(self, slot, tag):
+        """방 카드 그림에서 머리 자리 — (중심 x, 꼭대기 y, 반폭, 그림 폭, 높이).
+
+        그림 왼쪽 위 기준 픽셀 좌표. 캐릭터마다 머리 위치가 달라 알파로
+        잰다 — 맨 윗줄 언저리의 불투명 픽셀 띠가 곧 머리(머리카락)다.
+        """
+        h = int(self.ROOM_FIG * self._room_k() * self.ROOM_SIZE.get(slot, 1.0))
+        key = (slot, tag, h)
+        hit = self._room_head_cache.get(key)
+        if hit is not None:
+            return hit
+        p = self._room_art_file(slot, tag + ".png")
+        if p is None:
+            return None
+        try:
+            im = Image.open(p).convert("RGBA")
+            im = im.resize((max(1, int(im.width * h / im.height)), h),
+                           Image.LANCZOS)
+            a = im.split()[3]
+            bb = a.getbbox()
+            if not bb:
+                return None
+            # '맨 위 불투명 픽셀'을 머리로 보면 안 된다 — 자는 그림에는
+            # zzZ·콧방울이, 도로롱은 머리장식·리본이 그 위에 떠 있어
+            # 왕관이 허공에 얹힌다. 폭이 그림의 30%를 넘는 줄이 3줄
+            # 연속되는 첫 자리가 머리(정수리)다 — 가는 장식은 못 넘는다.
+            pxa = a.load()
+            thr_w = im.width * 0.30
+            top = bb[1]
+            run = 0
+            for y in range(bb[1], min(h, bb[1] + int(h * 0.6))):
+                cnt = 0
+                for x in range(bb[0], bb[2], 2):
+                    if pxa[x, y] > 40:
+                        cnt += 1
+                if cnt * 2 >= thr_w:
+                    run += 1
+                    if run >= 3:
+                        top = y - 2
+                        break
+                else:
+                    run = 0
+            band = a.crop((0, top, im.width,
+                           min(h, top + max(4, int(h * 0.16)))))
+            b2 = band.getbbox()
+            if b2:
+                got = ((b2[0] + b2[2]) / 2.0, float(top),
+                       (b2[2] - b2[0]) / 2.0, float(im.width), float(h))
+            else:
+                got = (im.width / 2.0, float(top), im.width * 0.25,
+                       float(im.width), float(h))
+        except Exception:
+            return None
+        self._room_head_cache[key] = got
+        return got
+
+    # 왕관 (가로, 세로) 보정 (hw 배수) — 생김새 때문에 표준 위치가 안 맞는
+    # 캐릭터. 개구리는 눈이 정수리에 있고, 도로롱은 옆머리 장미 뭉치 때문에
+    # 머리 중심이 오른쪽으로 잡힌다.
+    CROWN_FIT = {"parts_peugo": (0.0, -0.25),
+                 "parts_dororong": (-0.22, -0.10),
+                 "parts_dororong_gift": (-0.22, -0.10)}
+
+    def _room_hat_img(self, hh):
+        """방 카드용 왕관 — 높이 hh 로 줄인 것 (캐시). 기울이지 않는다."""
+        hh = max(10, int(hh))
+        hit = self._room_hat_cache.get(hh)
+        if hit is not None:
+            return hit
+        p = os.path.join(self.dir, "crown.png")
+        if not os.path.exists(p):
+            p = os.path.join(self.dir, "hat.png")   # 옛 배포본 폴백
+        if not os.path.exists(p):
+            return None
+        try:
+            im = Image.open(p).convert("RGBA")
+            bb = im.split()[3].getbbox()
+            if bb:
+                im = im.crop(bb)
+            im = im.resize((max(6, round(im.width * hh / im.height)), hh),
+                           Image.LANCZOS)
+            got = ImageTk.PhotoImage(im)
+        except Exception:
+            return None
+        if len(self._room_hat_cache) > 8:
+            for old in list(self._room_hat_cache)[:4]:   # 지뢰 18
+                self._room_hat_cache.pop(old, None)
+        self._room_hat_cache[hh] = got
+        return got
+
+    def _room_party_draw(self, cv, slot, pose, cx, base, k, col):
+        """목표를 다 채운 사람 — 고깔모자와 파티 화관을 씌워 준다.
+
+        게이지(p)가 100%면 누구 화면에서나 이렇게 보인다. 따로 보내는
+        값은 없다 — 이미 실려 오는 진행률로 각자 그린다.
+        """
+        got = self._room_head(slot, pose)
+        if not got:
+            return
+        hx, hy, hw, iw, ih = got
+        # 그림은 anchor="s" 로 (cx, base) 에 붙는다 → 왼쪽 위 = (cx-iw/2, base-ih)
+        px = cx - iw / 2 + hx
+        py = base - ih + hy
+        hat = self._room_hat_img(hw * 0.72)
+        if hat is not None:            # 왕관 — 정수리에 눌러 쓴 느낌으로
+            dx, dy = self.CROWN_FIT.get(slot, (0.0, 0.0))
+            cv.create_image(px + dx * hw, py + (0.42 + dy) * hw, image=hat,
+                            anchor="s", tags="dyn")
+        # 고깔(기울인 모자)·구슬 화관을 거쳐 왕관으로 정착 (사용자 요청)
+
+    # ── 방 창 ───────────────────────────────────────────────────────────
+    def _room_palette(self):
+        """방 배경은 내 캐릭터 테마색의 파스텔.
+
+        보는 사람마다 자기 색의 방이 된다 — 도로롱은 분홍, 기뽀는 연두.
+        시간에 따라 밝기만 조금 달라진다 (작업일 기준이 아니라 시계 기준).
+        칸 색은 여기서 정하지 않는다 — 칸은 흰색에 가깝게 두고, 그 사람
+        테마색은 바닥과 테두리에만 쓴다.
+        """
+        h = time.localtime().tm_hour
+        if 6 <= h < 17:                      # 낮 — 가장 밝게
+            d, ink, sub = 0.0, "#6f5460", "#a8919c"
+        elif 17 <= h < 20:                   # 저녁 — 조금 진하게
+            d, ink, sub = 0.022, "#6d4e58", "#a68b95"
+        else:                                # 밤 — 한 단계 더
+            d, ink, sub = 0.045, "#584a5c", "#96879a"
+        key = (self.char, int(d * 1000))
+        hit = self._room_pal_cache.get(key)
+        if hit:
+            return hit
+        p = self._room_pastel
+        # 배경은 칸보다 색기를 낮춘다 — 안 그러면 진한 테마색(멸종 #ba2028)
+        # 에서 벽이 눈에 띄게 붉어져 캐릭터가 묻힌다.
+        out = {"wall": p(self.char, 0.970 - d * 0.6, 0.35, 0.50),
+               "dot": p(self.char, 0.930 - d * 0.6, 0.35, 0.55),
+               "card": "#ffffff",   # 방(칸)은 흰색 — 테마색은 바닥 띠가 맡는다
+               "line": p(self.char, 0.920 - d, 0.35, 0.55),
+               "bar": p(self.char, 0.982 - d * 0.6, 0.30, 0.45),
+               "lamp": p(self.char, 0.870 - d, 0.45, 0.70),
+               "ink": ink, "sub": sub}
+        if len(self._room_pal_cache) > 12:
+            self._room_pal_cache = {}
+        self._room_pal_cache[key] = out
+        return out
+
+    def _room_reset(self):
+        """방 코드나 켬/끔이 바뀌었을 때 — 끊고 다시 붙는다."""
+        self._room_close()
+        self._room_stop()
+        self.room_people = []
+        self._room_flash.clear()
+
+    def _room_toggle(self):
+        """우클릭 > 홈. 처음이면 무엇이 나가는지 알려 주고 물어본다."""
+        if self.room_win is not None:
+            self._room_close()
+        elif self.us.get("room_seen") and self.us.get("room_on"):
+            self._safe("room_open", self._room_open)
+        else:
+            self._safe("room_ask", self._room_ask)
+
+    def _room_ask(self):
+        """켜기 전에 한 번만 — 무엇이 나가고 무엇은 안 나가는지."""
+        if getattr(self, "_room_ask_win", None) is not None                 and self._room_ask_win.winfo_exists():
+            self._room_ask_win.lift()
+            return
+        cd, u = self.card, self._ui
+        W, H = u(372), u(268)
+        win = tk.Toplevel(self.root)
+        self._keep_front(win, focus=False)
+        self._room_ask_win = win
+        win.title("홈")
+        win.attributes("-topmost", True)
+        win.resizable(False, False)
+        win.configure(bg=cd["panel"])
+        cv = tk.Canvas(win, width=W, height=H, bg=cd["panel"],
+                       highlightthickness=0)
+        cv.pack()
+        self._rr(cv, u(14), u(12), W - u(14), u(46), u(12), fill=cd["soft"],
+                 outline=cd["border"], width=2)
+        cv.create_text(W / 2, u(29), text="친구들과 같이 앉아서 작업해요",
+                       font=self._uf(10, True), fill=cd["text"])
+        lines = [
+            ("보내는 것", True),
+            ("· 방에서 보일 이름 (기본은 캐릭터 이름)", False),
+            ("· 레벨과 칭호", False),
+            ("· 오늘 작업한 시간, 지금 작업 중인지 자는지", False),
+            ("보내지 않는 것", True),
+            ("· 어떤 프로그램을 쓰는지, 창 제목", False),
+            ("· 그린 그림, 할 일, 마감, 그 밖의 모든 것", False),
+        ]
+        y = u(64)
+        for text, head in lines:
+            cv.create_text(u(26), y, anchor="w", text=text,
+                           font=self._uf(9, True) if head else self._uf(9),
+                           fill=cd["fill"] if head else cd["text"])
+            y += u(23) if head else u(20)
+            if head:
+                y -= u(3)
+        cv.create_text(W / 2, H - u(62), text="환경설정에서 언제든 끌 수 있어요",
+                       font=self._uf(8), fill=cd["sub"])
+
+        def go():
+            self.us["room_seen"] = True
+            self.us["room_on"] = True
+            self._safe("room_save", self._save_settings)
+            win.destroy()
+            self._room_ask_win = None
+            self._safe("room_open", self._room_open)
+
+        def no():
+            # 이 자리에서 바로 끌 수 있게 — 설정을 뒤지게 하지 않는다
+            self.us["room_seen"] = True
+            self.us["room_on"] = False
+            self._safe("room_save", self._save_settings)
+            self._safe("room_off", self._room_reset)
+            win.destroy()
+            self._room_ask_win = None
+
+        for label, fn, x0, strong in (("들어가기", go, W / 2 + u(6), True),
+                                      ("끄기", no, W / 2 - u(114), False)):
+            self._rr(cv, x0, H - u(44), x0 + u(108), H - u(14), u(15),
+                     fill=cd["fill"] if strong else cd["soft"],
+                     outline="" if strong else cd["border"],
+                     width=0 if strong else 1)
+            cv.create_text(x0 + u(54), H - u(29), text=label,
+                           font=self._uf(9, True),
+                           fill="#ffffff" if strong else cd["text"])
+            cv.tag_bind(cv.create_rectangle(x0, H - u(44), x0 + u(108),
+                                            H - u(14), fill="", outline=""),
+                        "<Button-1>", lambda e, f=fn: f())
+        def later():
+            # 그냥 닫은 것은 고른 게 아니다 — 다음에 다시 알려 준다
+            win.destroy()
+            self._room_ask_win = None
+
+        win.protocol("WM_DELETE_WINDOW", later)
+        win.bind("<Escape>", lambda e: later())
+        x = self.root.winfo_rootx() + self.W + u(12)
+        win.geometry("+%d+%d" % (x, max(0, self.root.winfo_rooty())))
+
+    def _room_close(self):
+        self._inbox_open = False
+        self._room_fx = []
+        if self._room_job is not None:
+            try:
+                self.root.after_cancel(self._room_job)   # 지뢰 20
+            except Exception:
+                pass
+            self._room_job = None
+        w = self.room_win
+        self.room_win = None
+        self.room_cv = None
+        self._room_bg = None
+        if w is not None:
+            try:
+                w.destroy()
+            except Exception:
+                pass
+
+    def _room_open(self):
+        if self.room_win is not None:
+            return
+        if not self._room_on():
+            self._say("환경설정에서 '같이 작업하는 방'을 켜 주세요", 4.0)
+            return
+        k = self._room_k()
+        cw = int(self.ROOM_CW * k)
+        n = max(1, len(self._room_seats()))
+        cols, rows, W, H = self._room_fit(
+            int(16 * k) * 2 + int(44 * k) * 2 + cw * self.ROOM_COLS, n)
+        self._room_cols, self._room_rows = cols, rows
+        self._room_size = (0, 0)
+        win = tk.Toplevel(self.root)
+        # 홈은 보통 창이다 — 다른 창을 누르면 그 뒤로 내려간다. 항상 위로
+        # 걸어 두면 홈이 화면을 계속 차지해 오히려 걸리적거린다.
+        win.title("같이 작업 중")
+        win.resizable(True, True)
+        win.minsize(int(self.ROOM_CW * k) + int(20 * k),
+                    int((self.ROOM_TOP + 126) * k) + int(self.ROOM_CH * k))
+        win.configure(bg=self._room_palette()["wall"])
+        try:
+            win.iconphoto(False, self.tray_img) if getattr(
+                self, "tray_img", None) else None
+        except Exception:
+            pass
+        # 화면 한가운데에 띄운다 (캐릭터 옆이면 화면 밖으로 나가기도 한다)
+        sw = win.winfo_screenwidth()
+        sh = win.winfo_screenheight()
+        x = max(0, (sw - W) // 2)
+        y = max(0, (sh - H) // 2)
+        win.geometry("%dx%d+%d+%d" % (W, H, x, y))
+        # geometry 의 y 는 제목 표시줄 위가 아니라 안쪽 기준이라, 그대로 두면
+        # 제목 표시줄 높이만큼 아래로 치우친다. 실제로 놓인 자리를 재서 보정한다.
+        win.update_idletasks()
+        try:
+            win.geometry("+%d+%d" % (x + (x - win.winfo_rootx()),
+                                     y + (y - win.winfo_rooty())))
+        except Exception:
+            pass
+        cv = tk.Canvas(win, width=W, height=H, highlightthickness=0,
+                       bd=0, bg=self._room_palette()["wall"])
+        cv.pack(fill="both", expand=True)
+        cv.bind("<Button-1>", lambda e: self._safe("room_click",
+                                                   self._room_click, e))
+        cv.bind("<Button-3>", lambda e: self._safe("room_rclick",
+                                                   self._room_rclick, e))
+        cv.bind("<B1-Motion>", lambda e: self._safe("deco_drag",
+                                                    self._deco_drag, e))
+        cv.bind("<ButtonRelease-1>",
+                lambda e: self._safe("deco_drop", self._deco_drop, e))
+        cv.bind("<Motion>", lambda e: self._safe("room_hover",
+                                                 self._room_hover, e))
+        cv.bind("<Configure>", lambda e: self._safe("room_size",
+                                                    self._room_relayout))
+        cv.bind("<MouseWheel>", lambda e: self._safe("room_wheel",
+                                                     self._room_wheel, e))
+        self._room_cur = ""
+        win.protocol("WM_DELETE_WINDOW", self._room_close)
+        win.bind("<Escape>", lambda e: self._room_close())
+        try:      # 통신층이 없거나 옛 것이어도 창은 떠야 한다
+            self.room_net.idle = False
+            self.room_net.wake()          # 열자마자 최신 명단을 받는다
+        except Exception:
+            pass
+        self.room_win, self.room_cv = win, cv
+        self._room_hit = []
+        self._room_loop()
+
+    def _room_loop(self):
+        """숨쉬는 것만 바뀐 프레임에서는 몸 그림만 옮긴다.
+
+        캔버스를 통째로 지웠다 그리면 창 전체가 다시 칠해져서, 6명 기준으로
+        CPU가 9%p쯤 더 든다(실측). 사람·자세·고른 상대가 그대로면 옮기기만
+        하면 되고, 그때는 그 자리만 다시 칠해진다.
+        """
+        self._room_job = None
+        if self.room_win is None:
+            return
+        self._room_job = self.root.after(100, self._room_loop)   # 먼저 예약
+        self._safe("room_frame", self._room_frame)
+
+    def _room_key(self):
+        """다시 그려야 하는지 가르는 값 — 바뀌면 통째로 그린다."""
+        who = [(q.get("slot"), q.get("n"), q.get("lv"), q.get("ti"),
+                q.get("t"), q.get("p"), q.get("s"), q.get("cdh"))
+               for q in self.room_people]
+        fresh = [k for k, v in self._room_flash.items()
+                 if v > time.time() - 1.6]
+        # 연출이 도는 동안은 개수만 열쇠에 넣는다 — 프레임마다 다시 그리되
+        # 통째로 그리지는 않게 (연출은 _room_fx_draw 가 따로 그린다)
+        ts = self._room_toast
+        return (tuple(who), self._room_pick, self._room_page,
+                tuple(sorted(fresh)),
+                self._inbox_open, self._inbox_scroll,
+                len(self._inbox_get().get("list") or []), self._inbox_unread(),
+                self._sent_total(),
+                bool(ts and time.time() - ts[1] < self.ROOM_TOAST),
+                int(time.time() - (self.room_net.ok_at if self.room_net else 0)
+                    > 60))
+
+    @staticmethod
+    def _room_hop(slot, now, k):
+        """이따금 한 번 깡총 — 자리마다 9~16초에 한 번, 0.5초 동안.
+
+        상태를 들지 않는다. 시간과 자리 이름만으로 정해지는 순수 함수라
+        칸을 다시 그려도, 창을 껐다 켜도 이어진다.
+        """
+        ph = hash(slot) % 97
+        cyc = 9.0 + ph % 8
+        t = (now + ph) % cyc
+        if t >= 0.5:
+            return 0.0
+        return -5.0 * k * math.sin(math.pi * t / 0.5)
+
+    # 시간대 → (하늘색, 글자색, 보조색). 그림은 _room_sky_draw 가 그린다.
+    SKY = {"아침": ("#a9ddff", "#33566f", "#6c8ba1"),
+           "낮": ("#8fd0ff", "#2f5470", "#6488a0"),
+           "저녁": ("#ffb083", "#6d3a2a", "#996a58"),
+           "밤": ("#283158", "#eceaf8", "#b6b3d6"),
+           "새벽": ("#5f7cb0", "#f4f7fd", "#dde6f4")}
+
+    @staticmethod
+    def _sky_period(hour=None):
+        h = time.localtime().tm_hour if hour is None else int(hour)
+        if 6 <= h < 10:
+            return "아침"
+        if 10 <= h < 17:
+            return "낮"
+        if 17 <= h < 20:
+            return "저녁"
+        if 20 <= h or h < 2:
+            return "밤"
+        return "새벽"
+
+    # 시간대별 하늘 그라데이션 (위 → 아래)
+    SKY_GRAD = {"아침": ("#79c4f8", "#cdeaff"),
+                "낮": ("#5fb8f4", "#b8e2ff"),
+                "저녁": ("#ff8e5e", "#ffd2a3"),
+                "밤": ("#1e2648", "#3d4775"),
+                "새벽": ("#4c6aa5", "#8fabd6")}
+
+    def _room_sky_img(self, W, top, period):
+        """타이틀 띠의 하늘 그림 — 시간대·크기가 바뀔 때만 다시 만든다.
+
+        Tk 캔버스 도형은 안티앨리어싱이 없어 계단이 진다. 3배로 그려
+        LANCZOS 로 줄이면 가장자리가 부드럽고, 그라데이션도 여기서 그린다.
+        """
+        key = (int(W), int(top), period)
+        if self._sky_key == key and self._sky_img is not None:
+            return self._sky_img
+        S = 3
+        k = self._room_k() * S
+        w, h = int(W * S), int(top * S)
+
+        def hx(c):
+            return tuple(int(c[i:i + 2], 16) for i in (1, 3, 5))
+
+        t_c, b_c = map(hx, self.SKY_GRAD[period])
+        im = Image.new("RGB", (w, h))
+        dr = ImageDraw.Draw(im)
+        for y in range(h):                     # 세로 그라데이션
+            t = y / max(1, h - 1)
+            dr.line([(0, y), (w, y)],
+                    fill=tuple(int(t_c[i] + (b_c[i] - t_c[i]) * t)
+                               for i in range(3)))
+        ov = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+        d2 = ImageDraw.Draw(ov)
+        rnd = random.Random(7)                 # 별·구름 자리는 늘 같게
+
+        def ball(cx, cy, r, col, alpha=255):
+            d2.ellipse([cx - r, cy - r, cx + r, cy + r],
+                       fill=col + (alpha,))
+
+        if period in ("아침", "낮", "저녁"):
+            sy = {"아침": h * 0.62, "낮": h * 0.34, "저녁": h * 0.86}[period]
+            sx = w - 320 * k
+            col = (255, 215, 94) if period != "저녁" else (255, 122, 74)
+            for r, a in ((20 * k, 60), (16 * k, 90), (12 * k, 255)):
+                ball(sx, sy, r, col, a)        # 겹친 반투명 원 = 은은한 햇무리
+        if period in ("아침", "낮"):
+            # 구름·새는 띠 전체에 성기게 — 가운데에만 몰리면 허전하다
+            for _i in range(5):
+                cx = w * (0.05 + 0.90 * rnd.random())
+                cy = h * (0.18 + 0.44 * rnd.random())
+                sc = 0.55 + 0.55 * rnd.random()
+                for dx, dy, rr_ in ((0, 0, 11), (9, 3, 9), (-9, 3, 8)):
+                    ball(cx + dx * k * sc, cy + dy * k * sc, rr_ * k * sc,
+                         (255, 255, 255), 235 if period == "낮" else 200)
+            for _i in range(3):                # 새 — 갈매기 획
+                bx = w * (0.08 + 0.84 * rnd.random())
+                by = h * (0.2 + 0.35 * rnd.random())
+                for sign in (-1, 1):
+                    d2.line([(bx, by), (bx + 7 * k * sign, by - 5 * k)],
+                            fill=(58, 94, 122, 200), width=max(2, int(k * 1.2)))
+        if period == "저녁":
+            for i2 in range(5):                # 노을 줄구름 — 전체에
+                yy = h * (0.22 + 0.55 * rnd.random())
+                ww = (46 + 60 * rnd.random()) * k
+                xx = (w - ww) * rnd.random()
+                hh2 = 6 * k
+                d2.rounded_rectangle([xx, yy, xx + ww, yy + hh2],
+                                     radius=hh2 / 2,
+                                     fill=(255, 226, 186, 130))
+        # 양옆 나무 — 시간대 색으로 (밤에는 어두운 실루엣)
+        tc = {"아침": (104, 152, 92, 215), "낮": (88, 148, 84, 225),
+              "저녁": (110, 86, 96, 205), "밤": (56, 64, 96, 220),
+              "새벽": (76, 88, 120, 205)}[period]
+
+        def tree(cx, sc):
+            d2.rectangle([cx - 2.4 * k * sc, h - 24 * k * sc,
+                          cx + 2.4 * k * sc, h], fill=tc)
+            for dx, dy, r3 in ((0, 30, 13), (-10, 21, 10), (10, 21, 10),
+                               (0, 15, 9)):
+                ball(cx + dx * k * sc, h - dy * k * sc, r3 * k * sc,
+                     tc[:3], tc[3])
+
+        tree(30 * k, 1.0)
+        tree(w - 30 * k, 0.9)
+        if period in ("밤", "새벽"):
+            faint = period == "새벽"
+            star = (238, 234, 200, 120) if faint else (255, 242, 168, 235)
+            # 별은 띠 전체에 성기게 — 가운데에만 몰리면 허전하다.
+            # 글자·알약은 나중에 위에 그려지므로 가려져도 괜찮다.
+            n = 13 if faint else 11
+            for _i in range(n):
+                sx = w * 0.03 + (w * 0.94) * rnd.random()
+                sy = h * (0.12 + 0.68 * rnd.random())
+                r = (1.0 + 0.8 * rnd.random()) * (1.1 if faint else 1.4) * k
+                ball(sx, sy, r, star[:3], star[3])
+            if not faint:
+                sx, sy = w - 362 * k, h * 0.3
+                a = 7 * k                  # 네 갈래 큰 별
+                d2.polygon([(sx, sy - a), (sx + a * 0.3, sy - a * 0.3),
+                            (sx + a, sy), (sx + a * 0.3, sy + a * 0.3),
+                            (sx, sy + a), (sx - a * 0.3, sy + a * 0.3),
+                            (sx - a, sy), (sx - a * 0.3, sy - a * 0.3)],
+                           fill=(255, 242, 168, 245))
+                mx, my, mr = w - 320 * k, h * 0.44, 12 * k
+                ball(mx, my, mr * 1.5, (255, 233, 168), 45)   # 달무리
+                ball(mx, my, mr, (255, 233, 168), 255)
+                # 초승달 — 하늘색 원을 겹쳐 깎아낸다 (그 자리 그라데이션 색으로)
+                px = im.load()
+                # 창이 채 안 잡힌 첫 프레임에는 폭이 1px 라 좌표가 음수가
+                # 된다 — 양끝을 다 막는다 (음수 인덱스는 그대로 터진다)
+                sample = px[max(0, min(w - 1, int(mx))),
+                            max(0, min(h - 1, int(my - mr * 2)))]
+                d2.ellipse([mx - mr + 7 * k, my - mr - 4 * k,
+                            mx + mr + 7 * k, my + mr - 4 * k],
+                           fill=sample + (255,))
+        im = Image.alpha_composite(im.convert("RGBA"), ov)
+        im = im.resize((int(W), int(top)), Image.LANCZOS)
+        self._sky_img = ImageTk.PhotoImage(im)
+        self._sky_key = key
+        return self._sky_img
+
+    def _room_sky_draw(self, cv, W, top, k, period):
+        """홈 타이틀 띠의 하늘 — 시간대 5종 (그림 한 장으로)."""
+        img = self._room_sky_img(W, top, period)
+        cv.create_image(0, 0, image=img, anchor="nw", tags="dyn")
+
+    def _room_frame(self):
+        cv = self.room_cv
+        if cv is None or self.room_win is None:
+            return
+        key = self._room_key()
+        if key != self._room_key_last or not self._room_body:
+            self._room_key_last = key
+            self._room_draw()
+            return
+
+        now = time.time()
+        for i, (item, desk_item, slot, base, sleeping, pose) in enumerate(
+                self._room_body):
+            bob = math.sin(now * 1.7 + hash(slot) % 7) * (1.6 * self._room_k())
+            if sleeping:
+                bob *= 0.6
+            else:
+                bob += self._room_hop(slot, now, self._room_k())
+            try:
+                x, y = cv.coords(item)
+                # 실제로 픽셀이 바뀔 때만 옮긴다. 소수점만 달라진 것으로
+                # 옮기면 그 자리를 다시 칠하느라 CPU만 쓴다.
+                if abs((base + bob) - y) >= 1.0:
+                    cv.coords(item, x, base + bob)
+                q = next((r for r in self.room_people
+                          if r.get("slot") == slot), None)
+                want = self._room_pose(q) if q else pose
+                if want != pose:
+                    got = self._room_img(slot, want)
+                    if got:
+                        cv.itemconfigure(item, image=got[0])
+                        if desk_item and got[1] is not None:
+                            cv.itemconfigure(desk_item, image=got[1])
+                        self._room_body[i] = (item, desk_item, slot, base,
+                                              sleeping, want)
+            except Exception:
+                self._room_body = []
+                return
+        # 노래 말풍선 마퀴 — 커서를 올리면 긴 제목이 옆으로 천천히 흐른다
+        hov = self._song_hover
+        if hov and hov in self._room_song_box:
+            bx0, by0, bx1, by1, title2, col2 = self._room_song_box[hov]
+            got_mq = self._safe_str(self._song_marquee, hov, title2,
+                                    int(bx1 - bx0), int(by1 - by0),
+                                    col2, now)
+            cv.delete("songmq")
+            if got_mq is not None:
+                cv.create_image(int(bx0), int(by0), image=got_mq,
+                                anchor="nw", tags=("dyn", "songmq"))
+        # 노래가 걸린 카드 — 캐릭터 옆에 음표가 둥실거린다
+        cv.delete("songfx")
+        for item, _d2, slot, base, _s2, _p2 in self._room_body:
+            if slot not in self._room_song_slots:
+                continue
+            try:
+                x, _y = cv.coords(item)
+            except Exception:
+                continue
+            kk2 = self._room_k()
+            ph2 = hash(slot) % 5
+            for j2, (dx2, sp) in enumerate(((-46, 1.0), (44, 1.35))):
+                yy2 = base - 72 * kk2 - ((now * 14 * sp + ph2 * 9 + j2 * 23)
+                                         % (46 * kk2))
+                cv.create_text(x + dx2 * kk2, yy2,
+                               text="\u266a" if j2 == 0 else "\u266b",
+                               font=self._uf(10 + 2 * j2),
+                               fill=self._tint(self._room_raw(slot), 0.25),
+                               tags=("dyn", "songfx"))
+        # 다 같이 24시간을 채운 날 — 캐릭터 옆에 반짝이가 돈다
+        cv.delete("glit")
+        if self._room_goal_done:
+            kk = self._room_k()
+            for item, _d, slot, base, _s, _p in self._room_body:
+                try:
+                    x, _y = cv.coords(item)
+                except Exception:
+                    continue
+                for j, (dx, dy, ph) in enumerate(
+                        ((-52, -86, 0.0), (46, -62, 2.1), (-38, -34, 4.2))):
+                    tw = 0.5 + 0.5 * math.sin(now * 3.1 + ph + hash(slot) % 7)
+                    a = (2.2 + 3.2 * tw) * kk
+                    if a < 2.6 * kk:
+                        continue               # 잦아든 별은 잠깐 쉰다
+                    sx, sy = x + dx * kk, base + dy * kk
+                    cv.create_polygon(
+                        sx, sy - a, sx + a * 0.3, sy - a * 0.3, sx + a, sy,
+                        sx + a * 0.3, sy + a * 0.3, sx, sy + a,
+                        sx - a * 0.3, sy + a * 0.3, sx - a, sy,
+                        sx - a * 0.3, sy - a * 0.3,
+                        fill="#ffeeb8", outline="#f5deA0",
+                        width=1, tags=("dyn", "glit"))
+
+    def _rr_soft(self, cv, x0, y0, x1, y1, r, fill="#ffffff", outline="",
+                 width=1, tail=None, tags="dyn"):
+        """매끈한 둥근 사각형 — PIL로 3배로 그려 줄인다.
+
+        Tk 다각형(_rr)은 계단이 져서 말풍선이 못생겨 보인다는 제보.
+        tail=(tx, 높이)면 아래에 V자 꼬리를 붙인다. 실패하면 _rr로 물러난다.
+        """
+        w, h = int(round(x1 - x0)), int(round(y1 - y0))
+        if w < 4 or h < 4:
+            return self._rr(cv, x0, y0, x1, y1, r, fill=fill,
+                            outline=outline, width=width, tags=tags)
+        th = int(round(tail[1])) if tail else 0
+        tx = int(round(tail[0] - x0)) if tail else 0
+        key = (w, h, int(r), fill, outline, int(width), tx, th)
+        cache = self._bubble_cache
+        img = cache.get(key)
+        if img is None:
+            try:
+                from PIL import ImageDraw
+                S = 3
+                lw = max(1, int(width)) * S
+                im = Image.new("RGBA", (w * S, (h + th) * S), (0, 0, 0, 0))
+                d2 = ImageDraw.Draw(im)
+                d2.rounded_rectangle(
+                    [lw // 2, lw // 2, w * S - 1 - lw // 2,
+                     h * S - 1 - lw // 2],
+                    radius=int(r) * S, fill=fill,
+                    outline=outline or None, width=lw)
+                if th:
+                    # 꼬리 — 속을 몸통 테두리 '위'까지 파고들게 칠해 아랫선을
+                    # 지우고(한 덩어리), 빗변 두 줄만 테두리색으로 긋는다.
+                    lx, rx = (tx - 8) * S, (tx + 8) * S
+                    tipx, tipy = (tx - 3) * S, (h + th) * S - lw
+                    topy = h * S - lw * 2 - S
+                    d2.polygon([(lx, topy), (rx, topy), (tipx, tipy)],
+                               fill=fill)
+                    if outline:
+                        ey = h * S - lw // 2 - 1
+                        d2.line([(lx, ey), (tipx, tipy)],
+                                fill=outline, width=lw)
+                        d2.line([(rx, ey), (tipx, tipy)],
+                                fill=outline, width=lw)
+                im = im.resize((w, h + th), Image.LANCZOS)
+                img = ImageTk.PhotoImage(im)
+            except Exception:
+                return self._rr(cv, x0, y0, x1, y1, r, fill=fill,
+                                outline=outline, width=width, tags=tags)
+            if len(cache) > 60:            # 지뢰 18 — 오래된 절반만
+                for old in list(cache)[:30]:
+                    cache.pop(old, None)
+            cache[key] = img
+        return cv.create_image(int(x0), int(y0), image=img, anchor="nw",
+                               tags=tags)
+
+    def _rr(self, cv, x0, y0, x1, y1, r, **kw):
+        """둥근 사각형. smooth 스플라인을 쓰지 않는다.
+
+        스플라인 판(smooth=True)은 아래 변 한가운데가 볼록 튀어나왔다
+        (홈 게이지 혹 제보 — 같은 코드만 따로 그려 실측으로 재현했다).
+        모서리를 9단계 호로 직접 찍으면 반지름 27px에서도 어긋남이
+        0.2px 이 안 돼 눈으로 구분이 안 된다.
+        """
+        kw.setdefault("tags", "dyn")
+        r = max(1.0, min(r, (x1 - x0) / 2.0, (y1 - y0) / 2.0))
+        pts = []
+        for cx, cy, a0, a1 in ((x1 - r, y0 + r, -90, 0), (x1 - r, y1 - r, 0, 90),
+                               (x0 + r, y1 - r, 90, 180),
+                               (x0 + r, y0 + r, 180, 270)):
+            for i in range(9):
+                a = math.radians(a0 + (a1 - a0) * i / 8)
+                pts.extend((cx + math.cos(a) * r, cy + math.sin(a) * r))
+        return cv.create_polygon(pts, smooth=False, **kw)
+
+    def _room_draw(self):
+        cv = self.room_cv
+        if cv is None or self.room_win is None:
+            return
+        P = self._room_palette()
+        k = self._room_k()
+        # 창을 늘릴 수 있으므로 실제로 그려진 크기를 본다 (cv["width"] 는
+        # 처음 만들 때 준 값에서 안 변한다).
+        W = cv.winfo_width() or int(cv["width"])
+        H = cv.winfo_height() or int(cv["height"])
+        top = int(self.ROOM_TOP * k)
+        # 안 변하는 것(벽지 점 500여 개)을 매 프레임 다시 그리면 한 프레임이
+        # 25ms를 넘는다. 배경은 한 번만 그리고 움직이는 것만 지웠다 그린다.
+        key = (W, H, P["wall"], self._room_deco_ver)
+        if self._room_bg != key:
+            self._room_bg = key
+            cv.delete("all")
+            cv.configure(bg=P["wall"])
+            self.room_win.configure(bg=P["wall"])
+            bgim = self._room_deco_img("bg", W, H - top)
+            if bgim is not None:
+                # 골라 둔 배경 그림 — 벽지 점 대신 그림을 깐다
+                cv.create_image(0, top, image=bgim, anchor="nw", tags="bg")
+            else:
+                step = max(8, int(26 * k))
+                for yy in range(top, H, step):
+                    for xx in range((step // 2) if (yy // step) % 2 else 0,
+                                    W, step):
+                        cv.create_oval(xx, yy, xx + 3, yy + 3, fill=P["dot"],
+                                       width=0, tags="bg")
+            cv.create_rectangle(0, 0, W, top, fill=P["bar"], width=0,
+                                tags="bg")
+            cv.create_line(0, top, W, top, fill=P["line"], width=2, tags="bg")
+        else:
+            cv.delete("dyn")
+        # 위쪽 줄 — 타이틀 띠는 시간대별 하늘이 된다 (방 안은 그대로)
+        mid = top / 2
+        period = self._sky_period()
+        self._safe("room_sky", self._room_sky_draw, cv, W, top, k, period)
+        ink2, sub2 = self.SKY[period][1], self.SKY[period][2]
+        people = self._room_seats()
+        self._room_cal_btn = None    # 달력 아이콘은 내 칸에서 그린다
+        cv.create_text(28 * k, mid - 9 * k, anchor="w", text="HOME",
+                       font=self._uf(13, True), fill=ink2, tags="dyn")
+        live = time.time() - (self.room_net.ok_at if self.room_net else 0)
+        on = sum(1 for q in people if not q.get("off"))
+        # 왜 안 되는지 여기서 바로 보이게. 지금까지는 RoomNet 이 오류를
+        # 들고만 있고 아무 데도 안 보여 줘서, 친구 화면에서는 '다들 안 켰네'
+        # 로만 보였다 (사가가 방에 못 붙는데도 그 이유를 알 수 없었다).
+        sub = "총 %d명  ·  %s" % (len(people), self._room_state_text(on, live))
+        cv.create_text(28 * k, mid + 11 * k, anchor="w", text=sub,
+                       font=self._uf(9), fill=sub2, tags="dyn")
+        # 방 번호표는 평소엔 안 띄운다 (하늘을 가리고, 평소엔 쓸 일이
+        # 없다). 통신이 이상할 때는 숫자 줄에 방 번호가 이미 들어 있어서
+        # 그때만 자연히 보인다 (지뢰 51의 진단 경로는 그대로 산다).
+        # 꺼진 사람도 오늘 본 마지막 값이 실려 있어 합계가 안 깎인다
+        tot = sum(int(q.get("t") or 0) for q in people)
+        # 다 같이 24시간을 채우면 카드마다 캐릭터 옆에 반짝이가 돈다
+        self._room_goal_done = tot >= 24 * 60
+        nums = self._safe_str(self._room_numbers, on, live)
+        if nums:
+            self._rr(cv, W - 216 * k, mid - 14 * k, W - 12 * k, mid + 14 * k,
+                     12 * k, fill="#ffffff", outline=P["line"], width=1)
+            cv.create_text(W - 114 * k, mid, anchor="center", text=nums,
+                           font=self._uf(8), fill=P["sub"], tags="dyn")
+        else:
+            # 흰 라운드 판 — 하늘이 어두운 시간대에도 시간이 또렷하게
+            self._rr(cv, W - 216 * k, mid - 25 * k, W - 12 * k, mid + 22 * k,
+                     14 * k, fill="#ffffff", outline=P["line"], width=1)
+            cv.create_text(W - 114 * k, mid - 10 * k, anchor="center",
+                           text="오늘 다 같이  %d시간 %d분"
+                           % (tot // 60, tot % 60),
+                           font=self._uf(10, True), fill=P["ink"], tags="dyn")
+            gx0, gx1 = W - 204 * k, W - 24 * k
+            gy = mid + 9 * k
+            self._rr(cv, gx0, gy - 5 * k, gx1, gy + 5 * k, 5 * k,
+                     fill="#ffffff", outline=P["line"], width=1)
+            goal = 24 * 60           # 다 같이 하루 24시간이 목표
+            frac = min(1.0, tot / goal)
+            # 채워질수록 색이 익는다 — 주황 → 노랑 → 연두 → (다 차면) 초록
+            if frac >= 1.0:
+                gcol = "#5fc48f"
+            elif frac < 0.5:
+                gcol = self._mix("#ffb37a", "#ffd75e", frac / 0.5)
+            else:
+                gcol = self._mix("#ffd75e", "#8fd06a", (frac - 0.5) / 0.5)
+            if tot > 0:
+                self._rr(cv, gx0, gy - 5 * k,
+                         gx0 + max(10 * k, (gx1 - gx0) * min(1.0, tot / goal)),
+                         gy + 5 * k, 5 * k, fill=gcol, width=0)
+        # 사람들
+        cw, chh = int(self.ROOM_CW * k), int(self.ROOM_CH * k)
+        self._room_hit = []
+        self._room_body = []
+        self._room_cal_btns = {}
+        self._room_song_hits = {}
+        self._room_song_box = {}
+        self._room_song_slots = set()
+        cols = max(1, self._room_cols)
+        # 사람이 많아지면 페이지로 나눈다 — 첫 페이지 9명, 화살표로 넘김.
+        # '모두에게'는 서버가 방 전체에 돌리므로 페이지와 무관하게 다 간다.
+        allp = people
+        # 한 페이지 = 기본 9명. 화면이 짧아 줄이 모자라면 그만큼 줄인다.
+        page_n = max(1, min(self.ROOM_PAGE,
+                            cols * max(1, self._room_rows)))
+        pages = max(1, -(-len(allp) // page_n))
+        self._room_page = max(0, min(getattr(self, "_room_page", 0),
+                                     pages - 1))
+        people = allp[self._room_page * page_n:
+                      (self._room_page + 1) * page_n]
+        self._room_pages = pages
+        left = max(int(8 * k), (W - cols * cw) // 2)
+        # 세로도 가운데로 — 창이 칸보다 높으면 위에 딱 붙어 휑했다.
+        # 아래 단추 줄(126k)을 뺀 나머지 공간의 한가운데에 놓는다.
+        H2 = cv.winfo_height() or int(self.room_win.winfo_height())
+        rows_used = max(1, -(-len(people) // cols))
+        # 타이틀 띠 바로 밑에 첫 줄이 붙으면 말풍선이 하늘에 닿는다 —
+        # 최소 간격을 두고, 남는 공간이 있으면 그 안에서 가운데로.
+        gap = int(16 * k)
+        voff = gap + max(0, (H2 - int(126 * k) - top - gap
+                             - rows_used * chh) // 2)
+        self._room_voff = voff
+        for i, p in enumerate(people):
+            cx0 = left + (i % cols) * cw
+            cy0 = top + voff + (i // cols) * chh
+            self._room_one(cv, p, cx0, cy0, cw, chh, P, k)
+        # 마지막 줄에 남는 칸도 카드 모양만 그려 둔다. 비워 두면 그 줄만
+        # 휑하게 뚫려 보인다.
+        used = len(people)
+        for i in range(used, -(-used // cols) * cols):
+            cx0 = left + (i % cols) * cw
+            cy0 = top + voff + (i // cols) * chh
+            self._rr(cv, cx0 + 8 * k, cy0 + 6 * k, cx0 + cw - 8 * k,
+                     cy0 + chh - 16 * k, 18 * k, fill=P["card"],
+                     outline=P["line"], width=1)
+        # 보낼 상대 찾기는 전체 명단으로 — 고른 사람이 다른 페이지에 있어도
+        self._room_bar(cv, W, H, P, k, allp)
+        # 페이지 화살표 — 카드 그리드 오른쪽·왼쪽 가운데
+        self._room_page_btn = []
+        if pages > 1:
+            ay = top + voff + rows_used * chh / 2
+            bw2 = 34 * k
+            for dxn, label, on in ((1, "▶", self._room_page < pages - 1),
+                                   (-1, "◀", self._room_page > 0)):
+                if not on:
+                    continue
+                ax = (W - 10 * k - bw2) if dxn > 0 else 10 * k
+                cv.create_oval(ax, ay - bw2 / 2, ax + bw2, ay + bw2 / 2,
+                               fill="#ffffff", outline=P["line"], width=2,
+                               tags="dyn")
+                cv.create_text(ax + bw2 / 2, ay, text=label,
+                               font=self._uf(9, True), fill=P["sub"],
+                               tags="dyn")
+                self._room_page_btn.append(
+                    ((ax, ay - bw2 / 2, ax + bw2, ay + bw2 / 2), dxn))
+            cv.create_text(W / 2, H - 16 * k,
+                           text="%d / %d" % (self._room_page + 1, pages),
+                           font=self._uf(8), fill=P["sub"], tags="dyn")
+        # 목록은 맨 나중에 — 카드·단추 위에 덮여야 한다
+        self._safe("inbox_panel", self._room_inbox_draw, cv, W, H, P, k)
+
+    def _room_inbox_draw(self, cv, W, H, P, k):
+        """오늘 받은 반응 — 홈 창 안에서 펼쳐진다.
+
+        새 창을 만들지 않는다. 캐릭터 창과 이 창이 모두 '항상 위'라
+        따로 띄우면 순서가 뒤집혀 안 보이는 일이 생긴다 (지뢰 15).
+        """
+        self._room_inbox_panel = None
+        if not self._inbox_open:
+            return
+        items = self._inbox_items()
+        top = max(0, min(self._inbox_scroll, max(0, len(items) - self.INBOX_SHOW)))
+        self._inbox_scroll = top
+        rows = items[top:top + self.INBOX_SHOW]
+        pw = min(W - 16 * k, 300 * k)
+        rh = 30 * k
+        ph = 76 * k + rh * max(1, len(rows))
+        card = self._room_inbox_card or (10 * k, 10 * k, 10 * k + pw, 10 * k)
+        px = min(max(8 * k, card[0] + 6 * k), W - pw - 8 * k)
+        py = min(max(self.ROOM_TOP * k + 4 * k, card[3] - 44 * k), H - ph - 8 * k)
+        # 카드도 희고 목록도 희어서, 테두리를 내 테마색으로 해야 떠 보인다
+        mine = self._room_tone(self.char)
+        self._rr(cv, px + 3 * k, py + 4 * k, px + pw + 3 * k, py + ph + 4 * k,
+                 18 * k, fill=self._tint(mine, 0.62), width=0)   # 그림자
+        self._rr(cv, px, py, px + pw, py + ph, 18 * k, fill="#fffdfe",
+                 outline=self._tint(mine, 0.32), width=2)
+        cv.create_text(px + 18 * k, py + 22 * k, anchor="w",
+                       text="오늘 받은 반응", font=self._uf(11, True),
+                       fill=self._shade(mine, 0.2), tags="dyn")
+        cv.create_text(px + pw - 18 * k, py + 22 * k, anchor="e",
+                       text="%d개" % len(items), font=self._uf(9),
+                       fill=P["sub"], tags="dyn")
+        cv.create_line(px + 16 * k, py + 38 * k, px + pw - 16 * k, py + 38 * k,
+                       fill=self._tint(mine, 0.55), width=1, tags="dyn")
+        yy = py + 38 * k + rh / 2
+        if not rows:
+            cv.create_text(px + pw / 2, yy + 6 * k, text="아직 받은 반응이 없어요",
+                           font=self._uf(9), fill=P["sub"], tags="dyn")
+        f = self._uf(10)
+        for it in rows:
+            text, col = self._inbox_line(it)
+            cv.create_oval(px + 18 * k, yy - 7 * k, px + 32 * k, yy + 7 * k,
+                           fill=col, width=0, tags="dyn")
+            when = time.strftime("%H:%M", time.localtime(float(it.get("t") or 0)))
+            lim = pw - 100 * k
+            line = text
+            while line and self._room_tw(cv, line, f) > lim:
+                line = line[:-1]
+            cv.create_text(px + 40 * k, yy, anchor="w", text=line, font=f,
+                           fill=P["ink"], tags="dyn")
+            cv.create_text(px + pw - 18 * k, yy, anchor="e", text=when,
+                           font=self._uf(8), fill=P["sub"], tags="dyn")
+            yy += rh
+        foot = "내일 아침 6시에 지워져요"
+        if len(items) > self.INBOX_SHOW:
+            foot = "휠을 굴리면 더 보여요  (%d/%d)" % (
+                min(top + self.INBOX_SHOW, len(items)), len(items))
+        cv.create_text(px + 18 * k, py + ph - 18 * k, anchor="w", text=foot,
+                       font=self._uf(8), fill=P["sub"], tags="dyn")
+        self._room_inbox_panel = (px, py, px + pw, py + ph)
+
+    def _room_wheel(self, e):
+        """목록이 펼쳐져 있을 때만 굴린다."""
+        if not self._inbox_open:
+            return
+        self._inbox_scroll = max(0, self._inbox_scroll
+                                 + (-1 if e.delta > 0 else 1))
+        self._safe("room_draw", self._room_draw)
+
+    def _room_one(self, cv, p, cx0, cy0, cw, ch, P, k):
+        slot = p.get("slot") or ""
+        if slot == self.char:
+            self._room_msg_box = None      # 이번 프레임의 말풍선 자리
+        sleeping = p.get("s") == "sleep"
+        off = bool(p.get("off"))
+        col = self._room_tone(slot)
+        kx0, ky0 = cx0 + 8 * k, cy0 + 6 * k
+        kx1, ky1 = cx0 + cw - 8 * k, cy0 + ch - 16 * k
+        picked = (self._room_pick == slot)
+        if slot == self.char:
+            # 내 칸은 내가 고른 그림 — 남들 화면에도 같은 그림이 실려 간다
+            cimg = self._room_deco_img("card", kx1 - kx0, ky1 - ky0,
+                                       r=18 * k)
+        else:
+            cdh = str(p.get("cdh") or "")
+            if p.get("cd") and cdh:
+                self._safe("deco_peer", self._room_peer_save,
+                           slot, cdh, p.get("cd"))
+            cimg = (self._room_peer_img(slot, cdh, kx1 - kx0, ky1 - ky0,
+                                        18 * k) if cdh else None)
+        if cimg is not None:
+            # 골라 둔 방 그림 — 칸 색으로 받치고(줄였을 때 빈자리) 깐다.
+            # 테두리는 바닥 색까지 그린 뒤 맨 나중에 두른다.
+            self._rr(cv, kx0, ky0, kx1, ky1, 18 * k, fill=P["card"],
+                     width=0)
+            cv.create_image(kx0, ky0, image=cimg, anchor="nw", tags="dyn")
+        else:
+            self._rr(cv, kx0, ky0, kx1, ky1, 18 * k, fill=P["card"],
+                     width=0)
+        floor = ky1 - 74 * k
+        # 바닥 색은 칸에 꽉 차게 (가장자리 1~2px 틈 제보)
+        self._rr(cv, kx0, floor, kx1, ky1, 18 * k,
+                 fill=self._tint(col, 0.72), width=0)
+        cv.create_rectangle(kx0, floor, kx1, floor + 14 * k,
+                            fill=self._tint(col, 0.72), width=0, tags="dyn")
+        self._rr(cv, kx0, ky0, kx1, ky1, 18 * k, fill="",
+                 outline=col if picked else P["line"],
+                 width=3 if picked else 2)
+        got = self._room_img(slot, self._room_pose(p))
+        if got is not None:
+            body, desk, cut = got
+            # 숨쉬듯 아주 살짝. 움직이는 것은 몸뿐이고 책상은 고정이다.
+            bob = math.sin(time.time() * 1.7 + hash(slot) % 7) * (1.6 * k)
+            if sleeping:
+                bob *= 0.6
+            cx = (kx0 + kx1) / 2
+            base = floor + 4 * k
+            pose = self._room_pose(p)
+            item = cv.create_image(cx, base + bob, image=body, anchor="s",
+                                   tags="dyn")
+            ditem = None
+            if desk is not None:
+                # 책상을 나중에 그려 위에 덮는다 — 뒤에서 몸이 움직여도
+                # 책상은 붙박이고 이음매도 안 보인다.
+                ditem = cv.create_image(cx, base, image=desk, anchor="s",
+                                        tags="dyn")
+            if float(p.get("p") or 0) >= 1.0:
+                # 목표를 다 채운 사람 — 남들 화면에서도 축하 모습으로
+                self._safe("room_party", self._room_party_draw,
+                           cv, slot, pose, cx, base + bob, k, col)
+            if not off:
+                # 안 켠 사람은 숨쉬지 않는다 — 켜 있는 사람과 구분이 된다
+                self._room_body.append((item, ditem, slot, base, sleeping,
+                                        pose))
+        else:
+            cv.create_oval((kx0 + kx1) / 2 - 26 * k, floor - 56 * k,
+                           (kx0 + kx1) / 2 + 26 * k, floor - 4 * k,
+                           fill=self._tint(col, 0.5), width=0, tags="dyn")
+            cv.create_text((kx0 + kx1) / 2, floor - 30 * k, text="…",
+                           font=self._uf(12), fill=P["sub"], tags="dyn")
+        fl = self._room_flash.get(slot, 0)
+        msg = "" if off else str(p.get("m") or "").strip()
+        cx2 = (kx0 + kx1) / 2
+        if fl > time.time() - 1.6:
+            note = (self._room_note[0]
+                    if self._room_note and self._room_note[1] >= fl - 0.3
+                    else "!")
+            # 알림 말풍선은 칸 맨 위로 — 연출·얼굴과 안 겹치게
+            ny = ky0 + 16 * k
+            self._rr_soft(cv, cx2 - 26 * k, ny - 12 * k, cx2 + 26 * k,
+                          ny + 12 * k, 12 * k, fill="#ffffff", outline=col,
+                          width=2)
+            cv.create_text(cx2, ny, text=note, font=self._uf(9, True),
+                           fill=self._shade(col, 0.15), tags="dyn")
+        elif msg:
+            # 오늘 한 줄 — 캐릭터 머리 위 빈자리에 말풍선으로.
+            # 알림이 뜬 동안은 그쪽이 먼저다 (같은 자리라 겹친다).
+            # 캐릭터 머리 위 여백은 칸 위에서 44*k 까지다 (그 아래는 그림).
+            # 말풍선은 꼬리까지 그 안에 들어가야 머리를 안 가린다.
+            f3 = self._uf(10)
+            line = msg
+            # 말풍선은 늘 가운데, 제 폭 그대로. 자리가 모자라면 표가
+            # 비켜 준다(_room_inbox_badge) — 말풍선을 미는 쪽은 보기 안 좋다.
+            room = (kx1 - kx0) - 34 * k
+            bub = cx2
+            while line and self._room_tw(cv, line, f3) > room:
+                line = line[:-1]
+            tw3 = self._room_tw(cv, line, f3)
+            ny = ky0 + 19 * k
+            edge = self._tint(col, 0.35)
+            self._rr_soft(cv, bub - tw3 / 2 - 14 * k, ny - 15 * k,
+                          bub + tw3 / 2 + 14 * k, ny + 15 * k, 14 * k,
+                          fill="#ffffff", outline=edge, width=2,
+                          tail=(cx2, 9 * k))
+            cv.create_text(bub, ny, text=line, font=f3,
+                           fill=self._shade(col, 0.25), tags="dyn")
+            if slot == self.char:      # 표가 피해 갈 자리 (꼬리까지)
+                self._room_msg_box = (bub - tw3 / 2 - 14 * k, ny - 15 * k,
+                                      bub + tw3 / 2 + 14 * k, ny + 24 * k)
+        lab = (str(p.get("n") or "")[:12] if off
+               else "Lv.%d  %s" % (int(p.get("lv") or 1),
+                                   str(p.get("n") or "")[:12]))
+        f = self._uf(10, True)
+        tw = self._room_tw(cv, lab, f)
+        px0 = (kx0 + kx1) / 2 - tw / 2 - 12 * k
+        py0 = floor + 2 * k
+        self._rr(cv, px0, py0, px0 + tw + 24 * k, py0 + 24 * k, 12 * k,
+                 fill="#ffffff", outline=col, width=2)
+        cv.create_text((kx0 + kx1) / 2, py0 + 12 * k, text=lab, font=f,
+                       fill=P["sub"] if (sleeping or off) else P["ink"],
+                       tags="dyn")
+        if slot != self.char:
+            self._safe("sent_chip", self._room_sent_chip, cv, slot,
+                       px0 + tw + 24 * k, py0, kx1, k, col)
+        # 이 자리는 칭호와 접속 여부를 알려 준다. 오늘 한 줄은 캐릭터
+        # 위쪽 빈자리에 말풍선으로 따로 띄운다.
+        cv.create_text((kx0 + kx1) / 2, py0 + 34 * k,
+                       text="아직 안 켰어요" if off
+                       else str(p.get("ti") or "")[:14],
+                       font=self._uf(8), fill=P["sub"], tags="dyn")
+        # 게이지 왼쪽에 오늘 몇 시간째인지 (3h 13m 꼴, 1시간 전에는 분만)
+        tmin = max(0, int(p.get("t") or 0))
+        tlab = ("%dh %dm" % (tmin // 60, tmin % 60)) if tmin >= 60 \
+            else ("%dm" % tmin)
+        bx0, bx1 = kx0 + 60 * k, kx1 - 42 * k
+        by = py0 + 48 * k
+        cv.create_text(bx0 - 6 * k, by + 5 * k, anchor="e", text=tlab,
+                       font=self._uf(8), fill=P["sub"], tags="dyn")
+        # 바탕은 흰색, 채우는 색은 그 사람 테마색 그대로
+        self._rr(cv, bx0, by, bx1, by + 11 * k, 5 * k, fill="#ffffff",
+                 outline=self._tint(col, 0.55), width=1)
+        pr = max(0.0, min(1.0, float(p.get("p") or 0)))
+        if pr > 0.01:
+            self._rr(cv, bx0, by, bx0 + (bx1 - bx0) * pr, by + 11 * k, 5 * k,
+                     fill=self._room_raw(slot) if not off
+                     else self._tint(self._room_raw(slot), 0.5), width=0)
+        cv.create_text(bx1 + 6 * k, by + 5 * k, anchor="w",
+                       text="%d%%" % (pr * 100), font=self._uf(8), fill=P["sub"], tags="dyn")
+        sg = p.get("sg")
+        if isinstance(sg, dict) and self._song_ok(sg.get("u")):
+            self._safe("room_song", self._room_song_draw,
+                       cv, p, kx0, ky0, kx1, ky1, k, col, slot)
+        # 자는 표시는 seat_idle 그림에 이미 들어 있다 (여기서 또 그리면 겹친다)
+        if slot == self.char:
+            self._room_inbox_card = (kx0, ky0, kx1, ky1)
+            self._safe("inbox_badge", self._room_inbox_badge,
+                       cv, kx0, ky0, kx1, k)
+            self._safe("room_cal", self._room_cal_draw,
+                       cv, kx0, ky0, k, self._room_raw(slot))
+        elif isinstance(p.get("cal"), dict):
+            # 도장판을 공개한 사람 — 그 카드에도 달력 아이콘이 뜬다
+            self._room_cal_data[slot] = p["cal"]
+            self._safe("room_cal2", self._room_cal_draw,
+                       cv, kx0, ky0, k, self._room_raw(slot), slot)
+        self._room_hit.append((kx0, ky0, kx1, ky1, slot, sleeping))
+
+    def _room_inbox_badge(self, cv, kx0, ky0, kx1, k):
+        """내 칸 오른쪽 위 — 오늘 받은 수, 안 본 것이 있으면 빨간 점."""
+        self._room_inbox_hit = None
+        n = len(self._inbox_get().get("list") or [])
+        if not n:
+            return
+        txt = "\u2665%d" % min(n, 99)
+        f = self._uf(8, True)
+        w = self._room_tw(cv, txt, f) + 13 * k
+        h = 19 * k
+        x1 = kx1 - 8 * k
+        x0, y0 = x1 - w, ky0 + 7 * k
+        # 오늘 한 줄이 길어 자리가 없으면 말풍선 바로 아래로 내려간다.
+        # 말풍선을 옆으로 미는 것보다 이쪽이 보기 낫다.
+        box = getattr(self, "_room_msg_box", None)
+        if box and box[2] + 3 * k > x0 and box[1] < y0 + h:
+            y0 = box[3] + 3 * k
+        self._rr(cv, x0, y0, x1, y0 + h, h / 2, fill="#ffffff",
+                 outline="#ff8fb8", width=2)
+        cv.create_text((x0 + x1) / 2, y0 + h / 2, text=txt,
+                       font=f, fill="#ff6f9f", tags="dyn")
+        if self._inbox_unread():
+            cv.create_oval(x1 - 5 * k, y0 - 4 * k, x1 + 4 * k, y0 + 5 * k,
+                           fill="#ff4d6d", outline="#ffffff", width=2,
+                           tags="dyn")
+        self._room_inbox_hit = (x0 - 5 * k, y0 - 5 * k,
+                                x1 + 6 * k, y0 + h + 5 * k)
+
+    def _song_marquee(self, slot, title, w, h, col, now):
+        """호버 중인 노래 말풍선 — 제목이 옆으로 천천히 흐르는 그림 한 장.
+
+        제목이 짧아 다 보이면 None (기존 말풍선 그대로). 글자 띠는 노래마다
+        한 번만 그려 두고, 프레임마다 잘라 붙이기만 한다.
+        """
+        title = "♪ " + str(title or "노래 들으러 가기")
+        S = 3
+        fpx = max(10, int(h * 0.56)) * S
+        key = ("strip", title, fpx)
+        strip = self._mq_cache.get(key)
+        if strip is None:
+            try:
+                from PIL import ImageDraw, ImageFont
+                try:
+                    font = ImageFont.truetype(
+                        os.path.join(self.dir, "fonts",
+                                     "Pretendard-Bold.otf"), fpx)
+                except Exception:
+                    font = ImageFont.load_default()
+                probe = Image.new("RGBA", (4, 4))
+                d0 = ImageDraw.Draw(probe)
+                tw = int(d0.textlength(title, font=font))
+                strip = Image.new("RGBA", (max(1, tw), int(fpx * 1.5)),
+                                  (0, 0, 0, 0))
+                ImageDraw.Draw(strip).text(
+                    (0, int(fpx * 0.12)), title, font=font,
+                    fill=self._shade(col, 0.15))
+            except Exception:
+                strip = False
+            if len(self._mq_cache) > 12:
+                for old4 in list(self._mq_cache)[:6]:
+                    self._mq_cache.pop(old4, None)
+            self._mq_cache[key] = strip
+        if strip is False or strip is None:
+            return None
+        inner = (w - 18) * S
+        if strip.width <= inner:
+            return None                  # 짧으면 흐를 필요가 없다
+        # 말풍선 몸통 (꼬리 없이 — 원래 말풍선 위에 겹쳐 그린다)
+        tkey = ("tpl", w, h, col)
+        tpl = self._mq_cache.get(tkey)
+        if tpl is None:
+            from PIL import ImageDraw
+            tpl = Image.new("RGBA", (w * S, h * S), (0, 0, 0, 0))
+            ImageDraw.Draw(tpl).rounded_rectangle(
+                [S // 2, S // 2, w * S - 1 - S, h * S - 1 - S],
+                radius=(h * S) // 2, fill="#ffffff",
+                outline=self._tint(col, 0.35), width=S)
+            self._mq_cache[tkey] = tpl
+        gap = 14 * S
+        span = strip.width + gap
+        off = int((now * 22 * S) % span)      # 천천히 (초당 ~22px)
+        im = tpl.copy()
+        win = Image.new("RGBA", (inner, strip.height), (0, 0, 0, 0))
+        # 띠를 off 만큼 민 곳부터 창 폭만큼 이어 붙인다 (끝나면 처음부터)
+        pos = -off
+        while pos < inner:
+            if pos + strip.width > 0:
+                a3 = max(0, -pos)
+                piece = strip.crop((a3, 0,
+                                    min(strip.width, a3 + inner - max(0, pos)),
+                                    strip.height))
+                win.alpha_composite(piece, (max(0, pos), 0))
+            pos += span
+        y2 = (h * S - strip.height) // 2
+        im.alpha_composite(win, (9 * S, max(0, y2)))
+        im = im.resize((w, h), Image.LANCZOS)
+        self._mq_img = ImageTk.PhotoImage(im)
+        return self._mq_img
+
+    def _room_song_draw(self, cv, p, kx0, ky0, kx1, ky1, k, col, slot):
+        """카드 오른쪽 여백의 노래 말풍선 — 누르면 유튜브로 간다."""
+        sg = p["sg"]
+        title = str(sg.get("t") or "노래 들으러 가기")
+        if len(title) > 9:
+            title = title[:9] + "…"
+        f = self._uf(8, True)
+        txt = "\u266a " + title
+        tw = self._room_tw(cv, txt, f)
+        h = 20 * k
+        x1 = kx1 - 6 * k
+        x0 = max(kx0 + 6 * k, x1 - tw - 14 * k)
+        y0 = ky0 + 34 * k                # 하트 배지 아래, 오른쪽 여백
+        edge = self._tint(col, 0.35)
+        self._rr_soft(cv, x0, y0, x1, y0 + h, h / 2, fill="#ffffff",
+                      outline=edge, width=1, tail=(x0 + 16 * k, 7 * k))
+        cv.create_text((x0 + x1) / 2, y0 + h / 2, text=txt, font=f,
+                       fill=self._shade(col, 0.15), tags="dyn")
+        lk = int(sg.get("lk") or 0)
+        if lk > 0:                       # 좋아요 하트 — 말풍선 오른쪽 위
+            # 글꼴의 ♥ 글자는 기계마다 높낮이가 달라 배지 안에서 떠 보인다.
+            # 하트를 도형으로 그리고, 하트+숫자 묶음을 재서 정중앙에 놓는다.
+            pink = "#f7a8bc"
+            num = str(min(lk, 99))
+            f2 = self._uf(6, True)
+            nw = self._room_tw(cv, num, f2)
+            hw = 7 * k                   # 하트 폭
+            gap = 1.5 * k
+            bx = x1 - 4 * k
+            cy2 = y0 - 2 * k
+            bh = 7 * k                   # 배지 반높이
+            half = (hw + gap + nw) / 2 + 4.5 * k
+            self._rr(cv, bx - half, cy2 - bh, bx + half, cy2 + bh, bh,
+                     fill="#ffffff", outline=self._tint(col, 0.35), width=1)
+            hx = bx - (hw + gap + nw) / 2 + hw / 2   # 하트 중심 x
+            r2 = hw * 0.27               # 봉우리 원 반지름
+            ty = cy2 - hw * 0.18         # 봉우리 원 중심 y
+            for sx in (-1, 1):
+                cv.create_oval(hx + sx * hw * 0.23 - r2, ty - r2,
+                               hx + sx * hw * 0.23 + r2, ty + r2,
+                               fill=pink, width=0, tags="dyn")
+            cv.create_polygon(hx - hw * 0.47, ty + r2 * 0.35,
+                              hx + hw * 0.47, ty + r2 * 0.35,
+                              hx, cy2 + hw * 0.52,
+                              fill=pink, width=0, tags="dyn")
+            cv.create_text(hx + hw / 2 + gap, cy2, text=num, font=f2,
+                           fill=pink, anchor="w", tags="dyn")
+        self._room_song_hits[slot] = ((x0 - 3 * k, y0 - 3 * k,
+                                       x1 + 3 * k, y0 + h + 3 * k),
+                                      str(sg.get("u")))
+        self._room_song_box[slot] = (x0, y0, x1, y0 + h,
+                                     str(sg.get("t") or ""), col)
+        self._room_song_slots.add(slot)
+
+    def _room_cal_draw(self, cv, kx0, ky0, k, col, slot=None):
+        """내 칸 왼쪽 위의 달력 아이콘 — 하트 배지와 짝, 테마색으로.
+
+        누르면 이 달의 도장판이 열린다.
+        """
+        r = 10 * k
+        cx = kx0 + 8 * k + r
+        cy = ky0 + 7 * k + r
+        x0, y0, x1, y1 = cx - r, cy - r, cx + r, cy + r
+        line = self._shade(col, 0.12)
+        self._rr(cv, x0, y0, x1, y1, 4 * k, fill="#ffffff",
+                 outline=line, width=2)
+        self._rr(cv, x0, y0, x1, y0 + 7 * k, 4 * k, fill=col, width=0)
+        cv.create_rectangle(x0, y0 + 4 * k, x1, y0 + 7 * k,
+                            fill=col, width=0, tags="dyn")
+        for gx in (cx - 4.5 * k, cx + 4.5 * k):   # 고리 두 개
+            cv.create_line(gx, y0 - 2.5 * k, gx, y0 + 2.5 * k, fill=line,
+                           width=max(1, int(1.7 * k)), capstyle="round",
+                           tags="dyn")
+        for row in range(2):                      # 날짜 점
+            for col_ in range(3):
+                dx = (col_ - 1) * 5 * k
+                dy = 10.5 * k + row * 4.5 * k
+                cv.create_oval(cx + dx - k, y0 + dy - k,
+                               cx + dx + k, y0 + dy + k,
+                               fill=self._tint(col, 0.35), width=0,
+                               tags="dyn")
+        box = (x0 - 5 * k, y0 - 5 * k, x1 + 5 * k, y1 + 5 * k)
+        if slot is None:
+            self._room_cal_btn = box
+        else:
+            self._room_cal_btns[slot] = box
+
+    # ── 도장판 ───────────────────────────────────────────────────────
+    STAMP_TIERS = ((8 * 3600, "gold"), (4 * 3600, "flower"),
+                   (2 * 3600, "bud"), (1, "sprout"))
+
+    def _stamp_days(self, year, month):
+        """그 달의 날짜별 (작업 초, 종료 횟수). 오늘은 지금 재는 값으로."""
+        hist = self._hist_load() or {}       # 이미 days 껍데기를 벗겨 준다
+        out = {}
+        for key, d in hist.items():
+            try:
+                y, mo, dd = (int(v) for v in key.split("-"))
+            except Exception:
+                continue
+            if y == year and mo == month and isinstance(d, dict):
+                out[dd] = (float(d.get("work", 0)), int(d.get("runs", 0)))
+        today = self._my_workday()
+        try:
+            ty, tm, td = (int(v) for v in today.split("-"))
+            if ty == year and tm == month:
+                secs, runs = out.get(td, (0.0, 0))
+                out[td] = (max(secs, float(self._today_secs())), runs)
+        except Exception:
+            pass
+        return out
+
+    @staticmethod
+    def _month_shape(year, month):
+        """(1일의 요일 0=일요일, 그 달의 날수) — calendar 없이 time 만으로."""
+        t = time.mktime((year, month, 1, 12, 0, 0, 0, 0, -1))
+        first = (time.localtime(t).tm_wday + 1) % 7      # tm_wday 0=월
+        ny, nm = (year + 1, 1) if month == 12 else (year, month + 1)
+        days = int(round((time.mktime((ny, nm, 1, 12, 0, 0, 0, 0, -1))
+                          - t) / 86400))
+        return first, days
+
+    def _stamp_pack(self):
+        """공개용 이번 달 도장 꾸러미 — {"m": "2026-08", "d": {"14": 분}}.
+
+        자리 신호에 실려 30초마다 나가므로 60초 캐시로 계산을 아낀다.
+        일기는 넣지 않는다 — 내 컴퓨터에만 남는 것.
+        """
+        now = time.time()
+        if self._stamp_pack_v is not None and now - self._stamp_pack_at < 60:
+            return self._stamp_pack_v
+        t = time.localtime()
+        days = self._stamp_days(t.tm_year, t.tm_mon)
+        self._stamp_pack_v = {
+            "m": "%04d-%02d" % (t.tm_year, t.tm_mon),
+            "d": {str(d): int(v[0] // 60) for d, v in days.items()
+                  if v[0] >= 60}}
+        self._stamp_pack_at = now
+        return self._stamp_pack_v
+
+    def _stamp_diary_path(self):
+        return os.path.join(self.state_dir, ".stamp_diary.json")
+
+    def _stamp_diary(self):
+        try:
+            with open(self._stamp_diary_path(), encoding="utf-8") as fp:
+                d = json.load(fp)
+            return d if isinstance(d, dict) else {}
+        except Exception:
+            return {}
+
+    def _stamp_diary_set(self, key, text):
+        d = self._stamp_diary()
+        text = str(text).strip()[:300]
+        if text:
+            d[key] = text
+        else:
+            d.pop(key, None)
+        _save_json(self._stamp_diary_path(), d)
+
+    def _stamp_open(self, slot=None):
+        """도장판 창 — 이 달에 며칠, 얼마나 그렸는지 도장으로 본다."""
+        w = self._stamp_win
+        if w is not None:
+            try:
+                w.destroy()              # 다른 사람 것으로 바꿔 여는 경우
+            except Exception:
+                pass
+            self._stamp_win = None
+        self._stamp_slot = slot
+        self._stamp_txt = None
+        cd, u = self.card, self._ui
+        win = tk.Toplevel(self.root)
+        self._stamp_win = win
+        self._stamp_off = 0
+        self._stamp_pick = None
+        win.title("도장판" if slot is None
+                  else "%s의 도장판" % self.ROOM_NAME.get(slot, ""))
+        win.attributes("-topmost", True)
+        win.resizable(False, False)
+        win.configure(bg=cd["panel"])
+        W, H = u(348), u(372)
+        cv = tk.Canvas(win, width=W, height=H, bg=cd["panel"],
+                       highlightthickness=0)
+        cv.pack()
+        cv.bind("<Button-1>", lambda e: self._safe(
+            "stamp_click", self._stamp_click, e))
+
+        def bye():
+            self._stamp_win = None
+            try:
+                win.destroy()
+            except Exception:
+                pass
+        win.protocol("WM_DELETE_WINDOW", bye)
+        win.bind("<Escape>", lambda _e: bye())
+        self._stamp_cv = cv
+        self._place_near(win)
+        self._dialog_keep(win, "stamp")
+        self._safe("stamp_draw", self._stamp_draw)
+
+    def _stamp_img(self, kind, px):
+        """도장 스티커 그림 (PSD 에서 뽑은 것). 캐시하고, 없으면 None."""
+        cache = getattr(self, "_stamp_imgs", None)
+        if cache is None:
+            cache = self._stamp_imgs = {}
+        key = (kind, int(px))
+        if key in cache:
+            return cache[key]
+        name = "flower" if kind == "gold" else kind
+        p = os.path.join(self.dir, "stamps", name + ".png")
+        got = None
+        try:
+            im = Image.open(p).convert("RGBA")
+            im.thumbnail((int(px), int(px)), Image.LANCZOS)
+            got = ImageTk.PhotoImage(im)
+        except Exception:
+            got = None
+        cache[key] = got
+        return got
+
+    def _stamp_flower(self, cv, cx, cy, r, kind):
+        """도장 — 그린 스티커(새싹·봉오리·꽃)로. 금꽃은 꽃 + 금별.
+
+        그림이 없으면(옛 배포본) 예전처럼 도형으로 그린다.
+        """
+        # 급이 오를수록 뚜렷이 커진다 — 활짝 핀 꽃이 새싹의 두 배 가까이
+        k2 = {"sprout": 1.6, "bud": 2.15, "flower": 2.8,
+              "gold": 2.95}.get(kind, 2.4)
+        img = self._stamp_img(kind, r * k2)
+        if img is not None:
+            cv.create_image(cx, cy, image=img)
+            if kind == "gold":               # 여덟 시간 — 금별을 달아 준다
+                sx, sy, a = cx + r * 0.85, cy - r * 0.85, r * 0.5
+                cv.create_polygon(
+                    sx, sy - a, sx + a * 0.3, sy - a * 0.3, sx + a, sy,
+                    sx + a * 0.3, sy + a * 0.3, sx, sy + a,
+                    sx - a * 0.3, sy + a * 0.3, sx - a, sy,
+                    sx - a * 0.3, sy - a * 0.3,
+                    fill="#ffd75e", outline="#e0a83c", width=1)
+            return
+        if kind == "sprout":
+            cv.create_line(cx, cy + r * 0.8, cx, cy - r * 0.2,
+                           fill="#5c8a2c", width=2, capstyle="round")
+            for sign in (-1, 1):
+                cv.create_oval(cx + (0.15 * sign - 0.55 * (sign > 0)) * r * 2,
+                               cy - r * 0.7,
+                               cx + (0.15 * sign + 0.55 * (sign < 0)) * r * 2,
+                               cy + r * 0.1,
+                               fill="#8fc34a", width=0)
+            return
+        if kind == "bud":
+            cv.create_oval(cx - r * 0.55, cy - r * 0.8, cx + r * 0.55,
+                           cy + r * 0.3, fill="#f6a8c8", outline="#e07aa8",
+                           width=1)
+            cv.create_line(cx, cy + r * 0.3, cx, cy + r * 0.9,
+                           fill="#5c8a2c", width=2, capstyle="round")
+            return
+        # 꽃 (flower / gold)
+        petal = "#ffb6d2" if kind == "flower" else "#ffd75e"
+        edge = "#e07aa8" if kind == "flower" else "#e0a83c"
+        for i in range(5):
+            a = math.radians(i * 72 - 90)
+            px_, py_ = cx + math.cos(a) * r * 0.55, cy + math.sin(a) * r * 0.55
+            cv.create_oval(px_ - r * 0.42, py_ - r * 0.42, px_ + r * 0.42,
+                           py_ + r * 0.42, fill=petal, outline=edge, width=1)
+        cv.create_oval(cx - r * 0.3, cy - r * 0.3, cx + r * 0.3, cy + r * 0.3,
+                       fill="#fff2b8" if kind == "flower" else "#ff9e5c",
+                       outline=edge, width=1)
+
+    def _stamp_draw(self):
+        cv = getattr(self, "_stamp_cv", None)
+        if cv is None or self._stamp_win is None:
+            return
+        cd, u = self.card, self._ui
+        cv.delete("all")
+        W = int(cv.cget("width"))
+        now = time.localtime()
+        y, mo = now.tm_year, now.tm_mon
+        other = self._stamp_slot          # 남의 판이면 그 자리 이름
+        if other is not None:
+            cal = self._room_cal_data.get(other) or {}
+            try:
+                y2, mo2 = (int(v) for v in str(cal.get("m")).split("-"))
+            except Exception:
+                y2, mo2 = y, mo
+            days = {int(d): (int(mn) * 60, 0)
+                    for d, mn in (cal.get("d") or {}).items()}
+        else:
+            off = self._stamp_off
+            mo2 = mo + off
+            y2 = y + (mo2 - 1) // 12
+            mo2 = (mo2 - 1) % 12 + 1
+            days = self._stamp_days(y2, mo2)
+        first, ndays = self._month_shape(y2, mo2)
+        today = self._my_workday()
+
+        def rr(x0, y0, x1, y1, r, **kw):
+            self._rr(cv, x0, y0, x1, y1, r, **kw)
+            cv.itemconfigure("dyn", tags="")     # 이 창은 dyn 태그를 안 쓴다
+
+        # 머리 — 달 이름과 넘김 단추
+        rr(u(14), u(12), W - u(14), u(48), u(14), fill=cd["soft"],
+           outline=cd["border"], width=2)
+        head = "%d년 %d월 도장판" % (y2, mo2)
+        if other is not None:
+            head = "%s의 %d월 도장판" % (self.ROOM_NAME.get(other, ""), mo2)
+        cv.create_text(W / 2, u(30), text=head,
+                       font=self._uf(11, True), fill=cd["text"])
+        self._stamp_nav = []
+        if other is None:                 # 남의 판은 받은 달 하나뿐이다
+            for tx, lab, d in ((u(34), "◀", -1), (W - u(34), "▶", 1)):
+                cv.create_text(tx, u(30), text=lab, font=self._uf(11),
+                               fill=cd["sub"])
+                self._stamp_nav.append((tx - u(16), u(14), tx + u(16), u(46),
+                                        d))
+        # 요일 줄
+        wk = "일월화수목금토"
+        gx0, gy0 = u(18), u(58)
+        cell = (W - u(36)) / 7.0
+        for i, ch in enumerate(wk):
+            col = "#e06a7a" if i == 0 else ("#5a7ac0" if i == 6 else cd["sub"])
+            cv.create_text(gx0 + cell * (i + 0.5), gy0 + u(8), text=ch,
+                           font=self._uf(8, True), fill=col)
+        # 날짜 칸
+        diary = self._stamp_diary() if other is None else {}
+        self._stamp_hit = []
+        ch_ = u(42)
+        yy0 = gy0 + u(20)
+        row = 0
+        for dd in range(1, ndays + 1):
+            colx = (first + dd - 1) % 7
+            row = (first + dd - 1) // 7
+            x0 = gx0 + cell * colx + u(2)
+            y0_ = yy0 + row * ch_ + u(2)
+            x1, y1_ = x0 + cell - u(4), y0_ + ch_ - u(4)
+            key = "%04d-%02d-%02d" % (y2, mo2, dd)
+            is_today = key == today
+            secs, runs = days.get(dd, (0.0, 0))
+            fill = "#ffffff" if secs <= 0 else self._tint(
+                cd.get("fill", "#f0a8c0"), 0.88)
+            rr(x0, y0_, x1, y1_, u(9), fill=fill,
+               outline=cd.get("fill") if is_today else cd["line"],
+               width=2 if is_today else 1)
+            cv.create_text(x0 + u(8), y0_ + u(8), text=str(dd),
+                           font=self._uf(7), fill=cd["sub"])
+            kind = next((nm for thr, nm in self.STAMP_TIERS if secs >= thr),
+                        None)
+            if kind:
+                self._stamp_flower(cv, (x0 + x1) / 2, (y0_ + y1_) / 2 + u(3),
+                                   u(11), kind)
+            if runs > 0 and other is None:   # 작업 종료한 날 — 빨간 체크
+                cv.create_text(x1 - u(7), y0_ + u(8), text="✓",
+                               font=self._uf(8, True), fill="#e0525c")
+            if other is None and diary.get(key):   # 일기 있는 날 — 연필 점
+                cv.create_oval(x1 - u(10), y1_ - u(10), x1 - u(4),
+                               y1_ - u(4), fill=cd.get("fill", "#f0a8c0"),
+                               width=0)
+            self._stamp_hit.append((x0, y0_, x1, y1_, dd))
+        # 발치 — 합계와 고른 날
+        fy = yy0 + (row + 1) * ch_ + u(10)
+        tot = sum(v[0] for v in days.values())
+        n = sum(1 for v in days.values() if v[0] > 0)
+        line = "이번 달 %d시간 %d분 · 도장 %d개" % (tot // 3600,
+                                                   tot % 3600 // 60, n)
+        if self._stamp_pick in days:
+            secs, runs = days[self._stamp_pick]
+            line = "%d일 · %d시간 %d분" % (self._stamp_pick,
+                                           secs // 3600, secs % 3600 // 60)
+            if other is None:
+                line += " · 종료 %d번" % runs
+        cv.create_text(W / 2, fy + u(6), text=line, font=self._uf(9, True),
+                       fill=cd["text"])
+        fy += u(16)
+        # ── 일기 (내 판에서 날을 골랐을 때 — 아래가 늘어난다) ────────
+        if self._stamp_txt is not None:
+            try:
+                self._stamp_txt.destroy()
+            except Exception:
+                pass
+            self._stamp_txt = None
+        if other is None and self._stamp_pick is not None:
+            key = "%04d-%02d-%02d" % (y2, mo2, self._stamp_pick)
+            rr(u(18), fy + u(4), W - u(18), fy + u(96), u(12),
+               fill="#ffffff", outline=cd["border"], width=2)
+            cv.create_text(u(30), fy + u(17), anchor="w",
+                           text="\u270e %d일의 일기" % self._stamp_pick,
+                           font=self._uf(8, True), fill=cd["sub"])
+            # 입력칸의 부모는 캔버스여야 삐져나오지 않는다 (지뢰 22)
+            txt = tk.Text(cv, font=self._uf(9), relief="flat",
+                          bg="#ffffff", fg=cd["text"], wrap="char",
+                          height=3, highlightthickness=0)
+            txt.insert("1.0", self._stamp_diary().get(key, ""))
+            cv.create_window(u(30), fy + u(26), anchor="nw", window=txt,
+                             width=W - u(60), height=u(48))
+            self._stamp_txt = txt
+            self._stamp_diary_key = key
+
+            def save_diary(_e=None):
+                try:
+                    self._stamp_diary_set(self._stamp_diary_key,
+                                          txt.get("1.0", "end-1c"))
+                except Exception:
+                    pass
+                return "break"
+            txt.bind("<FocusOut>", save_diary, add="+")
+
+            def save_close(_e=None):
+                save_diary()
+                self._safe("stamp_draw", self._stamp_draw)   # 표시 갱신
+                return "break"
+
+            def del_diary(_e=None):
+                try:
+                    self._stamp_diary_set(self._stamp_diary_key, "")
+                    txt.delete("1.0", "end")
+                except Exception:
+                    pass
+                self._safe("stamp_draw", self._stamp_draw)
+                return "break"
+            txt.bind("<Return>", save_close, add="+")
+            # 안내는 칸 안쪽 오른끝에 붙인다 (가운데 앵커라 삐져나왔었다)
+            cv.create_text(W - u(26), fy + u(85), anchor="e",
+                           text="엔터로 저장", font=self._uf(7),
+                           fill=cd["sub"])
+            dd = cv.create_text(u(30), fy + u(85), anchor="w",
+                                text="일기 지우기", font=self._uf(7, True),
+                                fill="#c96a7d")
+            cv.tag_bind(dd, "<Button-1>", del_diary)
+            fy += u(100)
+        # ── 공개 토글 (내 판에서만) ──────────────────────────────────
+        self._stamp_share_hit = None
+        if other is None:
+            on = bool(self.us.get("stamp_share"))
+            pw = u(150)
+            x0_ = W / 2 - pw / 2
+            rr(x0_, fy + u(6), x0_ + pw, fy + u(32), u(13),
+               fill=self._tint(cd.get("fill", "#f0a8c0"), 0.85) if on
+               else "#ffffff",
+               outline=cd.get("fill") if on else cd["line"], width=2)
+            cv.create_text(W / 2, fy + u(19),
+                           text=("\U0001f513 공개 중 — 친구들이 봐요" if on
+                                 else "\U0001f512 비공개 — 나만 봐요"),
+                           font=self._uf(8, True),
+                           fill=cd["text"] if on else cd["sub"])
+            self._stamp_share_hit = (x0_, fy + u(6), x0_ + pw, fy + u(32))
+            fy += u(36)
+        h_need = int(fy + u(10))
+        if int(cv.cget("height")) != h_need:
+            cv.configure(height=h_need)
+
+    def _stamp_click(self, e):
+        sh = self._stamp_share_hit
+        if sh and sh[0] <= e.x <= sh[2] and sh[1] <= e.y <= sh[3]:
+            self.us["stamp_share"] = not bool(self.us.get("stamp_share"))
+            self._save_settings()
+            self._stamp_pack_at = 0.0    # 다음 신호에 바로 실리게
+            self._safe("stamp_draw", self._stamp_draw)
+            return
+        for x0, y0, x1, y1, d in getattr(self, "_stamp_nav", []):
+            if x0 <= e.x <= x1 and y0 <= e.y <= y1:
+                self._stamp_off += d
+                self._stamp_pick = None
+                self._safe("stamp_draw", self._stamp_draw)
+                return
+        for x0, y0, x1, y1, dd in getattr(self, "_stamp_hit", []):
+            if x0 <= e.x <= x1 and y0 <= e.y <= y1:
+                self._stamp_pick = None if self._stamp_pick == dd else dd
+                self._safe("stamp_draw", self._stamp_draw)
+                return
+
+    def _room_sent_chip(self, cv, slot, x0, py0, kx1, k, col):
+        """내가 오늘 그 사람에게 보낸 수 — 이름표 바로 오른쪽에.
+
+        칸 위쪽은 '오늘 한 줄' 말풍선 자리라 거기 두면 긴 한 줄이 잘린다.
+        서버가 받아 준 것만 세므로, 눌렀는데 안 늘면 안 간 것이다.
+        """
+        n = self._sent_count(slot)
+        if not n:
+            return
+        f = self._uf(8, True)
+        # 수가 커지면 알약이 넓어지는데, 예전에는 왼쪽으로 밀어 넣어서
+        # 이름표를 덮었다 ('→ 99' 제보). 자리가 모자라면 짧은 글로 물러나고,
+        # 그래도 안 들어가면 이름을 가리느니 안 그린다.
+        x0 = x0 + 4 * k
+        for txt in ("\u2192 %d" % min(n, 99), "9+" if n > 9 else "%d" % n):
+            w = self._room_tw(cv, txt, f) + 14 * k
+            if x0 + w <= kx1 - 6 * k:
+                break
+        else:
+            return
+        self._rr(cv, x0, py0 + 3 * k, x0 + w, py0 + 21 * k, 9 * k,
+                 fill="#ffffff", outline=self._tint(col, 0.35), width=1)
+        cv.create_text(x0 + w / 2, py0 + 12 * k, text=txt, font=f,
+                       fill=self._shade(col, 0.2), tags="dyn")
+
+    # 신호 이름(blanket)은 그대로 둔다 — 친구마다 업데이트 시점이 달라서
+    # 이름을 바꾸면 옛 판이 보낸 것을 못 알아본다. 보이는 글자만 바꾼다.
+    ROOM_BTN = (("콕", "poke", "#ffd6e0"), ("응원", "cheer", "#ffe8ba"),
+                ("쓰담", "blanket", "#ffe0ee"), ("간식", "snack", "#def0d6"),
+                ("칭찬", "praise", "#ffe9a0"))
+
+    ROOM_TOAST = 2.0         # '보냈어요' 알림이 떠 있는 시간(초)
+
+    def _room_toast_say(self, to, kind):
+        """무엇을 누구에게 보냈는지 잠깐 알린다 (보내는 쪽 소리도 여기서).
+
+        보내는 길이 셋(아래 단추·캐릭터 누르기·나에게)인데 모두 이곳을
+        거친다. 나에게 보낸 것만 빼는데, 그때는 곧이어 _room_event 가
+        불려 같은 소리를 내기 때문이다(안 빼면 두 번 겹친다).
+        """
+        if to != self.char:
+            self._safe("room_send_snd", self._room_sound)
+        label = dict((b, a) for a, b, _c in self.ROOM_BTN).get(kind, kind)
+        if to == "*":
+            who = "모두"
+        else:
+            who = next((str(q.get("n") or "") for q in self.room_people
+                        if q.get("slot") == to), "")
+            who = who or self.ROOM_NAME.get(to, "") or (
+                self._room_nick() if to == self.char else "")
+        self._room_toast = ("%s에게 %s 보냈어요" % (who, label)
+                            if who else "%s 보냈어요" % label, time.time())
+
+    def _room_deco_path(self, what):
+        """꾸미기 그림 파일 (bg = 배경, card = 방 칸). 내 컴퓨터에만 있다."""
+        return os.path.join(self.state_dir, ".room_%s.png" % what)
+
+    def _deco_zoom(self, what):
+        """꾸미기 그림 크기 설정 (0.5 ~ 2.5, 기본 1)."""
+        try:
+            return max(0.5, min(2.5, float(
+                self.us.get("room_%s_zoom" % what, 100)) / 100.0))
+        except Exception:
+            return 1.0
+
+    def _room_deco_img(self, what, w, h, r=0):
+        """골라 둔 꾸미기 그림을 그 크기로 (가운데를 꽉 채워 자름) — 캐시."""
+        w, h = int(w), int(h)
+        if w < 4 or h < 4 or not self.us.get("room_%s_on" % what):
+            return None
+        p = self._room_deco_path(what)
+        try:
+            mt = int(os.path.getmtime(p))
+        except Exception:
+            return None
+        zoom = self._deco_zoom(what)
+        ox, oy = self._deco_off(what)
+        al = self._deco_alpha(what)
+        key = (what, w, h, mt, zoom, ox, oy, al)
+        cache = self._room_deco_cache
+        if key in cache:
+            return cache[key]
+        got = None
+        try:
+            im = Image.open(p).convert("RGBA")
+            kk = max(w / im.width, h / im.height) * max(0.5, min(2.5, zoom))
+            if not hasattr(self, "_deco_dims"):
+                self._deco_dims = {}
+            self._deco_dims[what] = (im.width * kk, im.height * kk, w, h)
+            got = ImageTk.PhotoImage(
+                self._deco_fit(im, w, h, r, zoom, ox, oy, al))
+        except Exception:
+            got = None
+        if len(cache) > 12:              # 지뢰 18·42 — 오래된 절반만
+            for old in list(cache)[:6]:
+                cache.pop(old, None)
+        cache[key] = got
+        return got
+
+    @staticmethod
+    def _deco_fit(im, w, h, r=0, zoom=1.0, ox=0.0, oy=0.0, alpha=1.0):
+        """그림을 (w, h)에 맞춘다. zoom 1 = 꽉 채움, ox·oy(-1~1) = 위치.
+
+        키우면 확대해 자르고, 줄이면 빈자리가 생긴다(투명 — 그리는 쪽이
+        바탕색으로 받친다). ox가 +면 그림이 오른쪽으로, oy가 +면 아래로
+        간다. r이면 모서리를 둥글게.
+        """
+        zoom = max(0.5, min(2.5, float(zoom or 1.0)))
+        ox = max(-1.0, min(1.0, float(ox or 0.0)))
+        oy = max(-1.0, min(1.0, float(oy or 0.0)))
+        kk = max(w / im.width, h / im.height) * zoom
+        im = im.resize((max(1, round(im.width * kk)),
+                        max(1, round(im.height * kk))), Image.LANCZOS)
+        # 캔버스에 붙이는 방식 하나로 자르기·빈자리를 같이 처리한다
+        px = round((w - im.width) / 2 + ox * abs(w - im.width) / 2)
+        py = round((h - im.height) / 2 + oy * abs(h - im.height) / 2)
+        base = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+        base.paste(im, (px, py), im)
+        im = base
+        if r:
+            from PIL import ImageChops, ImageDraw
+            mask = Image.new("L", im.size, 0)
+            ImageDraw.Draw(mask).rounded_rectangle(
+                [0, 0, im.width - 1, im.height - 1], radius=int(r), fill=255)
+            im.putalpha(ImageChops.multiply(im.split()[3], mask))
+        if alpha < 0.999:                    # 불투명도 (꾸미기 슬라이더)
+            a2 = im.getchannel("A").point(lambda v: int(v * alpha))
+            im.putalpha(a2)
+        return im
+
+    def _deco_alpha(self, what):
+        try:
+            return max(0.1, min(1.0, float(
+                self.us.get("room_%s_alpha" % what, 100)) / 100.0))
+        except Exception:
+            return 1.0
+
+    def _deco_off(self, what):
+        """꾸미기 그림 위치 설정 (-1 ~ 1, 기본 0·가운데)."""
+        try:
+            return (max(-1.0, min(1.0, float(
+                        self.us.get("room_%s_x" % what, 0)) / 100.0)),
+                    max(-1.0, min(1.0, float(
+                        self.us.get("room_%s_y" % what, 0)) / 100.0)))
+        except Exception:
+            return 0.0, 0.0
+
+    def _room_card_thumb(self):
+        """내 방 칸 그림의 작은 사본 — 방 신호에 실어 남에게도 보인다.
+
+        (base64 글, 해시) 를 돌려준다. 꺼져 있으면 (None, ""). 자주
+        불리므로 파일 mtime 으로 기억해 두고 다시 만들지 않는다.
+        """
+        if not self.us.get("room_card_on"):
+            return None, ""
+        p = self._room_deco_path("card")
+        try:
+            mt = int(os.path.getmtime(p))
+        except Exception:
+            return None, ""
+        zoom = self._deco_zoom("card")
+        ox, oy = self._deco_off("card")
+        al = self._deco_alpha("card")
+        mem = getattr(self, "_cd_mem", None)
+        if mem and mem[0] == (mt, zoom, ox, oy, al):
+            return mem[1], mem[2]
+        try:
+            import base64
+            import io as _io
+            im = Image.open(p).convert("RGBA")
+            # 크기·위치 조절까지 구워서 보낸다 — 받는 쪽은 그대로 깔면 내
+            # 화면과 같은 모습이 된다. 빈자리는 흰색(칸 색)으로 받친다.
+            # 480px — 어떤 배율에서도 카드보다 넓어 내 화면 화질과 같다
+            # (서버 상한 64000 기준. 올리기 전엔 큰 신호가 조용히 버려진다).
+            th = max(60, int(480 * self.ROOM_CH / self.ROOM_CW))
+            im = self._deco_fit(im, 480, th, 0, zoom, ox, oy, al)
+            base = Image.new("RGB", im.size, (255, 255, 255))
+            base.paste(im, (0, 0), im)
+            b64 = ""
+            for q in (74, 62, 50, 38):   # 20KB 안에 들 때까지 낮춘다
+                buf = _io.BytesIO()
+                base.save(buf, "JPEG", quality=q)
+                b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+                if len(b64) <= 44000:
+                    break
+            if len(b64) > 44000:
+                return None, ""
+            h = hashlib.sha256(b64.encode("ascii")).hexdigest()[:10]
+        except Exception:
+            return None, ""
+        self._cd_mem = ((mt, zoom, ox, oy, al), b64, h)
+        return b64, h
+
+    def _room_peer_hash_path(self):
+        return os.path.join(self.state_dir, ".deco_peers.json")
+
+    def _room_peer_hashes(self):
+        got = getattr(self, "_room_peer_hash", None)
+        if got is None:
+            try:
+                with open(self._room_peer_hash_path(),
+                          encoding="utf-8") as fp:
+                    got = json.load(fp)
+            except Exception:
+                got = {}
+            self._room_peer_hash = got if isinstance(got, dict) else {}
+        return self._room_peer_hash
+
+    @staticmethod
+    def _slot_sane(slot):
+        return "".join(ch for ch in str(slot)
+                       if ch.isalnum() or ch == "_")[:40]
+
+    def _room_peer_save(self, slot, cdh, b64):
+        """남이 보낸 방 칸 그림을 받아 둔다 (해시가 바뀌었을 때만)."""
+        hs = self._room_peer_hashes()
+        if not slot or hs.get(slot) == cdh:
+            return
+        try:
+            import base64
+            raw = base64.b64decode(str(b64)[:30000])
+        except Exception:
+            return
+        if not raw or len(raw) > 120000:
+            return
+        try:
+            import io as _io
+            im = Image.open(_io.BytesIO(raw))
+            im.load()
+            if im.width * im.height > 4000000:
+                return                   # 작은 파일이 큰 그림인 척하는 것 방지
+        except Exception:
+            return
+        try:
+            out = os.path.join(self.state_dir,
+                               ".deco_%s.png" % self._slot_sane(slot))
+            tmp = out + ".tmp"
+            im.convert("RGB").save(tmp, "PNG")
+            os.replace(tmp, out)
+        except Exception:
+            return
+        hs[slot] = cdh
+        try:
+            _save_json(self._room_peer_hash_path(), hs)
+        except Exception:
+            pass
+        # 크기별 캐시에 옛 그림이 남아 있으니 그 사람 것만 비운다
+        for k2 in [k3 for k3 in self._room_deco_cache
+                   if k3 and k3[0] == "peer" and k3[1] == slot]:
+            self._room_deco_cache.pop(k2, None)
+
+    def _room_peer_img(self, slot, cdh, w, h, r):
+        """남의 방 칸 그림 (받아 둔 것과 해시가 맞을 때만)."""
+        w, h = int(w), int(h)
+        if not cdh or w < 4 or h < 4:
+            return None
+        if self._room_peer_hashes().get(slot) != cdh:
+            return None                  # 아직 그림이 안 왔다 — 곧 온다
+        key = ("peer", slot, w, h, cdh)
+        cache = self._room_deco_cache
+        if key in cache:
+            return cache[key]
+        got = None
+        try:
+            p = os.path.join(self.state_dir,
+                             ".deco_%s.png" % self._slot_sane(slot))
+            im = Image.open(p).convert("RGBA")
+            got = ImageTk.PhotoImage(self._deco_fit(im, w, h, r))
+        except Exception:
+            got = None
+        if len(cache) > 12:
+            for old in list(cache)[:6]:
+                cache.pop(old, None)
+        cache[key] = got
+        return got
+
+    def _pick_image_file(self):
+        """그림 파일 고르기 창 — tkinter.filedialog 없이.
+
+        굳힌 exe 에는 안 쓰던 하위 모듈이 안 들어 있어 (지뢰 21) 준사의
+        '그림 고르기 버튼이 안 눌려요'가 됐다. 윈도우는 comdlg32, 맥은
+        AppKit 으로 직접 열고, 소스 실행이면 filedialog 로 물러난다.
+        """
+        if IS_WIN:
+            try:
+                dlg = ctypes.WinDLL("comdlg32")   # 지뢰 21 — 따로 연다
+                buf = ctypes.create_unicode_buffer(4096)
+
+                class OFN(ctypes.Structure):
+                    _fields_ = [
+                        ("lStructSize", ctypes.c_uint32),
+                        ("hwndOwner", ctypes.c_void_p),
+                        ("hInstance", ctypes.c_void_p),
+                        ("lpstrFilter", ctypes.c_wchar_p),
+                        ("lpstrCustomFilter", ctypes.c_wchar_p),
+                        ("nMaxCustFilter", ctypes.c_uint32),
+                        ("nFilterIndex", ctypes.c_uint32),
+                        ("lpstrFile", ctypes.c_wchar_p),
+                        ("nMaxFile", ctypes.c_uint32),
+                        ("lpstrFileTitle", ctypes.c_wchar_p),
+                        ("nMaxFileTitle", ctypes.c_uint32),
+                        ("lpstrInitialDir", ctypes.c_wchar_p),
+                        ("lpstrTitle", ctypes.c_wchar_p),
+                        ("Flags", ctypes.c_uint32),
+                        ("nFileOffset", ctypes.c_uint16),
+                        ("nFileExtension", ctypes.c_uint16),
+                        ("lpstrDefExt", ctypes.c_wchar_p),
+                        ("lCustData", ctypes.c_void_p),
+                        ("lpfnHook", ctypes.c_void_p),
+                        ("lpTemplateName", ctypes.c_wchar_p),
+                        ("pvReserved", ctypes.c_void_p),
+                        ("dwReserved", ctypes.c_uint32),
+                        ("FlagsEx", ctypes.c_uint32)]
+
+                ofn = OFN()
+                ofn.lStructSize = ctypes.sizeof(OFN)
+                try:
+                    # 꾸미기 창이 '항상 위'라 소유자를 안 주면 파일 창이
+                    # 그 뒤에 숨는다 — '안 열려요'로 보인 원인
+                    w2 = getattr(self, "_deco_win", None) or self.root
+                    ofn.hwndOwner = int(w2.wm_frame(), 16)
+                except Exception:
+                    pass
+                ofn.lpstrFilter = ("그림\0*.png;*.jpg;*.jpeg;*.webp;*.bmp\0"
+                                   "모든 파일\0*.*\0\0")
+                ofn.nFilterIndex = 1
+                ofn.lpstrFile = ctypes.cast(buf, ctypes.c_wchar_p)
+                ofn.nMaxFile = 4096
+                ofn.lpstrTitle = "그림 고르기"
+                ofn.Flags = 0x00081800    # 존재하는 파일만·경로 유효·숨김 무시
+                if dlg.GetOpenFileNameW(ctypes.byref(ofn)):
+                    return buf.value
+                return ""
+            except Exception:
+                pass
+        if IS_MAC:
+            try:
+                from AppKit import NSOpenPanel
+                pan = NSOpenPanel.openPanel()
+                pan.setCanChooseFiles_(True)
+                pan.setCanChooseDirectories_(False)
+                pan.setAllowsMultipleSelection_(False)
+                if pan.runModal():
+                    return str(pan.URLs()[0].path())
+                return ""
+            except Exception:
+                pass
+        try:
+            from tkinter import filedialog
+            return filedialog.askopenfilename(
+                title="그림 고르기",
+                filetypes=[("그림", "*.png *.jpg *.jpeg *.webp *.bmp"),
+                           ("모든 파일", "*.*")]) or ""
+        except Exception:
+            return ""
+
+    def _room_deco_set(self, what):
+        """그림 파일을 골라 꾸미기로 저장한다."""
+        p = self._pick_image_file()
+        if not p:
+            return
+        try:
+            im = Image.open(p).convert("RGBA")
+            im.thumbnail((1920, 1920), Image.LANCZOS)   # 원본이 커도 가볍게
+            out = self._room_deco_path(what)
+            tmp = out + ".tmp"
+            im.save(tmp, "PNG")
+            os.replace(tmp, out)
+        except Exception:
+            self._room_toast = ("그림을 읽지 못했어요", time.time())
+            return
+        self.us["room_%s_on" % what] = True
+        self._save_settings()
+        self._room_deco_bump()
+
+    def _room_deco_clear(self, what):
+        self.us["room_%s_on" % what] = False
+        self._save_settings()
+        self._room_deco_bump()
+
+    def _room_deco_bump(self):
+        """꾸미기가 바뀌었다 — 배경을 다시 그리고, 방에도 바로 알린다."""
+        self._room_deco_cache.clear()
+        self._cd_mem = None
+        self._cd_push = True             # 다음 신호에 그림을 실어 보낸다
+        self._room_deco_ver += 1
+        self._room_bg = None
+        self._safe("room_draw", self._room_draw)
+        self._safe("room_push", self._room_push_now)
+
+    def _deco_editing(self):
+        """꾸미기 창이 떠 있는 동안만 드래그 위치 조절이 켜진다."""
+        w = getattr(self, "_deco_win", None)
+        try:
+            return w is not None and w.winfo_exists()
+        except Exception:
+            return False
+
+    def _deco_drag(self, e):
+        """꾸미기 창이 열려 있으면 홈에서 그림을 직접 끌어 옮긴다.
+
+        내 칸 위에서 시작한 드래그는 방 칸 그림, 그 밖은 배경 그림.
+        옮길 수 있는 폭(그림과 칸의 크기 차)의 절반을 끝까지로 본다.
+        """
+        if not self._deco_editing():
+            return
+        st = getattr(self, "_deco_drag_st", None)
+        if st is None:
+            what = "bg"
+            for x0, y0, x1, y1, slot, _s in self._room_hit:
+                if (slot == self.char and x0 <= e.x <= x1
+                        and y0 <= e.y <= y1):
+                    what = "card"
+                    break
+            if not self.us.get("room_%s_on" % what):
+                return
+            self._deco_drag_st = st = {
+                "what": what, "x": e.x, "y": e.y,
+                "ox": self._deco_off(what)[0] * 100,
+                "oy": self._deco_off(what)[1] * 100, "at": 0.0}
+            return
+        what = st["what"]
+        dims = getattr(self, "_deco_dims", {}).get(what)
+        if not dims:
+            return
+        iw, ih, aw, ah = dims
+        span_x = max(20.0, abs(aw - iw) / 2.0)
+        span_y = max(20.0, abs(ah - ih) / 2.0)
+        nx = st["ox"] + (e.x - st["x"]) / span_x * 100.0
+        ny = st["oy"] + (e.y - st["y"]) / span_y * 100.0
+        self.us["room_%s_x" % what] = int(max(-100, min(100, nx)))
+        self.us["room_%s_y" % what] = int(max(-100, min(100, ny)))
+        now = time.time()
+        if now - st["at"] > 0.09:            # 너무 잦은 다시 그리기 방지
+            st["at"] = now
+            self._room_deco_cache.clear()
+            self._room_bg = None
+            self._safe("room_draw", self._room_draw)
+
+    def _deco_drop(self, _e):
+        """드래그 끝 — 저장하고 친구들에게도 알린다 (방 칸)."""
+        st = getattr(self, "_deco_drag_st", None)
+        self._deco_drag_st = None
+        if st is None or not self._deco_editing():
+            return
+        self._save_settings()
+        self._room_deco_bump()
+
+    def _pick_color(self, init="#e7e7ea"):
+        """색 고르기 창 — tkinter.colorchooser 없이 (지뢰 21).
+
+        윈도우는 comdlg32 ChooseColorW, 아니면 tkinter 로 물러난다.
+        """
+        if IS_WIN:
+            try:
+                dlg = ctypes.WinDLL("comdlg32")
+
+                class CC(ctypes.Structure):
+                    _fields_ = [
+                        ("lStructSize", ctypes.c_uint32),
+                        ("hwndOwner", ctypes.c_void_p),
+                        ("hInstance", ctypes.c_void_p),
+                        ("rgbResult", ctypes.c_uint32),
+                        ("lpCustColors", ctypes.c_void_p),
+                        ("Flags", ctypes.c_uint32),
+                        ("lCustData", ctypes.c_void_p),
+                        ("lpfnHook", ctypes.c_void_p),
+                        ("lpTemplateName", ctypes.c_wchar_p)]
+
+                cust = (ctypes.c_uint32 * 16)()
+                cc = CC()
+                cc.lStructSize = ctypes.sizeof(CC)
+                try:
+                    w2 = getattr(self, "_deco_win", None) or self.root
+                    cc.hwndOwner = int(w2.wm_frame(), 16)
+                except Exception:
+                    pass
+                r0, g0, b0 = (int(init[i:i + 2], 16) for i in (1, 3, 5))
+                cc.rgbResult = r0 | (g0 << 8) | (b0 << 16)
+                cc.lpCustColors = ctypes.cast(cust, ctypes.c_void_p)
+                cc.Flags = 0x103          # RGBINIT | FULLOPEN | ANYCOLOR
+                if dlg.ChooseColorW(ctypes.byref(cc)):
+                    v = cc.rgbResult
+                    return "#%02x%02x%02x" % (v & 255, (v >> 8) & 255,
+                                              (v >> 16) & 255)
+                return ""
+            except Exception:
+                pass
+        try:
+            from tkinter import colorchooser
+            got = colorchooser.askcolor(init, title="단추 색 고르기")
+            return got[1] or ""
+        except Exception:
+            return ""
+
+    def _room_deco_win(self):
+        """홈 꾸미기 창 — 배경·방 그림을 고르거나 되돌린다."""
+        cd, u = self.card, self._ui
+        win = tk.Toplevel(self.room_win or self.root)
+        self._deco_win = win             # 떠 있는 동안 드래그 조절이 켜진다
+        win.title("홈 꾸미기")
+        win.configure(bg=cd["panel"])
+        win.resizable(False, False)
+        tk.Label(win, text="홈 꾸미기", font=self._uf(12, True),
+                 bg=cd["panel"], fg=cd["text"]).pack(pady=(u(16), u(4)))
+        tk.Label(win, text="이 창이 떠 있는 동안 홈에서 그림을 끌면 위치가 움직여요",
+                 font=self._uf(8), bg=cd["panel"], fg=cd["text"]
+                 ).pack(pady=(0, u(2)))
+        tk.Label(win, text="배경은 내 화면에만 · 방 칸은 친구들에게도 보여요",
+                 font=self._uf(8), bg=cd["panel"], fg=cd["sub"]
+                 ).pack(pady=(0, u(8)))
+
+        def row(label, what):
+            fr = tk.Frame(win, bg=cd["panel"])
+            fr.pack(padx=u(20), pady=u(6), fill="x")
+            tk.Label(fr, text=label, font=self._uf(10, True),
+                     bg=cd["panel"], fg=cd["text"], width=8).pack(side="left")
+            tk.Button(fr, text="그림 고르기", font=self._uf(9),
+                      relief="flat", bg=cd["fill"], fg="#ffffff",
+                      activebackground=cd["fill"], padx=u(10),
+                      command=lambda: self._safe(
+                          "deco_set", self._room_deco_set, what)
+                      ).pack(side="left", padx=u(6))
+            tk.Button(fr, text="기본으로", font=self._uf(9),
+                      relief="flat", bg="#e9e2ea", fg=cd["text"],
+                      activebackground="#e9e2ea", padx=u(10),
+                      command=lambda: self._safe(
+                          "deco_clear", self._room_deco_clear, what)
+                      ).pack(side="left")
+            # 크기·위치 조절 — 놓는 순간 적용된다
+            def slider(label, key, lo, hi, default, res=5):
+                if IS_MAC:
+                    # 맥(Tk9 아쿠아)은 tk.Scale 에서 앱이 통째로 꺼지는
+                    # 제보가 있어(퀸시) +/- 단추로 만든다
+                    fr3 = tk.Frame(win, bg=cd["panel"])
+                    fr3.pack(padx=u(24), anchor="w")
+                    tk.Label(fr3, text=label, font=self._uf(7),
+                             bg=cd["panel"], fg=cd["sub"]).pack(side="left")
+                    val = tk.Label(fr3, font=self._uf(8, True),
+                                   bg=cd["panel"], fg=cd["text"], width=4,
+                                   text=str(int(float(
+                                       self.us.get(key, default)))))
+                    val.pack(side="right")
+
+                    def step(d2, k2=key, v2=val, lo2=lo, hi2=hi):
+                        cur = int(float(self.us.get(k2, default)))
+                        cur = max(lo2, min(hi2, cur + d2))
+                        self.us[k2] = cur
+                        v2.config(text=str(cur))
+                        self._save_settings()
+                        self._room_deco_bump()
+
+                    for cap2, d2 in (("−", -10), ("+", 10)):
+                        tk.Button(fr3, text=cap2, font=self._uf(9, True),
+                                  relief="flat", bg="#ffffff",
+                                  fg=cd["text"], width=2,
+                                  command=lambda dd=d2: step(dd)
+                                  ).pack(side="right", padx=2)
+                    return
+                sc = tk.Scale(win, from_=lo, to=hi, orient="horizontal",
+                              resolution=res, showvalue=True, length=u(230),
+                              label=label, font=self._uf(7),
+                              bg=cd["panel"], fg=cd["sub"],
+                              highlightthickness=0, troughcolor="#ffffff",
+                              activebackground=cd["fill"])
+                sc.set(int(float(self.us.get(key, default))))
+                sc.pack(padx=u(24))
+
+                def done(_e, k2=key, s2=sc):
+                    self.us[k2] = int(s2.get())
+                    self._save_settings()
+                    self._room_deco_bump()
+                sc.bind("<ButtonRelease-1>", done)
+
+            slider("크기 (%)", "room_%s_zoom" % what, 50, 250, 100)
+            slider("불투명도 (%)", "room_%s_alpha" % what, 10, 100, 100)
+
+        row("배경", "bg")
+        row("방 칸", "card")
+        # 반응 단추 색 — 견본 몇 개 + 직접 고르기 + 기본
+        fr2 = tk.Frame(win, bg=cd["panel"])
+        fr2.pack(padx=u(20), pady=(u(4), u(6)), fill="x")
+        tk.Label(fr2, text="단추 색", font=self._uf(10, True),
+                 bg=cd["panel"], fg=cd["text"], width=8).pack(side="left")
+
+        def set_btn_color(c2):
+            self.us["room_btn_color"] = c2
+            self._save_settings()
+            self._safe("room_draw", self._room_draw)
+
+        for c2 in ("#e7e7ea", "#d9d9de", "#ffd3e0", "#cfe2ff",
+                   "#d6ecc9", "#fff1bd", "#e3d8f7"):
+            tk.Button(fr2, text="  ", bg=c2, relief="flat", bd=1,
+                      activebackground=c2,
+                      command=lambda c3=c2: set_btn_color(c3)
+                      ).pack(side="left", padx=2)
+        tk.Button(fr2, text="직접", font=self._uf(8), relief="flat",
+                  bg="#ffffff", fg=cd["text"],
+                  command=lambda: set_btn_color(
+                      self._pick_color(self.us.get("room_btn_color")
+                                       or "#e7e7ea") or
+                      self.us.get("room_btn_color") or "")
+                  ).pack(side="left", padx=(u(6), 2))
+        tk.Button(fr2, text="기본", font=self._uf(8), relief="flat",
+                  bg="#ffffff", fg=cd["sub"],
+                  command=lambda: set_btn_color("")
+                  ).pack(side="left", padx=2)
+        tk.Button(win, text="닫기", font=self._uf(9), relief="flat",
+                  bg="#ffffff", fg=cd["text"], padx=u(16),
+                  command=win.destroy).pack(pady=(u(10), u(16)))
+        win.bind("<Escape>", lambda _e: win.destroy())
+        self._place_near(win)
+        self._dialog_keep(win, "deco")
+
+    def _room_bar(self, cv, W, H, P, k, people):
+        """아래 단추 줄 — 고른 상대에게만 간다.
+
+        누구에게 보낼지는 두 가지로 고른다. 캐릭터를 누르면 그 사람,
+        '모두에게' 알약을 누르면 방 전체. 바닥에 붙지 않게 여백을 둔다.
+        """
+        pick = self._room_pick
+        who = next((q for q in people if q.get("slot") == pick), None)
+        bw, gap, bot = 46 * k, 14 * k, 34 * k
+        by = H - bot - bw
+        if who is not None:
+            cap = "%s에게" % str(who.get("n") or "")
+        elif pick == "*":
+            cap = "방에 있는 모두에게"
+        else:
+            cap = "보낼 사람을 골라 주세요"
+        capf = self._uf(10, True)
+        tw_ = self._room_tw(cv, cap, capf)
+        self._rr(cv, W // 2 - tw_ / 2 - 14 * k, by - 44 * k,
+                 W // 2 + tw_ / 2 + 14 * k, by - 16 * k, 14 * k,
+                 fill="#ffffff", outline=P["line"], width=1)
+        cv.create_text(W // 2, by - 30 * k, anchor="center", text=cap,
+                       font=capf, fill=P["ink"], tags="dyn")
+        ts = self._room_toast
+        if ts and time.time() - ts[1] < self.ROOM_TOAST:
+            tw = self._room_tw(cv, ts[0], self._uf(9, True))
+            ty = by - 56 * k
+            self._rr(cv, W / 2 - tw / 2 - 14 * k, ty - 13 * k,
+                     W / 2 + tw / 2 + 14 * k, ty + 13 * k, 13 * k,
+                     fill="#ffffff", outline=P["lamp"], width=2)
+            cv.create_text(W / 2, ty, text=ts[0], font=self._uf(9, True),
+                           fill=P["ink"], tags="dyn")
+        row = len(self.ROOM_BTN) * bw + (len(self.ROOM_BTN) - 1) * gap
+        pw = 66 * k
+        px = W / 2 - row / 2 - pw - 18 * k
+        all_on = (pick == "*")
+        self._rr(cv, px, by + bw / 2 - 14 * k, px + pw, by + bw / 2 + 14 * k,
+                 14 * k, fill=P["lamp"] if all_on else P["card"],
+                 outline=P["sub"] if all_on else P["line"],
+                 width=2 if all_on else 1)
+        cv.create_text(px + pw / 2, by + bw / 2, text="모두에게",
+                       font=self._uf(8, True), fill=P["ink"], tags="dyn")
+        self._room_btn_hit = [(px, by + bw / 2 - 14 * k, px + pw,
+                               by + bw / 2 + 14 * k, "@all")]
+        live = who is not None or pick == "*"
+        x = W / 2 - row / 2
+        cust = str(self.us.get("room_btn_color") or "")
+        for label, kind, col in self.ROOM_BTN:
+            if cust:                 # 단추 색 직접 고르기 (준사 — 무채색파)
+                col = cust
+            on = live
+            if kind == "praise":
+                # 칭찬은 목표(게이지 100%)를 채운 사람에게만 켜진다
+                on = (who is not None
+                      and float(who.get("p") or 0) >= 1.0)
+            elif kind == "snack" and pick == self.char:
+                on = False               # 간식은 자기 자신에게는 못 준다
+            fill = col if on else self._tint(col, 0.62)
+            cv.create_oval(x + 2, by + 2, x + bw + 2, by + bw + 2,
+                           fill=P["line"], width=0, tags="dyn")
+            cv.create_oval(x, by, x + bw, by + bw, fill=fill,
+                           outline="#ffffff", width=2, tags="dyn")
+            cv.create_text(x + bw / 2, by + bw / 2, text=label,
+                           font=self._uf(9, True),
+                           fill=P["ink"] if on else P["sub"], tags="dyn")
+            if on:
+                self._room_btn_hit.append((x, by, x + bw, by + bw, kind))
+            x += bw + gap
+        # 꾸미기 단추 — 반응 단추와 같은 생김새로 오른쪽 끝에
+        dx0 = W - 20 * k - bw
+        cv.create_oval(dx0 + 2, by + 2, dx0 + bw + 2, by + bw + 2,
+                       fill=P["line"], width=0, tags="dyn")
+        cv.create_oval(dx0, by, dx0 + bw, by + bw,
+                       fill=cust or "#f6f0f8",
+                       outline="#ffffff", width=2, tags="dyn")
+        cv.create_text(dx0 + bw / 2, by + bw / 2, text="꾸미기",
+                       font=self._uf(8, True), fill=P["sub"], tags="dyn")
+        self._room_deco_btn = (dx0, by, dx0 + bw, by + bw)
+
+    POKE_BURST = 5           # 10초 안에 이 횟수째부터 막는다
+    POKE_WINDOW = 10.0
+
+    def _poke_ok(self):
+        """콕 연타 제한 — 10초 안에 다섯 번째부터는 안 보낸다.
+
+        보내는 길이 둘(아래 단추·캐릭터 직접 누르기)이라 여기 한 곳에서
+        센다. 서버에도 방 전체 제한(10초에 40개)이 있지만, 그건 넘치면
+        조용히 버려서 보낸 사람이 모른다 — 여기서 미리 막고 말해 준다.
+        """
+        now = time.time()
+        self._poke_times = [t for t in self._poke_times
+                            if now - t < self.POKE_WINDOW]
+        if len(self._poke_times) >= self.POKE_BURST - 1:
+            self._room_toast = ("콕은 잠깐 쉬었다가 눌러 주세요", now)
+            self._safe("room_draw", self._room_draw)
+            return False
+        self._poke_times.append(now)
+        return True
+
+    def _room_send(self, kind):
+        """단추를 눌렀을 때 — 고른 상대에게만 간다.
+
+        나에게 보낸 것은 서버를 거쳐 돌아오지 않는다(자기 것은 걸러진다).
+        그래서 나를 고른 경우에는 그 자리에서 바로 반응한다.
+        """
+        to = self._room_pick
+        if not to:
+            return
+        if kind == "poke" and not self._poke_ok():
+            return
+        if kind == "snack" and to == self.char:
+            self._room_toast = ("간식은 자기한테는 못 줘요", time.time())
+            return
+        if kind == "praise":
+            who = next((q for q in self.room_people
+                        if q.get("slot") == to), None)
+            if to == self.char or who is None                     or float(who.get("p") or 0) < 1.0:
+                self._room_toast = ("목표를 다 채운 사람에게만 칭찬할 수 "
+                                    "있어요", time.time())
+                return
+        # 간식은 그림 하나를 골라 신호에 실어 보낸다 — 받는 쪽도 같은 것을 본다
+        extra = self._snack_pick(time.time() * 1000) if kind == "snack" else ""
+        if kind == "snack":
+            cup = self._cup_name()
+            if cup and random.random() < self.SNACK_CUP_RATE:
+                extra = cup              # 내 스페셜 컵케이크가 나왔다!
+        if to == self.char:
+            self._room_fx_add(to, kind, extra)
+            self._room_toast_say(to, kind)
+            self._room_flash[to] = time.time()
+            self._room_note = (dict((b, a) for a, b, _c in self.ROOM_BTN).get(
+                kind, kind), time.time())
+            self._safe("room_self", self._room_event,
+                       {"f": self.char, "k": kind, "x": extra})
+            return
+        if self.room_net is None:
+            return
+        self.room_net.send(to, kind, extra or None)
+        self._room_toast_say(to, kind)
+        if to == "*":
+            for q in self.room_people:
+                self._room_flash[q.get("slot") or ""] = time.time()
+                self._room_fx_add(q.get("slot"), kind)
+        else:
+            self._room_flash[to] = time.time()
+            self._room_fx_add(to, kind)
+        self._room_sent = (kind, time.time())
+        self._room_note = (dict((b, a) for a, b, _c in self.ROOM_BTN).get(
+            kind, kind), time.time())
+
+    def _room_seats(self):
+        """방에 그릴 자리 — 나 · 접속한 사람 · 아직 안 켠 사람 순.
+
+        선물용 타이머를 받은 사람은 꺼져 있어도 자리를 보여 준다. 그래야
+        혼자 켰을 때도 방이 비어 보이지 않는다. 뒤쪽(안 켠 사람)부터
+        잘리므로 창이 작아도 접속한 사람이 먼저 보인다.
+        """
+        seats = []
+        if not self.us.get("room_hide_me"):
+            seats.append(dict(self._room_state_now(), slot=self.char, age=0))
+        # 서버는 '최근에 신호한 순'으로 준다. 그대로 쓰면 5초마다 자리가
+        # 뒤바뀌어 보인다 — 정해진 차례로 다시 세운다.
+        order = dict((sl, i) for i, sl in enumerate(self.ROOM_ALL))
+        seen = self._room_seen_get()
+        day = self._my_workday()
+        rest = []
+        for q in self.room_people:
+            if (q.get("slot") or "") == self.char:
+                continue
+            row = seen.get(q.get("slot") or "")
+            if self._seen_ok(row, day):
+                # 접속 중인 사람도 오늘 최고치 아래로는 안 보여 준다 —
+                # 옛 판이 재시작해 0을 보내와도 게이지가 안 꺼진다
+                t2 = max(int(q.get("t") or 0), int(row[0]))
+                p2 = max(float(q.get("p") or 0), float(row[1]))
+                if t2 != q.get("t") or p2 != q.get("p"):
+                    q = dict(q, t=t2, p=p2)
+            rest.append(q)
+        rest.sort(key=lambda q: (order.get(q.get("slot") or "", 99),
+                                 q.get("slot") or ""))
+        seats.extend(rest)
+        # 페이지로 나뉘면서 순서가 곧 페이지 배정이 됐다 — 켜 있는 사람이
+        # 앞 페이지에 오도록, 나를 뺀 전원을 '접속 먼저'로 다시 세운다.
+        seats[1:] = sorted(
+            seats[1:], key=lambda q: (1 if q.get("off") else 0,
+                                      order.get(q.get("slot") or "", 99),
+                                      q.get("slot") or ""))
+        here = set(q.get("slot") or "" for q in seats)
+        for slot in self.ROOM_ALL:
+            if slot in here:
+                continue
+            # 예전에는 내 캐릭터와 같은 그림의 선물본 자리를 '겹친다'고
+            # 뺐는데, 그 자리에 진짜 친구가 들어오면서 내 화면에서만 그
+            # 사람이 사라졌다 (도로롱 제보). 같은 그림이어도 다 보여 준다.
+            # 접속을 껐어도 오늘 본 마지막 시간·게이지는 그대로 보여 준다
+            st, sp = 0, 0
+            row = self._room_seen_get().get(slot)
+            if self._seen_ok(row, self._my_workday()):
+                st, sp = int(row[0]), float(row[1])
+            seats.append({"slot": slot, "n": self.ROOM_NAME.get(slot, ""),
+                          "lv": 1, "ti": "", "t": st, "s": "off", "p": sp,
+                          "a": "", "off": True})
+        return seats
+
+    def _room_pose(self, p):
+        """그 사람이 지금 뭘 하고 있는지에 맞는 그림을 고른다.
+
+        작업 중이면 두 자세를 번갈아 보여 준다 — 한 장만 쓰면 통째로 멈춰
+        보인다. 자세 그림이 없는 옛 배포본이면 _room_img 가 None 을 주므로
+        기본 자세로 물러난다.
+        """
+        if p.get("s") == "sleep":
+            return "seat_idle"
+        if p.get("s") != "work":
+            return "seat"
+        if p.get("a") == "key":
+            return "seat_type"
+        # 0.7초마다 손 위치가 바뀐다 (사람마다 박자를 어긋나게)
+        n = int(time.time() / 0.7 + (hash(p.get("slot") or "") % 3))
+        return "seat_pen" if n % 2 else "seat_pen2"
+
+    ROOM_FX = 1.5            # 연출이 보이는 시간(초)
+    ROOM_PAGE = 9            # 홈 한 페이지에 보이는 사람 수
+
+    CHAR_FX = 2.2            # 캐릭터 창 연출이 보이는 시간(초)
+
+    SNACK_CACHE = 40         # 만들어 둘 간식 그림 장수 (한 장 60KB쯤)
+
+    def _snack_names(self):
+        """간식 그림 이름들 (없으면 빈 목록 — 그때는 그려서 낸다)."""
+        got = getattr(self, "_snack_list", None)
+        if got is None:
+            got = []
+            try:
+                d = os.path.join(self.dir, "snacks")
+                got = sorted(f[:-4] for f in os.listdir(d)
+                             if f.lower().endswith(".png"))
+            except Exception:
+                got = []
+            self._snack_list = got
+        return got
+
+    def _snack_pick(self, seed):
+        """무작위로 하나 — 같은 씨앗이면 늘 같은 것 (프레임마다 안 바뀐다)."""
+        names = self._snack_names()
+        if not names:
+            return ""
+        # 나머지 연산으로 고르면 씨앗이 규칙적일 때 몇 개만 돌아 나온다
+        # (1000씩 늘려 봤더니 열여덟 중 아홉만 나왔다). 섞어서 고른다.
+        return names[random.Random(int(seed)).randrange(len(names))]
+
+    def _snack_photo(self, name, long_px, bite=0):
+        """그 크기의 간식 그림. 만든 것은 들고 있는다 (상한 있음).
+
+        bite 가 1이면 오른쪽 위를 두 군데 둥글게 베어 문 그림을 낸다.
+        """
+        if str(name).startswith("cup_"):
+            long_px = int(long_px * 1.5)     # 스페셜 컵케이크는 큼직하게
+        key = (name, int(long_px), int(bite))
+        cache = self._snack_cache
+        got = cache.get(key)
+        if got is not None:
+            return got
+        try:
+            p2 = os.path.join(self.dir, "snacks", name + ".png")
+            if not os.path.isfile(p2) and name.startswith("cup_"):
+                # 스페셜 컵케이크는 따로 둔다 (일반 뽑기에 안 섞이게)
+                p2 = os.path.join(self.dir, "snacks_special", name + ".png")
+            im = Image.open(p2)
+            im = im.convert("RGBA")
+            if bite:
+                # 이빨 자국 — 알파에서 원을 빼낸다 (입 수만큼 늘어난다)
+                from PIL import ImageChops, ImageDraw
+                mask = Image.new("L", im.size, 0)
+                dr = ImageDraw.Draw(mask)
+                w, h = im.size
+                r = max(6, int(min(w, h) * 0.20))
+                spots = [(int(w * 0.80), int(h * 0.22)),
+                         (int(w * 0.62), int(h * 0.10))]
+                if int(bite) >= 2:           # 두 입째 — 왼쪽 위도 베어 문다
+                    spots += [(int(w * 0.42), int(h * 0.16)),
+                              (int(w * 0.24), int(h * 0.08))]
+                for mx, my in spots:
+                    dr.ellipse([mx - r, my - r, mx + r, my + r], fill=255)
+                im.putalpha(ImageChops.subtract(im.getchannel("A"), mask))
+            w, h = im.size
+            r = float(long_px) / max(1, max(w, h))
+            im = im.resize((max(1, round(w * r)), max(1, round(h * r))),
+                           Image.LANCZOS)
+            got = ImageTk.PhotoImage(im)
+        except Exception:
+            return None
+        if len(cache) > self.SNACK_CACHE:      # 오래된 절반만 버린다 (지뢰 18)
+            for k2 in list(cache)[:self.SNACK_CACHE // 2]:
+                cache.pop(k2, None)
+        cache[key] = got
+        return got
+
+    def _char_fx_add(self, kind, extra=""):
+        """내 캐릭터 창에서 터지는 연출 — 남이 눌러 줬을 때.
+
+        extra 는 간식 종류처럼 '무엇을 보냈는지'다 (보낸 쪽이 정한다).
+        """
+        self._char_fx = [f for f in self._char_fx if f[0] != kind][-3:]
+        self._char_fx.append((kind, time.time(), str(extra or "")))
+
+    def _draw_char_fx(self, now):
+        """콕·응원·담요·간식이 캐릭터 위에서 보이게. draw() 끝에서 부른다."""
+        self._char_fx = [f for f in self._char_fx
+                         if now - f[1] < self.CHAR_FX]
+        if not self._char_fx:
+            return
+        c = self.canvas
+        k = max(1.0, self.cw_px / 260.0)          # 캐릭터 크기에 맞춘 배율
+        cx = self.ox + self.cw_px / 2
+        top = self.oy + self.ch_px * 0.13         # 머리 언저리
+        mid = self.oy + self.ch_px * 0.44
+        for kind, t0, extra in self._char_fx:
+            p = (now - t0) / self.CHAR_FX          # 0 → 1
+            if kind == "poke":
+                self._fx_poke(c, p, cx, mid, k)
+            elif kind == "blanket":
+                # 고깔모자(왼쪽)와 겹치지 않게 — 칭찬 연출은 모자가 같이
+                # 얹히므로 손을 오른쪽으로 비켜 쓰다듬는다
+                hx2 = cx + (80 * k if now < self.hat_until else 0)
+                self._fx_pat(c, p, hx2, top, k)
+            elif kind == "cheer":
+                n = 7
+                for i in range(n):
+                    q = p * 1.25 - i * 0.1
+                    if 0 < q < 1:
+                        dx = math.sin(q * 5.5 + i * 2.3) * 32 * k
+                        yy = mid + 32 * k - q * (mid - top + 52 * k)
+                        sz = int((18 + 10 * (1 - q)) * k)
+                        hx = cx + dx + (i - n // 2) * 25 * k
+                        # 꼬리 — 방금 지나온 자리에 작은 옅은 하트를 남긴다
+                        c.create_text(hx - math.cos(q * 5.5 + i * 2.3) * 6 * k,
+                                      yy + 13 * k, text="\u2665",
+                                      font=(UI_FONT,
+                                            max(7, int(sz * 0.55))),
+                                      fill="#ffd7e6")
+                        c.create_text(hx, yy,
+                                      text="\u2665", font=(UI_FONT, sz),
+                                      fill="#ff9ec4" if i % 2 else "#ffc0d4")
+            elif kind == "praise":
+                # 금별이 사방으로 터진다 — 목표 달성 축하
+                n2 = 7
+                for i in range(n2):
+                    q = p * 1.3 - i * 0.05
+                    if 0 < q < 1:
+                        a = i * (math.tau / n2) + p * 1.2
+                        e = 1.0 - (1.0 - q) ** 2
+                        r2 = (18 + 92 * e) * k
+                        self._fx_spark(c, cx + math.cos(a) * r2,
+                                       mid + math.sin(a) * r2 * 0.7,
+                                       (5 + 7 * (1 - q)) * k, "#ffd75e")
+                if p < 0.5:
+                    c.create_text(cx, top + 8 * k, text="\ud83c\udf89",
+                                  font=("Segoe UI Emoji", int(16 * k)))
+            elif kind == "snack":
+                pass      # 간식은 연출이 아니라 책상에 놓인다 (_draw_snack_on)
+
+    POKE_RING = ("#ff9ec4", "#ffb6d2", "#ffd6e4")
+
+    def _fx_poke(self, c, p, cx, cy, k):
+        """콕 — 동그란 물결 세 겹, 톡 튀는 점, 가운데 반짝임.
+
+        예전에는 세로를 0.6배로 눌러 타원이었는데 눌린 자국처럼 보였다.
+        실측으로 정원이 어느 캐릭터에서도 창을 안 넘는 것을 확인하고
+        (반지름 118*k, 창 428x529 / 244x354 / 348x544) 동그라미로 바꿨다.
+        """
+        for i in range(3):                         # 물결이 퍼진다
+            q = p * 1.9 - i * 0.16
+            # 잔상 — 한 박자 늦은 옅은 물결이 따라온다. 색상키 창은
+            # 반투명이 안 되므로, 늦은 만큼 옅은 색과 얇은 선으로 흉내낸다.
+            q2 = q - 0.10
+            if 0 < q2 < 1:
+                e2 = 1.0 - (1.0 - q2) ** 2
+                r2 = (20 + 96 * e2) * k
+                c.create_oval(cx - r2, cy - r2, cx + r2, cy + r2,
+                              outline=self.POKE_RING[2], width=1)
+            if 0 < q < 1:
+                e = 1.0 - (1.0 - q) ** 2           # 톡 튀어나가 천천히 멎는다
+                r = (20 + 96 * e) * k
+                c.create_oval(cx - r, cy - r, cx + r, cy + r,
+                              outline=self.POKE_RING[i],
+                              width=max(2, int(6 * k * (1 - q))))
+        q = p * 1.55                               # 물결을 따라 튀는 점 여섯
+        if q < 1:
+            e = 1.0 - (1.0 - q) ** 2
+            d = (32 + 82 * e) * k
+            for i in range(6):
+                a = math.pi * (i / 3.0 - 0.5) + 0.26
+                dx, dy = cx + math.cos(a) * d, cy + math.sin(a) * d
+                sz = max(1.6, (5.4 - 3.4 * q) * k)
+                col = self.POKE_RING[0] if i % 2 else self.POKE_RING[1]
+                if i % 2:
+                    self._fx_spark(c, dx, dy, sz * 1.7, col)
+                else:
+                    c.create_oval(dx - sz, dy - sz, dx + sz, dy + sz,
+                                  fill=col, width=0)
+        if p < 0.42:                               # 눌린 자리에서 반짝
+            q = p / 0.42
+            self._fx_spark(c, cx, cy, (9 + 16 * q) * k * (1 - q * 0.55),
+                           "#fff0f6" if q < 0.5 else self.POKE_RING[1])
+
+    @staticmethod
+    def _fx_spark(c, x, y, r, col):
+        """네 갈래 반짝임. 글꼴을 안 써서 맥에서도 똑같이 보인다."""
+        w = r * 0.30
+        c.create_polygon(x, y - r, x + w, y - w, x + r, y, x + w, y + w,
+                         x, y + r, x - w, y + w, x - r, y, x - w, y - w,
+                         fill=col, outline="", smooth=False)
+
+    PAT_TIMES = 3            # 좌우로 몇 번 왕복하며 쓰다듬는가
+
+    def _fx_pat(self, c, p, cx, top, k):
+        """쓰담 — 머리 위에서 손이 좌우로 호선을 그리고 하트가 떠오른다.
+
+        머리 상자(`_head_box`)가 있으면 그 윗선을 쓴다. 캐릭터마다 머리
+        크기가 달라서 비율로 잡으면 손이 이마에 박히거나 허공에 뜬다.
+        """
+        hb = getattr(self, "_head_box", None)
+        hx = (hb[0] + hb[2]) / 2 if hb else cx
+        hw = (hb[2] - hb[0]) if hb else self.cw_px
+        # _head_box 에는 oy(캐릭터가 아래로 내려간 만큼)가 빠져 있다.
+        # 그대로 쓰면 손이 머리가 아니라 타이머 카드 위에 그려진다
+        # (지뢰 43과 같은 함정 — 다른 곳도 self.oy 를 더해서 쓴다).
+        # 정수리가 아니라 이마 언저리를 쓰다듬는다. 머리 상자 맨 위는 위로
+        # 삐친 머리카락 한 올까지 잡으므로(멸종은 실측 137인데 머리 뭉치는
+        # 190부터다) 상자 높이의 38%쯤 내려서 얹는다.
+        hy = (hb[1] + self.oy + (hb[3] - hb[1]) * 0.38) if hb else top
+        # 머리 상자가 짧은 캐릭터(프고는 개구리 모자만 잡혀 102px)에서는
+        # 같은 비율이 눈을 덮는다 — 눈동자 자리를 위 한계로 둔다.
+        try:
+            pu = self.layout.get("pupils") or {}
+            if pu.get("pos"):
+                eye = pu["pos"][1] * self.s + self.oy
+                hy = min(hy, eye - (hb[3] - hb[1]) * 0.04 if hb else eye)
+        except Exception:
+            pass
+        # 좌우로 부드럽게 왕복한다. 처음과 끝은 살짝 여려지게.
+        beat = min(1.0, p * 1.2)
+        u = math.sin(beat * math.pi * 2.0 * self.PAT_TIMES)
+        ease = math.sin(min(1.0, beat * 1.6) * math.pi / 2) * (1.0 - beat * 0.25)
+        u *= ease
+        # 머리가 둥그니까 가운데에서 높고 양끝에서 낮은 호선을 그린다.
+        span = hw * 0.24
+        sag = hw * 0.05
+        x = hx + span * u
+        # 머리 위에 살짝 얹힌 높이로. 그림 크기도 머리 폭에 맞춘다 —
+        # 고정 크기로 두면 머리 큰 캐릭터에서 손이 점처럼 작아 보인다.
+        y = hy + sag * (u * u)
+        img = self._hand_img(int(max(36, hw * 0.34)), u)
+        if img is None:
+            self._draw_hand(c, x, max(y, 16 * k), 14 * k)
+        else:
+            c.create_image(x, y, image=img, anchor="s")
+        # 하트는 머리 위에서 떠오른다
+        for i in range(4):
+            q = p * 1.4 - i * 0.16
+            if 0 < q < 1:
+                dx = math.sin(q * 4.0 + i * 2.0) * 22 * k
+                yy = hy - q * 62 * k
+                sz = int((13 + 7 * (1 - q)) * k)
+                c.create_text(hx + dx + (i - 1.5) * 20 * k, yy, text="\u2665",
+                              font=(UI_FONT, sz),
+                              fill="#ff9ec4" if i % 2 else "#ffc0d4")
+
+    def _hand_img(self, long_px, u=0.0):
+        """쓰담 손 그림. 가는 쪽으로 조금 기울인다 (각도는 몇 개만 만들어 둔다).
+
+        그림이 없으면 None — 그때는 예전처럼 그려서 낸다. 자동 업데이트가
+        반쪽만 갔을 때도 연출이 통째로 사라지지 않게.
+        """
+        ang = round(max(-1.0, min(1.0, u)) * 14 / 7) * 7      # -14 ~ 14도
+        key = (int(long_px), ang)
+        got = self._hand_cache.get(key)
+        if got is not None:
+            return got
+        try:
+            im = Image.open(os.path.join(self.dir, "hand.png")).convert("RGBA")
+        except Exception:
+            self._hand_cache[key] = None
+            return None
+        w, h = im.size
+        r = float(long_px) / max(1, max(w, h))
+        im = im.resize((max(1, round(w * r)), max(1, round(h * r))),
+                       Image.LANCZOS)
+        if ang:
+            im = im.rotate(-ang, resample=Image.BICUBIC, expand=True)
+            a = im.getchannel("A")      # 돌리면 가장자리가 흐려진다 — 다시 굽는다
+            im.putalpha(a.point(lambda v: 255 if v >= 128 else 0))
+        got = ImageTk.PhotoImage(im)
+        if len(self._hand_cache) > 24:
+            for k2 in list(self._hand_cache)[:12]:
+                self._hand_cache.pop(k2, None)
+        self._hand_cache[key] = got
+        return got
+    @staticmethod
+    def _draw_hand(c, x, y, r):
+        """토닥이는 손 — 손바닥과 손가락 넷. 글꼴을 안 써서 맥에서도 같다."""
+        skin, line = "#ffe7d2", "#d9a882"
+        c.create_oval(x - r, y - r * 0.72, x + r, y + r * 0.86,
+                      fill=skin, outline=line, width=2)
+        for i in range(4):
+            fx = x - r * 0.62 + i * (r * 0.42)
+            c.create_oval(fx - r * 0.21, y + r * 0.38,
+                          fx + r * 0.21, y + r * 1.06,
+                          fill=skin, outline=line, width=2)
+        # 손목 (위로 살짝)
+        c.create_rectangle(x - r * 0.34, y - r * 0.95, x + r * 0.34,
+                           y - r * 0.5, fill=skin, outline=line, width=2)
+
+    def _draw_snack_on(self, now):
+        """책상에 놓인 간식 — 떨어진 뒤에는 누를 때까지 그대로 있는다.
+
+        받은 뒤 잠깐만 보이면 자리를 비운 사이에 받은 것을 못 본다.
+        누르면 먹고 사라지고, 또 받으면 최신 것으로 바뀐다.
+        """
+        sn = self._snack_get()
+        if not sn:
+            return
+        c = self.canvas
+        k = max(1.0, self.cw_px / 260.0)
+        cx = self.ox + self.cw_px / 2
+        top = self.oy + self.ch_px * 0.13
+        mid = self.oy + self.ch_px * 0.44
+        # 떨어지는 동안만 움직이고, 그 뒤로는 놓인 자리에 그대로.
+        p = min(1.0, max(0.0, (now - float(sn.get("t") or 0))
+                         / self.SNACK_DROP))
+        self._fx_cake(c, p, cx, top, mid, k, str(sn.get("k") or ""),
+                      bite=int(sn.get("b") or 0))
+
+    def _fx_cake(self, c, p, cx, top, mid, k, name="", bite=0):
+        """케이크가 접시째 책상 위로 떨어진다.
+
+        책상 그림이 있으면 상판 위에 놓는다. 캐릭터마다 책상 높이가 달라서
+        비율로 잡으면 허공이나 책상 앞면에 떨어진다 — 실제로 잰
+        `_desk_top`(상판 윗선)에서 내려온 자리를 쓴다.
+        """
+        r = 22 * k
+        bb = self._desk_bb
+        # _desk_bb 는 이미 배율이 반영된 값이다 (self.s 를 또 곱하면 안 된다).
+        # 자리는 _pos("desk") 로 잡는다 — _desk_top 은 oy(캐릭터가 아래로
+        # 내려간 만큼)가 빠져 있어 그대로 쓰면 케이크가 얼굴 옆에 뜬다.
+        land = mid + 52 * k
+        if bb:
+            dx, dy = self._pos("desk")
+            # 접시 바닥이 상판 중간쯤에 닿게 — 앞면에 놓이면 붕 떠 보인다
+            land = dy + bb[1] + (bb[3] - bb[1]) * 0.60 - r * 1.16
+            cx = dx + (bb[0] + bb[2]) / 2 + (bb[2] - bb[0]) * 0.28
+        land = max(land, top + 20 * k)
+        start = top - 48 * k
+        q = min(1.0, p)
+        y = start + q * q * (land - start)
+        img = (self._snack_photo(name, int(62 * k), bite=bite)
+               if name else None)
+        if img is None:
+            self._mini_cake(c, cx, y, r)
+            self._snack_box = (cx - r * 1.6, y - r * 1.5,
+                               cx + r * 1.6, y + r * 1.3)
+            return
+        # 접시 위에 놓인 것처럼 — 그림 밑선을 케이크 밑선에 맞춘다
+        bot = y + r * 1.16
+        pw = img.width() * 0.52
+        c.create_oval(cx - pw, bot - r * 0.32, cx + pw, bot + r * 0.34,
+                      fill="#ffffff", outline="#c6bfce", width=2)
+        c.create_image(cx, bot + r * 0.1, image=img, anchor="s")
+        # 누를 수 있는 자리 (조금 넉넉하게 — 작은 간식도 누르기 쉽게)
+        w2 = max(pw, img.width() * 0.5) + 4 * k
+        self._snack_box = (cx - w2, bot + r * 0.1 - img.height() - 4 * k,
+                           cx + w2, bot + r * 0.5)
+
+    def _mini_cake(self, c, cx, cy, r):
+        """접시에 놓인 조각 케이크 — 크림 위에 딸기 하나."""
+        c.create_oval(cx - r * 1.5, cy + r * 0.5, cx + r * 1.5, cy + r * 1.16,
+                      fill="#ffffff", outline="#c6bfce", width=2)
+        c.create_rectangle(cx - r, cy - r * 0.15, cx + r, cy + r * 0.75,
+                           fill="#f6d9a8", outline="#c99a55", width=2)
+        c.create_line(cx - r, cy + r * 0.3, cx + r, cy + r * 0.3,
+                      fill="#e0bd86", width=2)
+        c.create_arc(cx - r, cy - r * 0.85, cx + r, cy + r * 0.45,
+                     start=0, extent=180, fill="#fff4f7",
+                     outline="#f0c6d4", width=2)
+        c.create_oval(cx - r * 0.28, cy - r * 1.15, cx + r * 0.28,
+                      cy - r * 0.55, fill="#ff7a9a", outline="#d94f74",
+                      width=2)
+        c.create_line(cx, cy - r * 1.15, cx, cy - r * 1.4,
+                      fill="#6aa84f", width=2)
+
+    def _room_fx_add(self, slot, kind, extra=""):
+        """그 사람 칸에 연출을 띄운다 (보낸 쪽·받은 쪽 모두)."""
+        if not slot:
+            return
+        self._room_fx = [f for f in self._room_fx if f[0] != slot][-8:]
+        self._room_fx.append((slot, kind, time.time(), str(extra or "")))
+
+    def _room_fx_draw(self, cv, k):
+        """연출은 매 프레임 지웠다 다시 그린다 (한 번에 몇 개 안 된다)."""
+        now = time.time()
+        self._room_fx = [f for f in self._room_fx
+                         if len(f) == 4 and now - f[2] < self.ROOM_FX]
+        cv.delete("fx")
+        for slot, kind, t0, extra in self._room_fx:
+            box = next((h for h in self._room_hit if h[4] == slot), None)
+            if not box:
+                continue
+            x0, y0, x1, y1 = box[:4]
+            cx = (x0 + x1) / 2
+            cy = y0 + (y1 - y0) * 0.30
+            col = self._room_tone(slot)
+            p = (now - t0) / self.ROOM_FX          # 0 → 1
+            soft = self._room_palette()["card"]
+            if kind == "poke":
+                for i in range(3):                 # 퍼지는 물결 셋
+                    q = p * 1.7 - i * 0.18
+                    if 0 < q < 1:
+                        r = (12 + 44 * q) * k
+                        cv.create_oval(cx - r, cy - r, cx + r, cy + r,
+                                       outline=self._mix(col, soft, q),
+                                       width=max(1, int(2.4 * k)), tags="fx")
+            elif kind == "cheer":
+                for i in range(5):                 # 하트가 떠오른다
+                    q = p * 1.4 - i * 0.12
+                    if 0 < q < 1:
+                        dx = math.sin(q * 5 + i * 2.1) * 18 * k
+                        yy = cy + 26 * k - q * 74 * k
+                        cv.create_text(cx + dx + (i - 2) * 13 * k, yy,
+                                       text="\u2665",
+                                       font=self._uf(int(9 + 4 * (1 - q))),
+                                       fill=self._mix(col, soft, q), tags="fx")
+            elif kind == "praise":
+                for i in range(5):
+                    q = p * 1.3 - i * 0.08
+                    if 0 < q < 1:
+                        a = i * (math.tau / 5) + p
+                        r2 = (10 + 40 * q) * k
+                        self._fx_spark(cv, cx + math.cos(a) * r2,
+                                       cy + math.sin(a) * r2 * 0.7,
+                                       (4 + 4 * (1 - q)) * k, "#ffd75e")
+            elif kind == "blanket":
+                q = min(1.0, p * 2.2)              # 쓰담 (손이 토닥인다)
+                h = 52 * k * q
+                if h > 2:
+                    self._rr(cv, cx - 46 * k, cy - 16 * k, cx + 46 * k,
+                             cy - 16 * k + h, 10 * k,
+                             fill=self._mix(col, soft, 0.45),
+                             outline=self._shade(col, 0.15),
+                             width=max(1, int(1.6 * k)), tags="fx")
+                    for i in range(3):             # 줄무늬
+                        yy = cy - 16 * k + h * (i + 1) / 4.0
+                        cv.create_line(cx - 40 * k, yy, cx + 40 * k, yy,
+                                       fill=soft, width=max(1, int(2 * k)),
+                                       tags="fx")
+            elif kind == "snack":
+                q = min(1.0, p * 1.8)              # 간식이 툭 떨어진다
+                yy = cy - 40 * k + q * q * 66 * k
+                pic = self._snack_photo(
+                    extra or self._snack_pick(t0 * 1000), int(34 * k))
+                if str(extra).startswith("cup_"):
+                    # 스페셜 컵케이크 — 금빛 반짝임이 두른다
+                    for i2 in range(6):
+                        a2 = i2 * (math.tau / 6) + p * 4
+                        r3 = (24 + 10 * math.sin(p * 7 + i2 * 1.3)) * k
+                        self._fx_spark(cv, cx + math.cos(a2) * r3,
+                                       yy - 6 * k + math.sin(a2) * r3 * 0.6,
+                                       (3.2 + 2.4 * (1 - p)) * k, "#ffd75e")
+                if pic is not None:
+                    cv.create_image(cx, yy + 13 * k, image=pic, anchor="s",
+                                    tags="fx")
+                elif q < 1:
+                    r = 13 * k
+                    self._rr(cv, cx - r, yy - r * 0.8, cx + r, yy + r * 0.8,
+                             5 * k, fill="#f0c98a", outline="#c99a55",
+                             width=max(1, int(1.6 * k)), tags="fx")
+                else:
+                    r = 13 * k
+                    self._rr(cv, cx - r, yy - r * 0.8, cx + r, yy + r * 0.8,
+                             5 * k, fill=self._mix("#f0c98a", soft, p),
+                             outline=self._mix("#c99a55", soft, p),
+                             width=max(1, int(1.6 * k)), tags="fx")
+
+    def _room_tw(self, cv, text, font):
+        """글자 폭 — 캔버스에 잠깐 그려 재고 지운다 (캐시는 안 쌓는다)."""
+        t = cv.create_text(-999, -999, text=text, font=font, anchor="nw")
+        box = cv.bbox(t)
+        cv.delete(t)
+        return (box[2] - box[0]) if box else len(text) * 8
+
+    def _room_raw(self, slot):
+        """그 캐릭터의 테마색 그대로 — 밝기에 손대지 않은 값.
+
+        _room_tone 은 글자 대비를 위해 어두운 색을 밝혀 버리고,
+        _room_pastel 은 옅게 만든다. 게이지처럼 '그 색 그대로'가 필요한
+        곳에서는 이걸 쓴다.
+        """
+        col = self.ROOM_TINT.get(slot, "#8b8b93")
+        if slot == self.char:
+            return self.card.get("fill", col)
+        p = os.path.join(HERE, slot, "config.json")
+        try:
+            with open(p, encoding="utf-8") as fp:
+                return (json.load(fp).get("card") or {}).get("fill", col)
+        except Exception:
+            return col
+
+    def _room_pastel(self, slot, light=0.88, smin=0.55, smax=0.85):
+        """그 사람 테마색의 파스텔. 밝기는 정해 놓고 색기만 살린다.
+
+        _room_tone 을 옅게 만들어 쓰면 안 된다 — 그쪽은 어두운 색에 밝기
+        하한을 걸어 회색으로 눌러 버려서(준사 #4a4a52 → #a3a3a7), 옅게
+        하면 칸이 전부 흰색처럼 보인다. 원래 테마색에서 따로 뽑는다.
+        회색 테마(준사·개)는 색기를 억지로 올리지 않는다 — 엉뚱한 색이 된다.
+        """
+        key = (slot, round(light, 3), smin, smax)
+        hit = self._room_pastel_cache.get(key)
+        if hit:
+            return hit
+        col = self._room_raw(slot)
+        try:
+            r, g, b = (int(col[i:i + 2], 16) / 255.0 for i in (1, 3, 5))
+        except Exception:
+            r, g, b = 0.55, 0.55, 0.58
+        h, _l, sat = _rgb_to_hls(r, g, b)
+        if sat >= 0.12:                      # 회색은 그대로 회색으로 둔다
+            sat = min(smax, max(sat, smin))
+        r, g, b = _hls_to_rgb(h, light, sat)
+        out = "#%02x%02x%02x" % (int(r * 255), int(g * 255), int(b * 255))
+        if len(self._room_pastel_cache) > 60:
+            self._room_pastel_cache = {}
+        self._room_pastel_cache[key] = out
+        return out
+
+    def _room_tag_draw(self, cv, W, mid, P, k):
+        """방 번호표 — 같은 방에 있는지 화면만 견주면 알 수 있게.
+
+        코드 자체는 안 보여 준다 (방 번호는 코드에서 나오지만 역산이 안 된다).
+        """
+        tag = self._room_tag()
+        if not tag:
+            return
+        f = self._uf(8)
+        tw = self._room_tw(cv, tag, f)
+        x1 = W - 220 * k
+        self._rr(cv, x1 - tw - 18 * k, mid - 10 * k, x1, mid + 10 * k, 10 * k,
+                 fill=P["card"], outline=P["line"], width=1)
+        cv.create_text(x1 - tw / 2 - 9 * k, mid, text=tag, font=f,
+                       fill=P["sub"], tags="dyn")
+
+    def _safe_str(self, fn, *args):
+        """글자를 돌려주는 것이 터지면 빈 글자로 (홈은 떠야 한다)."""
+        try:
+            return fn(*args) or ""
+        except Exception:
+            return ""
+
+    def _room_tag(self):
+        """이 방의 번호표 (앞 네 자). 통신층이 없으면 코드로 직접 만든다."""
+        try:
+            rid = getattr(self.room_net, "room", None)
+            if not rid:
+                rid = _room_keys(self.us.get("room_code"))[0]
+            return "방 #" + str(rid)[:4]
+        except Exception:
+            return ""
+
+    def _room_state_text(self, on, live):
+        """지금 방이 어떤 상태인지 한 마디로.
+
+        '아무도 안 보인다'는 갈래가 여럿인데 화면에는 하나로만 보인다.
+        RoomNet 이 요청마다 적어 둔 것(stat)을 그대로 읽어 갈라 준다.
+        여기서 터져도 홈은 떠야 하므로 전부 getattr 로 막는다.
+        """
+        try:
+            if getattr(self, "_room_dead", False):
+                return "홈 처리가 멈췄어요 (곧 다시 해 볼게요)"
+            if live > 60:
+                return "연결 안 됨%s" % self._room_why()
+            net = self.room_net
+            st = dict(getattr(net, "stat", None) or {})
+            born = time.time() - float(getattr(net, "born", 0) or 0)
+            # 감시견이 통신층을 새로 만들면 born 이 0으로 돌아간다. 그것만
+            # 보면 '켠 지 얼마 안 됨'이 영영 이어져 진단이 가려진다.
+            if born > 30 or int(getattr(self, "_room_retry", 0) or 0):
+                # 자리를 한 번도 못 알렸다 — 남에게는 안 켠 것으로 보인다
+                if st.get("beat") not in (None, "보냄"):
+                    return "내 자리를 아직 못 알렸어요"
+                # 자리는 받았는데 하나도 못 읽었다 — 방 코드가 다른 것이다
+                if int(st.get("rows") or 0) > 0 and not int(st.get("read") or 0):
+                    return "다른 사람 자리를 못 읽어요 (방 코드가 달라요)"
+                # 보냈다는데 명단에 내가 없다 — 서버가 안 받아 준 것이다
+                if st.get("beat") == "보냄" and st.get("mine") is False:
+                    return "서버가 내 자리를 안 받아요"
+                if on <= 1:
+                    return "지금은 나만 있어요"
+            return "%d명 접속 중" % on
+        except Exception:
+            return "%d명 접속 중" % on
+
+    def _room_numbers(self, on, live):
+        """나 혼자일 때 위쪽 오른편에 띄우는 숫자.
+
+        파일을 주고받지 않고 화면 사진 하나로 갈리게 한다. 왼쪽 한 줄에
+        붙이면 방 번호표와 겹쳐서(실측) 여기에 둔다. 혼자일 때는
+        '오늘 다 같이'가 0이라 그 자리를 내줘도 잃는 것이 없다.
+        """
+        try:
+            if on > 1 or self.room_net is None:
+                return ""
+            st = dict(getattr(self.room_net, "stat", None) or {})
+            born = time.time() - float(
+                getattr(self.room_net, "born", 0) or 0)
+            retry = int(getattr(self, "_room_retry", 0) or 0)
+            if born <= 30 and not retry:
+                return ""
+            beat = {"보냄": "보냄", "보낼 값이 아직 없음": "값없음",
+                    "아직": "아직"}.get(st.get("beat"), str(st.get("beat"))[:8])
+            net = self.room_net
+            calls = int(getattr(net, "calls", 0) or 0)
+            th = getattr(net, "_th", None)
+            alive = "O" if (th is not None and th.is_alive()) else "X"
+            err = str(getattr(net, "err", "") or "")
+            fails = int(getattr(net, "fails", 0) or 0)
+            # 늘 붙이는 것만 짧게. 나머지는 '이상할 때'만 — 안 그러면 줄이
+            # 길어져 왼쪽 글자와 겹친다(실측).
+            line = ("%s · 자리 %s · 명단 %s/%s · 내자리 %s · 통신 %s · 부름 %d"
+                    % (self._room_tag(), beat, st.get("rows"),
+                       st.get("read"),
+                       {True: "있음", False: "없음"}.get(st.get("mine"), "?"),
+                       ("%d초" % live) if live < 8640000 else "없음", calls))
+            if fails:
+                line += " · 실패 %d" % fails
+            if retry:
+                line += " · 다시 %d" % retry
+            if alive != "O":
+                line += " · 스레드 끊김"
+            if err:
+                line += " · " + err[:40]
+            return line
+        except Exception:
+            return ""
+
+    def _room_why(self):
+        """방에 못 붙는 이유를 짧게 (없으면 빈 글자)."""
+        try:
+            if not self._room_on():
+                return " — 환경설정에서 꺼져 있어요"
+            if self.room_net is None:
+                return " — 통신을 시작하지 못했어요"
+            if getattr(self, "_room_dead", False):
+                return " — 프로그램 안에서 막혔어요"
+            err = getattr(self.room_net, "err", None)
+            if err:
+                return " — " + str(err)[:44]
+            return " — 인터넷을 확인해 주세요"
+        except Exception:
+            return ""
+
+    def _room_tone(self, slot):
+        """그 캐릭터의 테마색. 어두우면 밝기 하한을 준다 — 안 그러면 묻힌다."""
+        c = self._room_tone_cache.get(slot)
+        if c:
+            return c
+        col = self._room_raw(slot)
+        for _ in range(12):
+            r, g, b = (int(col[i:i + 2], 16) for i in (1, 3, 5))
+            if (r * 299 + g * 587 + b * 114) / 1000 >= 150:
+                break
+            col = self._tint(col, 0.16)
+        self._room_tone_cache[slot] = col
+        return col
+
+    def _room_photo(self):
+        """지금 방에 있는 사람들로 한 장 남긴다 — 작업 종료 때 부른다.
+
+        방 창이 안 떠 있어도 만든다(명단만 있으면 된다). 사람이 나뿐이면
+        찍지 않는다 — 혼자 찍은 단체사진은 의미가 없다.
+        """
+        people = [p for p in self.room_people
+                  if (p.get("slot") or "") != self.char]
+        if not people:
+            return None
+        me = dict(self._room_state_now(), slot=self.char)
+        row = [me] + people[:5]
+        P = self._room_palette()
+        pad, gap, fh = 22, 14, 150
+        figs = []
+        for p in row:
+            slot = p.get("slot") or ""
+            tag = "seat_idle" if p.get("s") == "sleep" else "seat"
+            src = os.path.join(self._room_art_dir(), "%s_%s.png" % (slot, tag))
+            if not os.path.isfile(src):
+                src = os.path.join(HERE, slot, tag + ".png")
+            if not os.path.isfile(src):
+                continue
+            try:
+                im = Image.open(src).convert("RGBA")
+            except Exception:
+                continue
+            im = im.resize((max(1, int(im.width * fh / im.height)), fh),
+                           Image.LANCZOS)
+            figs.append((p, im))
+        if len(figs) < 2:
+            return None
+        W = pad * 2 + sum(f.width for _p, f in figs) + gap * (len(figs) - 1)
+        H = pad + fh + 46
+        sheet = Image.new("RGB", (W, H), self._hex(P["wall"]))
+        d = ImageDraw.Draw(sheet)
+        x = pad
+        for p, f in figs:
+            sheet.paste(f, (x, pad), f)
+            nm = str(p.get("n") or "")[:10]
+            try:
+                fnt = ImageFont.truetype("malgun.ttf", 13)
+            except Exception:
+                fnt = None
+            tw = d.textlength(nm, font=fnt) if fnt else len(nm) * 8
+            d.text((x + f.width / 2 - tw / 2, pad + fh + 8), nm, font=fnt,
+                   fill=self._hex(P["ink"]))
+            x += f.width + gap
+        tot = sum(int(p.get("t") or 0) for p in row)
+        try:
+            fnt2 = ImageFont.truetype("malgun.ttf", 12)
+        except Exception:
+            fnt2 = None
+        d.text((pad, H - 20), "%s  ·  %d명이 다 같이 %d시간 %d분"
+               % (time.strftime("%Y-%m-%d"), len(row), tot // 60, tot % 60),
+               font=fnt2, fill=self._hex(P["sub"]))
+        out = os.path.join(self.state_dir, "단체사진")
+        os.makedirs(out, exist_ok=True)
+        path = os.path.join(out, time.strftime("%Y%m%d-%H%M%S") + ".png")
+        sheet.save(path)
+        return path
+
+    @staticmethod
+    def _hex(c):
+        return tuple(int(str(c)[i:i + 2], 16) for i in (1, 3, 5))
+
+    def _room_fit(self, W, n):
+        """가로 폭 W 에 n 명을 앉히는 칸/줄 수와, 그러려면 필요한 최소 창 크기.
+
+        창을 줄였을 때 사람이 사라지지 않게, 다 들어가는 크기를 최소 크기로
+        걸어 둔다 (Tk 가 그보다 작게 못 줄인다). 화면보다 커지면 안 되므로
+        줄 수에 상한을 두고, 그때는 칸을 늘려 가로로 눕힌다.
+        """
+        k = self._room_k()
+        n = min(n, self.ROOM_PAGE)   # 페이지로 나뉘므로 한 페이지가 기준
+        cw, ch = int(self.ROOM_CW * k), int(self.ROOM_CH * k)
+        # +16 은 타이틀 띠와 첫 줄 사이의 최소 간격 (그리는 쪽과 같은 값)
+        top, bot = int((self.ROOM_TOP + 16) * k), int(126 * k)
+        pad = int(20 * k) + int(44 * k) * 2   # 양옆 페이지 화살표 자리 포함
+        sh = self.root.winfo_screenheight()
+        sw = self.root.winfo_screenwidth()
+        maxr = max(1, int((sh * 0.92 - top - bot) // ch))
+        maxc = max(1, int((sw * 0.95 - pad) // cw))
+        # 열은 기본 3(ROOM_COLS)까지만 — 창을 넓혀도 5열로 눕지 않는다.
+        # (사가 맥 화면이 5열 2줄로 퍼져 윈도우와 다르게 보이던 원인.
+        #  세로가 모자란 작은 화면에서만 아래 폴백이 열을 늘린다.)
+        cols = max(1, min(maxc, self.ROOM_COLS, int((W - pad) // cw)))
+        rows = max(1, -(-n // cols))              # 올림 나눗셈
+        if rows > maxr:
+            # 세로가 모자라도 옆으로 눕지 않는다 — 예전엔 열을 늘려서
+            # 사가 맥이 5열 2줄이 됐다. 줄을 줄이고 나머지는 페이지로.
+            rows = maxr
+        return cols, rows, cols * cw + pad, top + rows * ch + bot
+
+    def _room_relayout(self):
+        """창 크기가 바뀌면 칸 배치를 다시 잡는다.
+
+        <Configure> 는 창을 끄는 동안 수십 번 온다. 크기가 실제로 달라졌을
+        때만 다시 그린다 — 안 그러면 끄는 내내 통째로 다시 칠한다.
+        """
+        cv = self.room_cv
+        if cv is None or self.room_win is None:
+            return
+        W, H = cv.winfo_width(), cv.winfo_height()
+        if W < 20 or H < 20 or (W, H) == self._room_size:
+            return
+        self._room_size = (W, H)
+        cols, rows, mw, mh = self._room_fit(W, max(1, len(self._room_seats())))
+        self._room_cols, self._room_rows = cols, rows
+        # 다 안 들어가면 모자란 쪽을 늘려 준다. 최소 크기를 지금 폭으로
+        # 걸면 안 된다 — 한 번 넓어진 창을 다시 좁힐 수 없게 갇힌다.
+        # 좁히면 칸이 줄고 줄이 늘어 세로로 자라고, 그것도 모자라면 폭이 는다.
+        try:
+            win = self.room_win
+            cw2, ch2 = win.winfo_width(), win.winfo_height()
+            nw, nh = max(cw2, mw), max(ch2, mh)
+            if nw > cw2 + 1 or nh > ch2 + 1:
+                win.geometry("%dx%d" % (nw, nh))
+        except Exception:
+            pass
+        self._room_key_last = None            # 통째로 다시 그린다
+        self._room_body = []
+        self._safe("room_draw", self._room_draw)
+
+    def _room_hover(self, e):
+        """누를 수 있는 것 위에서는 손 모양 커서로 — 눌리는지 알 수 있게.
+
+        같은 커서를 다시 넣으면 깜빡이므로 바뀔 때만 건드린다.
+        """
+        cv = self.room_cv
+        if cv is None:
+            return
+        was = self._song_hover
+        self._song_hover = None
+        for slot2, (box2, _u2) in list(self._room_song_hits.items()):
+            if box2[0] <= e.x <= box2[2] and box2[1] <= e.y <= box2[3]:
+                self._song_hover = slot2
+                break
+        if was and not self._song_hover:
+            try:
+                cv.delete("songmq")      # 벗어나면 흐르던 제목을 걷는다
+            except Exception:
+                pass
+        hit = self._room_inbox_hit
+        hot = bool(hit and hit[0] <= e.x <= hit[2] and hit[1] <= e.y <= hit[3])
+        if not hot and self._inbox_open:
+            pb = self._room_inbox_panel   # 목록 위에서는 손 모양을 안 쓴다
+            if pb and pb[0] <= e.x <= pb[2] and pb[1] <= e.y <= pb[3]:
+                if self._room_cur:
+                    self._room_cur = ""
+                    cv.configure(cursor="")
+                return
+        if not hot:
+            hot = any(x0 <= e.x <= x1 and y0 <= e.y <= y1
+                      for x0, y0, x1, y1, _k in self._room_btn_hit)
+        if not hot:
+            hot = any(x0 <= e.x <= x1 and y0 <= e.y <= y1
+                      for x0, y0, x1, y1, _s, _z in self._room_hit)
+        want = "hand2" if hot else ""
+        if want != self._room_cur:
+            self._room_cur = want
+            cv.configure(cursor=want)
+
+    def _open_url(self, url):
+        """주소를 브라우저로 연다 — webbrowser 모듈 없이.
+
+        굳힌 맥 앱에는 런처가 안 쓰던 표준 모듈이 안 들어 있다 (지뢰 21).
+        webbrowser 를 클릭 처리 안에서 import 하면 퀸시(맥)에서 그 자리서
+        터지고, 세 번이면 _safe 가 홈 클릭 구역을 통째로 꺼 버린다 —
+        '노래도 못 누르고 홈 클릭이 다 안 된다'로 보인 원인.
+        """
+        url = str(url or "")
+        if not (url.startswith("https://") or url.startswith("http://")):
+            return
+        if IS_WIN:
+            try:
+                os.startfile(url)          # os 는 어디에나 있다
+                return
+            except Exception:
+                pass
+        if IS_MAC:
+            try:                           # AppKit 은 맥 번들에 반드시 있다
+                from AppKit import NSURL, NSWorkspace
+                NSWorkspace.sharedWorkspace().openURL_(
+                    NSURL.URLWithString_(url))
+                return
+            except Exception:
+                pass
+            try:
+                import subprocess
+                subprocess.Popen(["open", url])
+                return
+            except Exception:
+                pass
+        try:
+            import webbrowser              # 소스 실행이면 여기까지 안 온다
+            webbrowser.open(url)
+        except Exception:
+            pass
+
+    def _room_rclick(self, e):
+        """우클릭 — 남의 노래 말풍선이면 좋아요를 보낸다."""
+        for slot, (box, url) in list(self._room_song_hits.items()):
+            if not (box[0] <= e.x <= box[2] and box[1] <= e.y <= box[3]):
+                continue
+            if slot == self.char:
+                self._room_toast = ("내 노래에는 좋아요를 못 눌러요",
+                                    time.time())
+                self._safe("room_draw", self._room_draw)
+                return
+            # 다시 눌러도 된다 — 세는 쪽이 '누가 눌렀나'로 중복을 거르므로
+            # (상대가 옛 버전이라 신호를 흘렸을 때 재시도 길을 막지 않는다).
+            # 연타로 신호가 쏟아지는 것만 10초 간격으로 막는다.
+            key = (slot, url)
+            last = self._song_liked.get(key, 0.0)
+            if time.time() - last < 10.0:
+                self._room_toast = ("방금 좋아요를 보냈어요", time.time())
+                self._safe("room_draw", self._room_draw)
+                return
+            if self.room_net is not None:
+                self.room_net.send(slot, "songlike")
+                self._song_liked[key] = time.time()
+                self._room_toast = ("노래에 좋아요를 보냈어요 ♥",
+                                    time.time())
+                self._safe("room_draw", self._room_draw)
+            return
+
+    def _room_click(self, e):
+        if self._deco_editing():
+            db = self._room_deco_btn
+            if not (db and db[0] <= e.x <= db[2] and db[1] <= e.y <= db[3]):
+                return       # 꾸미기 중 — 클릭·드래그는 위치 조절에 쓴다
+        for box, dxn in list(getattr(self, "_room_page_btn", [])):
+            if box[0] <= e.x <= box[2] and box[1] <= e.y <= box[3]:
+                self._room_page = max(0, min(
+                    self._room_pages - 1, self._room_page + dxn))
+                self._room_key_last = None
+                self._safe("room_draw", self._room_draw)
+                return
+        db = self._room_deco_btn
+        if db and db[0] <= e.x <= db[2] and db[1] <= e.y <= db[3]:
+            self._safe("room_deco", self._room_deco_win)
+            return
+        cb = self._room_cal_btn
+        if cb and cb[0] <= e.x <= cb[2] and cb[1] <= e.y <= cb[3]:
+            self._safe("stamp_open", self._stamp_open)
+            return
+        for slot2, box in list(self._room_cal_btns.items()):
+            if box[0] <= e.x <= box[2] and box[1] <= e.y <= box[3]:
+                self._safe("stamp_open", self._stamp_open, slot2)
+                return
+        for slot2, (box, url) in list(self._room_song_hits.items()):
+            if box[0] <= e.x <= box[2] and box[1] <= e.y <= box[3]:
+                if self._song_ok(url):     # 유튜브 주소만 연다
+                    self._safe("song_open", self._open_url, url)
+                return
+        hit = self._room_inbox_hit
+        if hit and hit[0] <= e.x <= hit[2] and hit[1] <= e.y <= hit[3]:
+            self._inbox_open = not self._inbox_open
+            self._inbox_scroll = 0
+            if self._inbox_open:      # 여는 순간 읽음으로 (지뢰 30)
+                self._safe("inbox_read", self._inbox_read)
+            self._safe("room_draw", self._room_draw)
+            return
+        if self._inbox_open:
+            pb = self._room_inbox_panel
+            if pb and pb[0] <= e.x <= pb[2] and pb[1] <= e.y <= pb[3]:
+                return                # 목록 안을 누른 것은 아무 일도 안 한다
+            self._inbox_open = False  # 밖을 누르면 닫기만 한다
+            self._safe("room_draw", self._room_draw)
+            return
+        for x0, y0, x1, y1, kind in self._room_btn_hit:
+            if x0 <= e.x <= x1 and y0 <= e.y <= y1:
+                if kind == "@all":
+                    self._room_pick = None if self._room_pick == "*" else "*"
+                else:
+                    self._safe("room_btn", self._room_send, kind)
+                self._safe("room_draw", self._room_draw)
+                return
+        for x0, y0, x1, y1, slot, sleeping in self._room_hit:
+            if x0 <= e.x <= x1 and y0 <= e.y <= y1:
+                # 카드 클릭은 '고르기'만 한다. 예전에는 남의 카드를 누르면
+                # 그 자리에서 콕/쓰담까지 보냈는데, 간식을 주려고 고르기만
+                # 해도 콕이 먼저 나가 이펙트가 겹쳐 보였다 (퀸시 제보).
+                # 콕·쓰담은 아래 단추로 보낸다.
+                self._room_pick = None if self._room_pick == slot else slot
+                if slot == self.char:
+                    # 내 칸을 누르면 오늘 한 줄을 적는다. 고르는 것도 같이
+                    # 되므로 아래 단추로 나에게 보내 볼 수도 있다.
+                    self._room_pick = slot
+                    self._safe("room_msg_win", self._room_msg_win)
+                self._safe("room_draw", self._room_draw)
+                return
+        self._room_pick = None
+        self._safe("room_draw", self._room_draw)
+
+    # ── 프리뷰 ───────────────────────────────────────────────────────────
+    def _preview_shots(self):
+        from PIL import ImageGrab
+        shots = [
+            (f"preview_{self.char}_idle.png", {}),
+            (f"preview_{self.char}_typing.png", {"type": True}),
+            (f"preview_{self.char}_pen.png", {"pen": (0.35, 0.45)}),
+            (f"preview_{self.char}_pen_corner.png", {"pen": (0.02, 0.95)}),
+            (f"preview_{self.char}_blink.png", {"blink": True}),
+            (f"preview_{self.char}_sleep.png", {"sleep": True}),
+        ]
+        for name, force in shots:
+            self._force = force
+            if force.get("type"):
+                self.key_ang = 5.0
+                self.pen_ang = -4.0
+            if "pen" in force:
+                self._pen_xy = list(self._quad_xy(*force["pen"]))
+                self.strokes = [[self._quad_xy(0.25 + 0.15 * i, 0.35 + 0.12 * (i % 2))
+                                 for i in range(5)]]
+            self.draw(time.time())
+            self.root.update()
+            time.sleep(0.15)
+            x, y = self.root.winfo_rootx(), self.root.winfo_rooty()
+            ImageGrab.grab(bbox=(x, y, x + self.W, y + self.H)).save(
+                os.path.join(HERE, name))
+            print("saved", name)
+        self.close()
+
+    def _mac_log(self, text):
+        """맥 창 설정 진단 기록 — 초기화 중이라 _log_error를 못 쓰는 구간용."""
+        try:
+            with open(os.path.join(self.state_dir, ".macwindow.log"), "a",
+                      encoding="utf-8") as fp:
+                fp.write(time.strftime("%Y-%m-%d %H:%M:%S ") + text + os.linesep)
+        except Exception:
+            pass
+
+    def _setup_mac_window(self):
+        """맥 투명 창 설정.
+
+        캔버스를 MAC_KEY 로 칠하고, 그 색은 나중에 _mac_chroma_key() 가 합성 단계에서
+        지운다. systemTransparent 를 쓰지 않는 이유는 _MacChromaKey 설명 참고 —
+        Tk 9 가 그 색을 불투명한 검정으로 칠해 버린다.
+        """
+        mode = os.environ.get("MASCOT_MAC_MODE", "chroma")
+        try:
+            if mode == "opaque":                     # 대조군 (확실히 보임)
+                self.root.config(bg="#808080")
+                return "#808080"
+            if mode == "legacy":                     # 예전 방식 (검은 사각형 재현용)
+                self.root.attributes("-transparent", True)
+                self.root.config(bg="systemTransparent")
+                return "systemTransparent"
+            self.root.attributes("-transparent", True)   # 기본 = 색상키 방식
+            self.root.config(bg=MAC_KEY)
+            return MAC_KEY
+        except Exception as e:
+            self._mac_log(f"[{mode}] 창 설정 실패 → {e!r}")
+            return MAC_KEY
+
+    def _mac_borderless(self):
+        """맥에서 제목 표시줄 제거 — Tk 9는 overrideredirect만으로는 안 되는 경우가 있다."""
+        if not IS_MAC:
+            return
+        try:
+            self.root.update_idletasks()
+            self.root.overrideredirect(False)
+            self.root.overrideredirect(True)
+        except Exception:
+            pass
+        try:                                   # 그래도 남으면 AppKit으로 직접
+            from AppKit import NSApp
+            self.root.update_idletasks()
+            for w in self._mac_windows():
+                try:
+                    w.setStyleMask_(0)         # NSWindowStyleMaskBorderless
+                    w.setHasShadow_(False)
+                    w.setMovableByWindowBackground_(False)
+                except Exception as e:
+                    self._mac_log(f"창 설정 실패 → {e!r}")
+            self._mac_keep_transparent()
+            # 창이 화면에 올라온 뒤 되돌아가는 경우가 있고, 말풍선·할 일 패널은
+            # 나중에 생기므로 계속 다시 걸어 준다.
+            self.root.after(300, self._mac_keep_transparent)
+            self.root.after(1500, self._mac_verify)
+            for i, w in enumerate(NSApp.windows()):
+                try:
+                    bc = w.backgroundColor()
+                    self._mac_log(
+                        f"창{i}: 불투명={bool(w.isOpaque())} "
+                        f"창알파={float(w.alphaValue()):.2f} "
+                        f"배경알파={float(bc.alphaComponent()):.2f} "
+                        f"크기={int(w.frame().size.width)}x{int(w.frame().size.height)}")
+                except Exception as e:
+                    self._mac_log(f"창{i} 상태 읽기 실패 → {e!r}")
+            self._mac_log(self._mac_env())
+        except Exception as e:
+            self._mac_log(f"AppKit 접근 실패 → {e!r}")
+
+    def _mac_windows(self):
+        """이 프로그램의 마스코트 창만 고른다 (다른 창은 건드리지 않는다)."""
+        from AppKit import NSApp
+        out, other = [], []
+        for w in NSApp.windows():
+            try:
+                sz = w.frame().size
+                if abs(sz.width - self.W) <= 2 and abs(sz.height - self.H) <= 2:
+                    out.append(w)
+                elif sz.width > 4 and sz.height > 4:
+                    other.append(int(sz.width))
+            except Exception:
+                pass
+        if not out:                    # 크기로 못 찾으면 예전처럼 전부
+            if not getattr(self, "_mac_miss_logged", False):
+                self._mac_miss_logged = True       # 주기 호출이라 한 번만 남긴다
+                self._mac_log(f"크기 {self.W}x{self.H} 창을 못 찾음 — 전체 적용")
+            got = []
+            for w in NSApp.windows():
+                try:                   # 메뉴 창까지 투명해지면 안 된다 (사가)
+                    cls = str(w.className())
+                    if ("Menu" in cls or "Popover" in cls
+                            or "tooltip" in cls.lower()):
+                        continue
+                except Exception:
+                    pass
+                got.append(w)
+            return got
+        if other and not getattr(self, "_mac_win_logged", False):
+            self._mac_win_logged = True        # 주기 호출이라 한 번만 남긴다
+            self._mac_log(f"건드리지 않은 다른 창 폭: {other}")
+        return out
+
+    def _mac_clear_bg(self):
+        """마스코트 창을 투명하게 (표시 후 되돌아가는 것 대비해 여러 번 호출)."""
+        if self.canvas_bg == "#808080":
+            return
+        try:
+            from AppKit import NSColor
+            clear = NSColor.clearColor()
+            for w in self._mac_windows():
+                try:
+                    w.setOpaque_(False)
+                    w.setBackgroundColor_(clear)
+                    # 창을 투명하게 해도 그 위를 덮는 뷰가 스스로 배경을 칠하면
+                    # 소용이 없다. 캔버스가 그려지는 뷰의 레이어까지 비운다.
+                    cv = w.contentView()
+                    if cv is not None:
+                        cv.setWantsLayer_(True)
+                        lay = cv.layer()
+                        if lay is not None:
+                            lay.setBackgroundColor_(clear.CGColor())
+                            lay.setOpaque_(False)
+                except Exception as e:
+                    self._mac_log(f"뷰 레이어 투명화 실패 → {e!r}")
+        except Exception as e:
+            self._mac_log(f"투명 재적용 실패 → {e!r}")
+
+    def _mac_chroma_key(self):
+        """캔버스에 칠해진 MAC_KEY 색을 합성 단계에서 지운다 (실제 투명화 담당)."""
+        if self.canvas_bg != MAC_KEY:
+            return 0                       # opaque·legacy 모드에서는 걸지 않는다
+        ck = getattr(self, "_mac_ck", None)
+        if ck is None:
+            ck = self._mac_ck = _MacChromaKey(MAC_KEY)
+            if ck.err:
+                self._mac_log(f"색상키 준비 실패 → {ck.err}")
+            else:
+                self._mac_log(f"색상키 준비됨: {MAC_KEY} 격자={ck.key_idx} "
+                              f"큐브={ck.N}^3 반경={ck.RAD}")
+        return ck.apply_all()
+
+    def _mac_keep_transparent(self):
+        """투명 설정을 다시 못 박는다. 창이 나중에 더 생기므로 주기적으로 돈다."""
+        try:
+            self._mac_clear_bg()
+            n = self._mac_chroma_key()
+            if n:
+                self._mac_log(f"색상키 적용한 창 수: {n}")
+        except Exception as e:
+            self._mac_log(f"투명 유지 실패 → {e!r}")
+        try:
+            self.root.after(2000, self._mac_keep_transparent)
+        except Exception:
+            pass
+
+    def _mac_verify(self):
+        """정말 투명해졌는지 화면 합성 결과를 직접 읽어 기록한다.
+
+        캐릭터가 없는 구석을 찍는다. 알파가 0 이면 성공, 255 면 여전히 덮여 있는 것.
+        """
+        ck = getattr(self, "_mac_ck", None)
+        if ck is None or ck.err:
+            return
+        pts = [(4, 4), (self.W - 5, 4), (4, self.H - 5)]
+        r = ck.probe(self.W, pts)
+        if not r:
+            self._mac_log(f"합성 결과 확인 실패 → {ck.err}")
+            return
+        got = ["없음" if p is None else
+               ("투명" if p[0] == 0 else f"불투명{p[1:]}") for p in r["px"]]
+        self._mac_log(f"합성 결과(배율 {r['scale']:.0f}x) 좌상/우상/좌하 = "
+                      + " · ".join(got))
+
+    def _mac_env(self):
+        """투명이 안 될 때 원인을 가르는 정보 — Tk 색상 처리 · 시스템 설정."""
+        out = [f"canvas_bg={self.canvas_bg!r}"]
+        try:
+            out.append("tk=" + str(self.root.tk.call("info", "patchlevel")))
+        except Exception as e:
+            out.append(f"tk오류={e!r}")
+        try:
+            out.append("transparent속성=" + str(self.root.attributes("-transparent")))
+        except Exception as e:
+            out.append(f"transparent속성오류={e!r}")
+        # 참고: winfo_rgb 는 알파를 버리므로 systemTransparent 가 흰색으로 보이지만,
+        # 실제로 칠해지는 값은 불투명한 검정이다. 판단은 _mac_verify() 의 합성 결과로.
+        try:
+            out.append("systemTransparent해석=" +
+                       str(self.root.winfo_rgb("systemTransparent")))
+        except Exception as e:
+            out.append(f"systemTransparent오류={e!r}")
+        ck = getattr(self, "_mac_ck", None)
+        out.append("색상키=" + (f"{MAC_KEY} 준비됨" if ck and not ck.err
+                                else f"실패({ck.err})" if ck else "미준비"))
+        try:
+            out.append("캔버스실제bg=" + str(self.canvas.cget("bg")))
+        except Exception as e:
+            out.append(f"캔버스bg오류={e!r}")
+        try:                       # 시스템 설정에서 투명 효과를 끈 경우
+            from AppKit import NSWorkspace
+            ws = NSWorkspace.sharedWorkspace()
+            out.append("투명도줄이기=" +
+                       str(bool(ws.accessibilityDisplayShouldReduceTransparency())))
+        except Exception as e:
+            out.append(f"투명도줄이기확인불가={e!r}")
+        return " | ".join(out)
+
+    def _dump_debug(self):
+        """맥 진단용 상태 덤프 — 그림이 안 보일 때 원인 좁히기."""
+        try:
+            lines = [f"platform: win={IS_WIN} mac={IS_MAC}",
+                     f"geometry: {self.root.winfo_geometry()} "
+                     f"W={self.W} H={self.H} oy={self.oy} scale={self.s:.3f}",
+                     f"canvas bg={self.canvas_bg} items={len(self.canvas.find_all())}",
+                     f"parts_dir={self.parts_dir}",
+                     f"loaded images={sorted(self.im)}"]
+            for name in sorted(self.im):
+                im = self.im[name]
+                lines.append(f"  {name}: {im.width()}x{im.height()}")
+            kinds = {}
+            for it in self.canvas.find_all():
+                k = self.canvas.type(it)
+                kinds[k] = kinds.get(k, 0) + 1
+            lines.append(f"canvas item kinds: {kinds}")
+            for it in self.canvas.find_all():
+                if self.canvas.type(it) == "image":
+                    lines.append(f"  image at {self.canvas.coords(it)} "
+                                 f"state={self.canvas.itemcget(it, 'state')!r}")
+            with open(os.path.join(self.state_dir, "debug.txt"), "w",
+                      encoding="utf-8") as fp:
+                fp.write(os.linesep.join(lines))
+        except Exception:
+            import traceback
+            with open(os.path.join(self.state_dir, "debug.txt"), "w",
+                      encoding="utf-8") as fp:
+                traceback.print_exc(file=fp)
+
+    def run(self):
+        self.root.mainloop()
+
+
+def _arg(name, default):
+    if name in sys.argv:
+        i = sys.argv.index(name)
+        if i + 1 < len(sys.argv):
+            return sys.argv[i + 1]
+    return default
+
+
+if __name__ == "__main__":
+    _char = _arg("--char", "parts")
+    if "--preview" not in sys.argv and already_running(os.path.basename(_char)):
+        sys.exit(0)                 # 같은 캐릭터가 이미 떠 있으면 조용히 종료
+    Mascot(char_dir=_char, preview="--preview" in sys.argv).run()
