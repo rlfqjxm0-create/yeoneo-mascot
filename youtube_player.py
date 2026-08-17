@@ -400,6 +400,27 @@ def _profile_arg():
 
 
 def main():
+    """실패해도 조용히 물러난다.
+
+    굳힌 exe(같은 실행 파일이 --yt-player로 다시 뜬 자식)에서 webview가
+    .NET을 못 얹으면(다운로드 차단 표식이 남은 zip, 오래된 프레임워크 등)
+    여기서 터지는데, 예외가 그대로 나가면 PyInstaller가 '스크립트 실행
+    실패' 오류 창을 띄워 본체가 죽은 것처럼 보인다 (준사 제보). 부모는
+    자식이 죽으면 '음악을 켤 수 없어요'라고 이미 말해 주므로, 여기서는
+    상태 한 줄만 남기고 조용히 끝낸다.
+    """
+    try:
+        _main()
+    except Exception as e:
+        try:
+            sys.stdout.write('@YT {"ready": false, "fatal": "%s"}\n'
+                             % type(e).__name__)
+            sys.stdout.flush()
+        except Exception:
+            pass
+
+
+def _main():
     try:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     except Exception:
