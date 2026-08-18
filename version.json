@@ -1,7 +1,7 @@
 {
- "version": 1787003169,
+ "version": 1787044335,
  "files": {
-  "mascot.py": "5f7fb01680ce670ed421cf1b8e414b5b261d902cf2135010bf35636238f00579",
+  "mascot.py": "17fea6f8bc7603009cfc2f3a674c7a0fcd7d582df24532650f4cb4e0ed65cbdb",
   "parts_yeoneo/arm_key.png": "5880d3ef755195b0ab6574ec3c408940da9a49cfba4ef0419b6701d59898a8b6",
   "parts_yeoneo/arm_pen.png": "9f5989174ed0c9eb0e9b1d62040292a5122bf743d748e2e8b1943a1a6afa83d8",
   "parts_yeoneo/arm_right.png": "e8955c8085bfbd801dfdd7ae776124c0f53bbc7c263ead9811d4091a7bdea159",
@@ -82,6 +82,13 @@
   "parts_yeoneo/snacks_special/cup_peugo.png": "5ad6757e542d673da015468543ad5040563e5e091594917ce1bd20c25ebfb617",
   "parts_yeoneo/snacks_special/cup_quincy.png": "2fcf891de8701e334443e08bc548062dc7ab7def89980b4af67a8f046ed2088b",
   "parts_yeoneo/snacks_special/cup_saga.png": "192d17b286eba531876a0cba17345d3783736767d0cd6d51e88b91584e2b3583",
+  "parts_yeoneo/sounds/ambient/굵은 빗소리.wav": "85d50c10f93fa4af6d7a348bbe5703464217f5e9637b6ddb9c5fd5f2e1076798",
+  "parts_yeoneo/sounds/ambient/말발굽.wav": "4ae202fd074927da4994a421e488012cff57b87e00b036d5e9eccf0e830b93c9",
+  "parts_yeoneo/sounds/ambient/먼 모닥불.wav": "fb36768291296948e9c02e35f82f2f90267cbffd884241406126fca8326208b5",
+  "parts_yeoneo/sounds/ambient/모닥불.wav": "9a24a37fc9ebf218df0440829a823735c21d33bcfc8365c62285b4e24a97b7c4",
+  "parts_yeoneo/sounds/ambient/빗소리.wav": "e39973ef65c9dde99013d6ec8c885e954683423eef146a7137094d5a26500dc9",
+  "parts_yeoneo/sounds/ambient/장작 타는 소리.wav": "f3a43bbf2ca65b4343b2c636dad8879575920440697cecf7961821ac35c2e2bd",
+  "parts_yeoneo/sounds/ambient/캠프파이어.wav": "7aa110e1f1954bb3e91a5cabd158b2dce3bea11caec69093b7cef082e6efd01b",
   "parts_yeoneo/sounds/apex-pro-tkl-v2_Akira/config.json": "1fc06af40c17bb41cc1c1fd9c22a4cbd88746e55c38bc582400e6cda3aa93ebf",
   "parts_yeoneo/sounds/apex-pro-tkl-v2_Akira/enter.wav": "fe7998dabcc579dd88b8ecb3b22f942efc880bd75f9794b792a41f5c10b51ef3",
   "parts_yeoneo/sounds/apex-pro-tkl-v2_Akira/key1.wav": "34ca127f328b29dfee7e5d777636cad708371d6bdadcfc3d05d988c1555fa97e",
@@ -393,6 +400,5 @@
   "stickers/__init__.py": "d77e3dc92cb353dced8d192c140643c6458bc3901facdf2e0a0d0830fa4244b7",
   "youtube_player.py": "b24fce8125c2234285ae5f8dfbb612eb879c8897476d7fbfcc04856057e42e76"
  },
- "notes": [],
- "silent": true
+ "notes": []
 }
