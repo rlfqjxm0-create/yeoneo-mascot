@@ -1,7 +1,7 @@
 {
- "version": 1787047861,
+ "version": 1787050956,
  "files": {
-  "mascot.py": "ea6dec390c8f968b5c03e70375360f29cf2e1282cc0e2591ce34421759809fe5",
+  "mascot.py": "64a5abf9228f8e32430daba4ef3e094686d1702ec5e7094c04337f9012e506df",
   "parts_yeoneo/arm_key.png": "5880d3ef755195b0ab6574ec3c408940da9a49cfba4ef0419b6701d59898a8b6",
   "parts_yeoneo/arm_pen.png": "9f5989174ed0c9eb0e9b1d62040292a5122bf743d748e2e8b1943a1a6afa83d8",
   "parts_yeoneo/arm_right.png": "e8955c8085bfbd801dfdd7ae776124c0f53bbc7c263ead9811d4091a7bdea159",
@@ -400,6 +400,12 @@
   "stickers/__init__.py": "d77e3dc92cb353dced8d192c140643c6458bc3901facdf2e0a0d0830fa4244b7",
   "youtube_player.py": "b24fce8125c2234285ae5f8dfbb612eb879c8897476d7fbfcc04856057e42e76"
  },
- "notes": [],
- "silent": true
+ "notes": [
+  "새 친구 둘이 왔어요 — 패왕(하늘빛 여우)과 성실이(치즈 위의 쥐)",
+  "할 일 말풍선을 하나씩 따로 옮길 수 있어요 (첫 칸을 끌면 전체가 따라오고, 둘째부터는 각자)",
+  "말풍선마다 꼬리 방향과 크기도 따로 정할 수 있어요 — 우클릭에서",
+  "뽀모도로 타이머가 생겼어요 — 우클릭 > 뽀모도로 타이머",
+  "25분 집중 · 5분 휴식 · 네 번째엔 15분. 시간이 되면 알려 주고 같이 몸을 펴요",
+  "마감도 우클릭으로 지울 수 있어요"
+ ]
 }
