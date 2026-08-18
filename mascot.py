@@ -1748,24 +1748,29 @@ class MacSlimeSound(_MacSoundPool):
 
 
 class AmbientSound:
-    """환경음(BGM) — 여러 소리를 **동시에** 끝없이 반복해서 튼다.
+    """환경음(BGM) — 여러 소리를 동시에, 끄기 전까지 끝없이.
 
-    빗소리에 천둥을 얹는 식으로 섞어 듣는 것이라, 소리마다 따로 켜고
-    따로 볼륨을 준다. 소리 하나가 재생 장치 하나를 쓴다.
+    파일을 통째로 올리지 않고 **조각으로 흘려보낸다**. 통째로 올려 볼륨을
+    곱하던 때는 3분짜리 하나에 메모리 60MB 와 곱셈 3천만 번이 들어, 켜는
+    순간 화면과 커서가 1.6초 굳었다(실측). 지금은 0.4초짜리 조각 넷을
+    돌려 쓴다 — 파일이 한 시간이어도 메모리는 300KB, 한 번에 곱하는 것도
+    조각 하나치뿐이다.
 
-    반복은 winmm 이 직접 해 준다 — 헤더에 WHDR_BEGINLOOP/ENDLOOP 를 켜고
-    dwLoops 를 크게 주면 드라이버가 알아서 이어 붙인다. 파이썬이 끝나는
-    때를 지켜보다 다시 써 넣을 필요가 없어 프레임을 한 톨도 안 쓴다.
+    볼륨도 이 구조라서 공짜다. **다음 조각부터** 새 볼륨으로 채우면 되니
+    소리가 안 끊기고 되감기지도 않는다. 장치 볼륨(waveOutSetVolume)은
+    쓸 수 없다 — 그건 핸들이 아니라 장치의 볼륨이라, 다른 소리가 재생
+    직전에 최대로 되돌릴 때마다 환경음까지 커진다(실측으로 확인).
 
-    볼륨은 장치마다 `waveOutSetVolume` 으로 준다. 넣고 되읽어 확인해 보고,
-    드라이버가 무시하면 — 이 프로젝트가 다른 소리에서 이미 겪은 일이다 —
-    샘플에 직접 곱해 다시 연다. 섞어 듣는 기능이라 이쪽이 중요하다:
-    버퍼를 다시 만들면 그 소리만 처음으로 되돌아가 박자가 어긋난다.
+    채우는 일은 스레드 하나가 모든 소리를 돌며 맡는다. 조각이 다 나가기
+    전에 다음 것을 넣어 두므로 끊기지 않는다.
     """
 
-    LOOP_FLAGS = 0x00000004 | 0x00000008      # WHDR_BEGINLOOP | WHDR_ENDLOOP
+    CHUNK_SEC = 0.4           # 조각 하나의 길이
+    SLOTS = 4                 # 돌려 쓰는 조각 수 (1.6초치 여유)
+    TICK = 0.06               # 채우러 도는 간격
 
     def __init__(self, folder):
+        import threading
         import wave                            # (이미 쓰는 표준 모듈)
         self.folder = folder
         self.names = [os.path.splitext(f)[0]
@@ -1773,124 +1778,158 @@ class AmbientSound:
                       if f.lower().endswith(".wav")]
         if not self.names:
             raise ValueError("환경음 wav 없음")
-        self.voices = {}          # 이름 -> (핸들, 헤더, 버퍼, 볼륨)
-        self._drv_vol = None      # 드라이버 볼륨이 통하는가
         self._wave = wave
+        self._threading = threading
+        self._lock = threading.Lock()
+        self.tracks = {}          # 이름 -> 흐르고 있는 소리 한 벌
+        self.want = {}            # 이름 -> 바라는 볼륨
+        self._stop = False
+        self._th = threading.Thread(target=self._loop, daemon=True)
+        self._th.start()
 
-    # ── 볼륨 ────────────────────────────────────────────────────────────
-    @staticmethod
-    def _vol_val(vol):
-        lvl = int(max(0.0, min(float(vol) / 100.0, 1.0)) * 0xFFFF)
-        return (lvl << 16) | lvl               # 좌우 같은 값
-
-    def _try_drv_vol(self, h, vol):
-        """드라이버 볼륨을 넣고 되읽어 확인한다. 못 믿으면 False."""
-        wm = ctypes.windll.winmm
-        val = self._vol_val(vol)
-        if wm.waveOutSetVolume(h, val):
-            return False
-        got = ctypes.c_uint32()
-        if wm.waveOutGetVolume(h, ctypes.byref(got)):
-            return False
-        return got.value == val
-
-    # ── 재생 ────────────────────────────────────────────────────────────
-    def _open(self, name, vol, scale):
+    # ── 한 소리 열기/닫기 ───────────────────────────────────────────────
+    def _open(self, name, vol):
         path = os.path.join(self.folder, name + ".wav")
-        with self._wave.open(path, "rb") as w:
-            ch, sw, fr = w.getnchannels(), w.getsampwidth(), w.getframerate()
-            pcm = w.readframes(w.getnframes())
-        if sw != 2 or not pcm:
+        wf = self._wave.open(path, "rb")
+        ch, sw, fr = wf.getnchannels(), wf.getsampwidth(), wf.getframerate()
+        if sw != 2:
+            wf.close()
             raise ValueError("환경음은 16bit wav 만 지원")
-        g = (float(vol) / 100.0) if scale else 1.0
-        buf = _scaled_buffer(pcm, g, sw)
         wfx = _WAVEFORMATEX(1, ch, fr, fr * ch * sw, ch * sw, sw * 8, 0)
         wm = ctypes.windll.winmm
         h = ctypes.c_void_p()
         if wm.waveOutOpen(ctypes.byref(h), 0xFFFFFFFF,
                           ctypes.byref(wfx), 0, 0, 0):
+            wf.close()
             raise OSError("소리 장치를 열 수 없음")
-        if scale:
-            wm.waveOutSetVolume(h, 0xFFFFFFFF)     # 볼륨은 샘플에 이미 반영
-        elif not self._try_drv_vol(h, vol):
-            wm.waveOutClose(h)
-            return None                            # 부르는 쪽이 다시 시도
-        hdr = _WAVEHDR()
-        hdr.lpData = ctypes.cast(buf, ctypes.c_void_p)
-        hdr.dwBufferLength = len(pcm)
-        hdr.dwFlags = self.LOOP_FLAGS
-        hdr.dwLoops = 0xFFFFFFFF
-        wm.waveOutPrepareHeader(h, ctypes.byref(hdr), ctypes.sizeof(_WAVEHDR))
-        wm.waveOutWrite(h, ctypes.byref(hdr), ctypes.sizeof(_WAVEHDR))
-        return h, hdr, buf
+        nframe = max(1024, int(fr * self.CHUNK_SEC))
+        nbytes = nframe * ch * sw
+        slots = []
+        for _ in range(self.SLOTS):
+            buf = ctypes.create_string_buffer(nbytes)
+            hdr = _WAVEHDR()
+            hdr.lpData = ctypes.cast(buf, ctypes.c_void_p)
+            hdr.dwBufferLength = nbytes
+            hdr.dwFlags = 0
+            wm.waveOutPrepareHeader(h, ctypes.byref(hdr),
+                                    ctypes.sizeof(_WAVEHDR))
+            hdr.dwFlags |= 0x00000001          # WHDR_DONE — 처음엔 다 비었다
+            slots.append([hdr, buf, False])    # [헤더, 버퍼, 나가 있는가]
+        return {"h": h, "wf": wf, "slots": slots, "nframe": nframe,
+                "vol": float(vol), "ch": ch, "sw": sw, "fr": fr,
+                "played": 0}
 
+    def _close_track(self, tr):
+        wm = ctypes.windll.winmm
+        try:
+            wm.waveOutReset(tr["h"])
+            for hdr, _buf, _out in tr["slots"]:
+                wm.waveOutUnprepareHeader(tr["h"], ctypes.byref(hdr),
+                                          ctypes.sizeof(_WAVEHDR))
+            wm.waveOutClose(tr["h"])
+        except Exception:
+            pass
+        try:
+            tr["wf"].close()
+        except Exception:
+            pass
+
+    # ── 채우기 ──────────────────────────────────────────────────────────
+    def _fill(self, tr):
+        """빈 조각을 다음 소리로 채워 다시 내보낸다 (끝나면 처음으로)."""
+        wm = ctypes.windll.winmm
+        g = max(0.0, min(tr["vol"], 100.0)) / 100.0
+        step = tr["nframe"]
+        for slot in tr["slots"]:
+            hdr, buf, out = slot
+            if out and not (hdr.dwFlags & 0x00000001):    # 아직 나가 있다
+                continue
+            data = tr["wf"].readframes(step)
+            if len(data) < hdr.dwBufferLength:
+                tr["wf"].rewind()                          # 끝 → 처음으로
+                data += tr["wf"].readframes(
+                    step - len(data) // (tr["ch"] * tr["sw"]))
+            if not data:
+                return
+            n = len(data)
+            ctypes.memmove(buf, data, n)
+            if g < 0.999:
+                arr = (ctypes.c_int16 * (n // 2)).from_buffer(buf)
+                for i in range(n // 2):
+                    arr[i] = int(arr[i] * g)
+            hdr.dwBufferLength = n
+            hdr.dwFlags &= ~0x00000001                     # DONE 을 지운다
+            wm.waveOutWrite(tr["h"], ctypes.byref(hdr),
+                            ctypes.sizeof(_WAVEHDR))
+            slot[2] = True
+            tr["played"] += n
+
+    def _loop(self):
+        import time as _t
+        while not self._stop:
+            try:
+                with self._lock:
+                    for name in list(self.tracks):
+                        self._fill(self.tracks[name])
+            except Exception:
+                pass
+            _t.sleep(self.TICK)
+
+    # ── 바깥에서 쓰는 것들 ──────────────────────────────────────────────
     def has(self, name):
         return str(name) in self.names
 
     def is_on(self, name):
-        return str(name) in self.voices
+        return str(name) in self.want
 
     def on_names(self):
-        return sorted(self.voices)
+        return sorted(self.want)
+
+    def played_bytes(self, name):
+        """지금까지 내보낸 바이트 (검사에서 '진짜 흐르는가'를 볼 때)."""
+        tr = self.tracks.get(str(name or ""))
+        return int(tr["played"]) if tr else -1
 
     def set(self, name, on, vol=35):
-        """켜거나 끈다. 이미 그 상태면 볼륨만 맞춘다."""
+        """켜거나 끈다. 켜져 있으면 볼륨만 바꾼다 (안 끊긴다)."""
         name = str(name or "")
         if name not in self.names:
             return
-        if not on:
+        vol = max(0.0, min(float(vol), 100.0))
+        if not on or vol <= 0:
             self.stop(name)
             return
-        if name in self.voices:
-            self.vol(name, vol)
-            return
-        if float(vol) <= 0:
-            return                       # 무음으로 돌릴 이유가 없다
-        got = None
-        if self._drv_vol is not False:
-            got = self._open(name, vol, False)     # 드라이버 볼륨으로 먼저
-            self._drv_vol = got is not None
-        if got is None:
-            got = self._open(name, vol, True)      # 안 통하면 샘플에 곱해서
-        self.voices[name] = got + (float(vol),)
+        with self._lock:
+            self.want[name] = vol
+            tr = self.tracks.get(name)
+            if tr is not None:
+                tr["vol"] = vol            # 다음 조각부터 새 볼륨
+                return
+            try:
+                tr = self._open(name, vol)
+            except Exception:
+                self.want.pop(name, None)
+                return
+            self.tracks[name] = tr
+            self._fill(tr)                 # 첫 조각은 그 자리에서 채운다
 
     def vol(self, name, vol):
-        name = str(name or "")
-        got = self.voices.get(name)
-        vol = max(0.0, min(float(vol), 100.0))
-        if got is None:
-            return
-        if vol <= 0:
-            self.stop(name)
-            return
-        if abs(got[3] - vol) < 0.01:
-            return
-        if self._drv_vol:
-            ctypes.windll.winmm.waveOutSetVolume(got[0], self._vol_val(vol))
-            self.voices[name] = got[:3] + (vol,)
-            return
-        self.stop(name)                  # 다시 열어야 반영된다
         self.set(name, True, vol)
 
     def stop(self, name):
-        got = self.voices.pop(str(name or ""), None)
-        if got is None:
-            return
-        h, hdr = got[0], got[1]
-        wm = ctypes.windll.winmm
-        try:
-            wm.waveOutReset(h)
-            wm.waveOutUnprepareHeader(h, ctypes.byref(hdr),
-                                      ctypes.sizeof(_WAVEHDR))
-            wm.waveOutClose(h)
-        except Exception:
-            pass
+        name = str(name or "")
+        with self._lock:
+            self.want.pop(name, None)
+            tr = self.tracks.pop(name, None)
+        if tr is not None:
+            self._close_track(tr)
 
     def stop_all(self):
-        for name in list(self.voices):
+        for name in list(self.want) + list(self.tracks):
             self.stop(name)
 
     def close(self):
+        self._stop = True
         self.stop_all()
 
 
@@ -1915,6 +1954,9 @@ class MacAmbientSound:
 
     def on_names(self):
         return sorted(self.voices)
+
+    def is_on(self, name):
+        return str(name) in self.voices
 
     def set(self, name, on, vol=35):
         name = str(name or "")
@@ -5991,7 +6033,7 @@ class Mascot:
                 return
             # 음악 버튼·환경음 알약이 카드 윗변에 걸쳐 있으므로 카드보다 먼저
             if (ab and ab[0] <= px <= ab[2] and ab[1] <= py <= ab[3]):
-                self._safe("amb_win", self._amb_win)
+                self._safe("amb_win", self._amb_toggle_win)
             elif mb and (px - mb[0]) ** 2 + (py - mb[1]) ** 2 <= (mb[2] + 3) ** 2:
                 self._safe("music", self._yt_toggle)
             elif self.has_clock and on_card:
@@ -7565,8 +7607,7 @@ class Mascot:
             return
         c, cd = self.canvas, self.card
         g = self._card_geom()
-        n = len(self._amb.on_names())
-        w, h = 44.0, 22.0
+        w, h = 34.0, 22.0
         cx = (g["x0"] + g["x1"]) / 2
         if self.us.get("yt_url") and self._yt_on():
             cx -= 34.0                    # 노래 버튼 왼쪽으로 비켜 준다
@@ -7578,15 +7619,14 @@ class Mascot:
         self._rr(c, x0, y0, x1, y1, h / 2, fill=cd["bg"],
                  outline=cd["border"], width=2)
         ink = cd["fill"]
-        # 물결 셋 — 소리가 퍼지는 모양
-        wx = x0 + 13.0
-        for i, (dx, sc) in enumerate(((0.0, 0.5), (5.0, 0.75), (10.0, 1.0))):
+        # 물결 셋 — 소리가 퍼지는 모양. 알약 한가운데에 놓는다.
+        span = 10.0                      # 첫 물결과 끝 물결의 간격
+        wx = cx - span / 2.0
+        for dx, sc in ((0.0, 0.5), (5.0, 0.75), (10.0, 1.0)):
             rr = 6.0 * sc
             c.create_arc(wx + dx - rr, by - rr, wx + dx + rr, by + rr,
                          start=-55, extent=110, style="arc",
                          outline=ink, width=2)
-        c.create_text(x1 - 9, by + 0.5, text=str(n), anchor="center",
-                      font=self._cf(9, True), fill=ink)
         self._amb_btn = (x0, y0, x1, y1)
 
     def _draw_update_dot(self):
@@ -7897,6 +7937,66 @@ class Mascot:
         win.bind("<Destroy>", gone, add="+")
         self._keep_front(win)
 
+    def _win_place(self, win, key=None):
+        """창을 지난번 닫은 자리에서 연다 (창마다 따로 기억).
+
+        열쇠는 창 제목이다. 자리는 옮길 때마다 들고 있다가 닫을 때 적는다
+        — 닫히는 순간에는 창 좌표를 못 읽는 경우가 있어서다. 모니터 구성이
+        바뀌어 화면 밖이 된 자리는 버리고 기본 자리에 띄운다.
+        """
+        def go():
+            try:
+                k = key or win.title() or ""
+                if not k:
+                    return
+                pos = (self.us.get("win_pos") or {}).get(k)
+                if pos and len(pos) == 2:
+                    x, y = int(pos[0]), int(pos[1])
+                    if self._pos_on_screen(x, y):
+                        win.geometry("+%d+%d" % (x, y))
+                last = {}
+
+                def moved(e, w=win):
+                    if e.widget is w:
+                        last["xy"] = (w.winfo_x(), w.winfo_y())
+
+                def gone(e, w=win, k2=k):
+                    if e.widget is not w or "xy" not in last:
+                        return
+                    d = dict(self.us.get("win_pos") or {})
+                    d[k2] = list(last["xy"])
+                    if len(d) > 24:            # 오래된 것부터 버린다
+                        for old in list(d)[:8]:
+                            d.pop(old, None)
+                    self.us["win_pos"] = d
+                    self._safe("winpos", self._save_settings)
+
+                win.bind("<Configure>", moved, add="+")
+                win.bind("<Destroy>", gone, add="+")
+            except Exception:
+                pass
+        try:
+            win.after_idle(go)
+        except Exception:
+            pass
+
+    def _pos_on_screen(self, x, y):
+        """그 자리가 지금 화면 안인가 (모니터가 바뀌었을 수 있다)."""
+        try:
+            if IS_WIN:
+                u32 = ctypes.WinDLL("user32")     # 지뢰 21 — 따로 연다
+                vx = u32.GetSystemMetrics(76)     # SM_XVIRTUALSCREEN
+                vy = u32.GetSystemMetrics(77)
+                vw = u32.GetSystemMetrics(78)
+                vh = u32.GetSystemMetrics(79)
+                return (vx - 40 <= x <= vx + vw - 60
+                        and vy - 20 <= y <= vy + vh - 60)
+            sw = self.root.winfo_screenwidth()
+            sh = self.root.winfo_screenheight()
+            return -40 <= x <= sw - 60 and -20 <= y <= sh - 60
+        except Exception:
+            return False
+
     def _keep_front(self, win, focus=True):
         """창이 살아 있는 동안 타이머(항상 위)보다 앞을 지킨다.
 
@@ -7906,6 +8006,7 @@ class Mascot:
         값이다. 이제 내 다른 창(캐릭터·말풍선)이 이 창을 실제로 덮었을
         때만 올린다. 윈도우가 아니면 잴 길이 없어 예전대로 주기 올림.
         """
+        self._win_place(win)          # 지난번 닫은 자리에서 열린다
         try:
             win.attributes("-topmost", True)   # 한 번만 — 주기로 걸면 깜빡인다
         except Exception:
@@ -12098,6 +12199,15 @@ class Mascot:
         if self._amb is None:
             return
         self._amb_apply()
+
+    def _amb_toggle_win(self):
+        """알약을 누를 때 — 열려 있으면 닫고, 아니면 연다."""
+        got = getattr(self, "_amb_winref", None)
+        if got is not None and got.winfo_exists():
+            got.destroy()
+            self._amb_winref = None
+            return
+        self._amb_win()
 
     def _amb_win(self):
         """환경음 고르는 창 — 여러 개를 겹쳐 틀고 각자 볼륨을 준다.
