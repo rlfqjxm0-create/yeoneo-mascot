@@ -1,5 +1,5 @@
 {
- "version": 1787060665,
+ "version": 1787060967,
  "files": {
   "mascot.py": "de855ae3cdd90d359c4c4129cb7e6b801a816af1281703e234ebd58c6dabfa33",
   "parts_yeoneo/arm_key.png": "5880d3ef755195b0ab6574ec3c408940da9a49cfba4ef0419b6701d59898a8b6",
@@ -11,6 +11,7 @@
   "parts_yeoneo/crown.png": "b1b7426a0222ac294a782cb06db6c9c4aba4e660591dd1761dc9e4da050175fc",
   "parts_yeoneo/desk.png": "7002c97c2c42baea38744d02fe5abf2fee063845665bd7bcd4bbced4254daa06",
   "parts_yeoneo/eyes_closed.png": "c0c00e56fb9f497d4093b103b91e21d29471e2879deafd7cc1082a4ada4ea503",
+  "parts_yeoneo/hand.png": "14fcba700a6266576b2d5a5e8d6aa308f53ff0d00008e93ee51526d08eec067f",
   "parts_yeoneo/hat.png": "4bd1da80b760cff3694c7b21350e8dce6a177026846dcd737d796ad7560f277f",
   "parts_yeoneo/head.png": "ddad4705ec55415e097d7c2ba75ae2bba57a136a652dadfdf7a2f8e7a936603f",
   "parts_yeoneo/head_raw.png": "74f08c4b89e3744b939499e028ad12366f69aaf422cfc629c3006564a5a4b40d",
