@@ -253,6 +253,10 @@ class Player:
         self.page = page
         self.vol = 60
         self.want_play = False
+        # 곡이 끝나면 **자식이 되감을 것인가**. 목록으로 트는 동안에는
+        # 부모가 다음 곡을 정하므로 꺼 둔다 — 둘이 같이 정하면 자식이
+        # 먼저 되감아 부모가 'ended' 를 못 보고 같은 곡이 반복된다.
+        self.loop = True
         self.mode = "play"           # play | login
         self.signed = None           # 로그인 상태를 확인했는가 (모르면 None)
         self.cur = ("", "")          # 지금 틀어 둔 (영상, 재생목록)
@@ -278,6 +282,8 @@ class Player:
         c = msg.get("c")
         if c == "load":
             self.want_play = True
+            # 안 보내는 옛 부모와도 맞물리게 기본은 '되감는다'
+            self.loop = bool(int(msg.get("loop", 1) or 0))
             if self.mode == "login":     # 로그인 끝나면 이 곡으로 시작한다
                 self.cur = (str(msg.get("v") or ""), str(msg.get("list") or ""))
                 self.resume = True
@@ -366,6 +372,8 @@ class Player:
         작업하는 내내 소리가 이어지라는 뜻이다. 사람이 멈춘 것(want_play가
         거짓)일 때는 건드리지 않는다.
         """
+        if not self.loop:
+            return                   # 목록 재생 중 — 다음 곡은 부모가 정한다
         now = time.time()
         if s.get("ended") and self.want_play and now - self._replay > 3.0:
             self._replay = now
