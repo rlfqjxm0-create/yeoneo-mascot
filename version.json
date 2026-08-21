@@ -1,13 +1,13 @@
 {
- "version": 1787304336,
+ "version": 1787305027,
  "files": {
-  "mascot.py": "aababd882f9ab547d0b68474873749221b4503ef7a52cc022fc948f32e4c5750",
+  "mascot.py": "2a1de8238569e1fc656ff4e83416455e9998682c21b0fd8f97f65d29a012e9a3",
   "parts_yeoneo/arm_key.png": "5880d3ef755195b0ab6574ec3c408940da9a49cfba4ef0419b6701d59898a8b6",
   "parts_yeoneo/arm_pen.png": "9f5989174ed0c9eb0e9b1d62040292a5122bf743d748e2e8b1943a1a6afa83d8",
   "parts_yeoneo/arm_right.png": "e8955c8085bfbd801dfdd7ae776124c0f53bbc7c263ead9811d4091a7bdea159",
   "parts_yeoneo/arm_right_typing.png": "5986342fe36b166d022691a044a27abf0d884a74d1fc43572887487318b24145",
   "parts_yeoneo/body_open.png": "c8a2baf6a7a2ff8ffc8b95db1c8c69c9b3e24469f9b970f9eff85b5f0905bc39",
-  "parts_yeoneo/config.json": "8d91e785a79e976d829aaef22ee4acbe2400bc6aafbc76a7bb523dfb74f0b264",
+  "parts_yeoneo/config.json": "1c3d55b6443b15da255dbd2e39098d8cb4d270fb9a423ddc190ba447f219afa2",
   "parts_yeoneo/crown.png": "b1b7426a0222ac294a782cb06db6c9c4aba4e660591dd1761dc9e4da050175fc",
   "parts_yeoneo/desk.png": "7002c97c2c42baea38744d02fe5abf2fee063845665bd7bcd4bbced4254daa06",
   "parts_yeoneo/eyes_closed.png": "c0c00e56fb9f497d4093b103b91e21d29471e2879deafd7cc1082a4ada4ea503",
@@ -167,6 +167,12 @@
   "parts_yeoneo/sounds/gameover/over1.wav": "98f0544212192e5c718ef3fbe3594f427de5c49b1fdfd59cb7ad65246dbcabb2",
   "parts_yeoneo/sounds/Gateron Black Ink - Revolt/config.json": "fd2ba9ead98d013f43b54f7d365919d1e3f784e3adc9a5d3968eff8529dbc242",
   "parts_yeoneo/sounds/Gateron Black Ink - Revolt/Gateron Black.wav": "7e743b05e2c521523bb173cc68c145b628045acbc485599a8d39d57095d0c432",
+  "parts_yeoneo/sounds/kkodle/bad/bad_1.wav": "860c89186528b1fa1635a1d079950f826982c7ca2dd24de4aac56e23472bfaf3",
+  "parts_yeoneo/sounds/kkodle/key/key_1.wav": "67cca67ccac95c5abd13f264643cd9270bb42692b2bbc8a63c1b58072f484fed",
+  "parts_yeoneo/sounds/kkodle/key/key_2.wav": "adae72cd46d8eb3bd76230bd28f2ac37a56b7b42636dabbbf9d140495f82166c",
+  "parts_yeoneo/sounds/kkodle/key/key_3.wav": "2ff5e36bef5b78fdb35ca346243013ed374d56a092f22112544f06cf0e5b8fe8",
+  "parts_yeoneo/sounds/kkodle/win/win_1.wav": "f9e30e6948e2690d589b86964f1c145cf39b7988a3aef5ba0a93921f6f519b93",
+  "parts_yeoneo/sounds/kkodle_bgm/bgm.wav": "b217c5ff36fcfbdacb7b114b4fbc0ac5c0dfd322cb00dab80538493d06bbecc7",
   "parts_yeoneo/sounds/link65 gold/config.json": "6f6225a5b64efdc73c76039d0081263f6dc402979af3a988c351161f64c01e88",
   "parts_yeoneo/sounds/link65 gold/link65gold-back1.wav": "36ceead79ac1f1d56314d8bccf407ca60c8bfc6b80c48b7b9a5df46e7eacedc2",
   "parts_yeoneo/sounds/link65 gold/link65gold-enter1.wav": "cba282de33d5398e593505150f1f960d0beec1d3e7b8964cc9bc4ca348c010a1",
@@ -445,6 +451,7 @@
   "parts_yeoneo/stamps/bud.png": "6b2b3f6c5b57f26e6b80123d766f8e2e391ade3668f3fd0f7b1686723e67ae8c",
   "parts_yeoneo/stamps/flower.png": "ed5b9ece5130a07c400974ede9f79a0d1ba23a61621f9b0a105d3d59279bc2fe",
   "parts_yeoneo/stamps/sprout.png": "7fc5debfff894594c7ff5d2905de9ede3182d3f36365d5cfb24ab77f2c815036",
+  "parts_yeoneo/words/kkodle.json": "cec16ab9934b2532339e4928c71b3467b03ef57601c6fc7fef8b4174c07d7b63",
   "stickers/app.py": "aec3746a70fd004af5fd7100db522c6852a7ff0fde3c4458f824e81acd0a505f",
   "stickers/editor.py": "541d92a634cc910e32ef6f837731d7556ae472ed1a7add5377d98b366ce34ff7",
   "stickers/layered.py": "5535d72bffce5307b687053f297f0f7a36f1a5acf296d0956bb70aeff5d3f9fa",
@@ -454,8 +461,9 @@
   "youtube_player.py": "8fd216056f4f61075a8646a791389b05ad0082c40864d84b16773c2302c74f2d"
  },
  "notes": [
-  "**랭킹 한마디를 게임마다 따로 쓸 수 있습니다.** 수박게임에 남긴 글이 컬러타일·2048에도 똑같이 떠 있던 문제예요. 옛날에 한마디가 하나뿐이던 시절의 값을 다른 게임까지 물려 쓰고 있었습니다 — 이제 게임마다 제 글만 뜹니다",
-  "**홈에서 미니게임을 펼치면 누를 때까지 접히지 않습니다.** 게임이 늘면서 칸이 길어져, 겨냥하다 마우스가 조금만 벗어나도 접혀 버렸어요. 이제 다른 곳을 누를 때에만 접힙니다",
-  "**수박게임 아이콘 색을 '미니게임' 단추와 갈랐습니다.** 둘 다 연두라 어느 것이 무엇인지 알아보기 어려웠어요"
+  "**미니게임에 '꼬들'이 생겼습니다.** 두 글자 낱말을 자모 여섯 칸으로 풀어 여섯 번 안에 맞히는 놀이예요 (초록=자리까지 맞음, 노랑=낱말엔 있지만 자리가 다름). 자판은 두벌식 그대로라 한/영을 안 바꿔도 되고, 새벽 6시에 새 낱말로 바뀝니다",
+  "**모두가 같은 낱말을 풉니다.** 창 오른쪽 '오늘의 기록'에 친구들이 몇 번 만에·언제 맞혔는지 모여요. 차례는 걸린 시간이 아니라 **적은 횟수**로 정해지고, 같으면 먼저 끝낸 사람이 위입니다. 줄을 누르면 그 사람 카드가 펼쳐지고, 제 줄에서는 한마디를 남길 수 있어요",
+  "**랭킹 한마디를 게임마다 따로 쓸 수 있습니다.** 수박게임에 남긴 글이 컬러타일·2048에도 똑같이 떠 있던 문제예요 — 옛날에 한마디가 하나뿐이던 시절의 값을 다른 게임까지 물려 쓰고 있었습니다",
+  "**홈에서 미니게임을 펼치면 누를 때까지 접히지 않습니다.** 게임이 늘면서 칸이 길어져, 겨냥하다 마우스가 조금만 벗어나도 접혀 버렸어요. 수박게임 아이콘 색도 '미니게임' 단추와 갈라 두었습니다"
  ]
 }
