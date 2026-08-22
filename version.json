@@ -1,7 +1,7 @@
 {
- "version": 1787413591,
+ "version": 1787415153,
  "files": {
-  "mascot.py": "e8d28148bb4d6eabe21d7c14b648387e525e23b1834294f847438030a7c955f3",
+  "mascot.py": "f6ef858b674dad52833ced139f9665748dd30aa791782c36bbb6231eac46cceb",
   "parts_yeoneo/arm_key.png": "5880d3ef755195b0ab6574ec3c408940da9a49cfba4ef0419b6701d59898a8b6",
   "parts_yeoneo/arm_pen.png": "9f5989174ed0c9eb0e9b1d62040292a5122bf743d748e2e8b1943a1a6afa83d8",
   "parts_yeoneo/arm_right.png": "e8955c8085bfbd801dfdd7ae776124c0f53bbc7c263ead9811d4091a7bdea159",
@@ -477,6 +477,9 @@
   "stickers/__init__.py": "d77e3dc92cb353dced8d192c140643c6458bc3901facdf2e0a0d0830fa4244b7",
   "youtube_player.py": "8fd216056f4f61075a8646a791389b05ad0082c40864d84b16773c2302c74f2d"
  },
- "notes": [],
- "silent": true
+ "notes": [
+  "머리 위로 솟는 소품(리본·뿔 같은 것)이 타이머 카드 뒤로 숨던 것을 고쳤어요",
+  "말풍선 글자가 양옆으로 삐져나가던 것을 고쳤어요. 긴 말은 줄을 나눠 말풍선이 아래로 자랍니다",
+  "친구가 놓고 간 간식이 타이머 카드 뒤로 숨던 것도 고쳤어요"
+ ]
 }
