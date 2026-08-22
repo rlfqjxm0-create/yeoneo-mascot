@@ -1022,6 +1022,127 @@ class CharLayer:
         self.ok = False
 
 
+class MacCharLayer:
+    """맥에서 캐릭터 몸을 진짜 반투명으로 올리는 층 (CALayer 덧레이어).
+
+    윈도우는 별도 레이어 창(`CharLayer`)을 쓰지만 맥에는 그 API 가 없다.
+    대신 **본체 창의 contentView 에 CALayer 를 하나 얹고** 거기에 우리가
+    합성한 그림을 매 프레임 넣는다. 창을 새로 만들지 않으므로
+
+      · 클릭·드래그가 지금 그대로다 (Tk 창이 계속 다 받는다)
+      · 자리·크기·z순서를 따로 챙길 것이 없다
+      · 부팅 경로를 안 건드린다
+
+    는 이점이 있다. 덧레이어는 Tk 가 그린 것 **위**에 합성되므로, 캐릭터
+    위에 얹는 것(모자·간식·말풍선)도 같은 그림에 들어가 있어야 한다 —
+    시트가 draw() 끝까지 모으는 이유가 그것이다.
+
+    맥에서 한 번도 돌려 보지 못한 길이라 **기본은 꺼 둔다.** 켜는 것은
+    환경설정의 '부드러운 가장자리'이고, 어디서든 터지면 그 자리에서
+    색상키 방식으로 되돌아간다.
+    """
+
+    def __init__(self, root):
+        self.ok = False
+        self.layer = None
+        self._sz = None
+        from Quartz import CALayer                 # pyobjc (맥 번들에 있다)
+        root.update_idletasks()
+        # Tk 창 → NSView → 그 레이어. PyObjC 로만 다룬다 (ctypes 로 직접
+        # 포인터를 만지면 잘못됐을 때 그 자리서 프로세스가 죽는다).
+        from AppKit import NSApp
+        view = None
+        for w in NSApp.windows():
+            try:
+                sz = w.frame().size
+                if (abs(sz.width - root.winfo_width()) <= 2
+                        and abs(sz.height - root.winfo_height()) <= 2):
+                    view = w.contentView()
+                    break
+            except Exception:
+                pass
+        if view is None:
+            raise RuntimeError("본체 창을 못 찾음")
+        view.setWantsLayer_(True)
+        host = view.layer()
+        if host is None:
+            raise RuntimeError("레이어가 없음")
+        # **레티나 배율을 맞춘다.** CALayer 는 기본이 1배라, 2배 화면에서
+        # 우리 그림이 그대로 늘어나 가장자리가 뭉개진다 (제보 '픽셀이
+        # 깨진 듯'). 창의 backingScaleFactor 를 넣고, 그림도 그 배율로
+        # 만들어 넣는다.
+        self.scale = 1.0
+        try:
+            sc = float(view.window().backingScaleFactor())
+            if 1.0 <= sc <= 4.0:
+                self.scale = sc
+        except Exception:
+            pass
+        lay = CALayer.layer()
+        lay.setContentsScale_(self.scale)
+        lay.setContentsGravity_("topLeft")
+        # 애니메이션을 끄지 않으면 그림을 바꿀 때마다 페이드가 걸려
+        # 잔상이 남고 프레임이 밀린다.
+        lay.setActions_({"contents": None, "position": None, "bounds": None})
+        host.addSublayer_(lay)
+        self.view, self.host, self.layer = view, host, lay
+        self.ok = True
+
+    def push(self, im, _x=None, _y=None):
+        """합성한 그림을 덧레이어에 올린다 (알파는 미리 곱한다 — 지뢰 117).
+
+        레티나면 그 배율로 키워서 넣는다 — contentsScale 만 올리고 그림은
+        1배로 두면 반대로 절반 크기로 나온다.
+        """
+        if self.scale > 1.01:
+            im = im.resize((max(1, int(round(im.width * self.scale))),
+                            max(1, int(round(im.height * self.scale)))),
+                           Image.LANCZOS)
+        from Foundation import NSData
+        from Quartz import (CATransaction, CGColorSpaceCreateDeviceRGB,
+                            CGDataProviderCreateWithCFData, CGImageCreate,
+                            kCGImageAlphaPremultipliedLast)
+        w, h = im.size
+        raw = im.convert("RGBa").tobytes("raw", "RGBa")
+        data = NSData.dataWithBytes_length_(raw, len(raw))
+        prov = CGDataProviderCreateWithCFData(data)
+        img = CGImageCreate(w, h, 8, 32, w * 4,
+                            CGColorSpaceCreateDeviceRGB(),
+                            kCGImageAlphaPremultipliedLast, prov, None,
+                            False, 0)
+        if img is None:
+            raise RuntimeError("CGImage 못 만듦")
+        CATransaction.begin()
+        CATransaction.setDisableActions_(True)
+        try:
+            b = self.view.bounds()
+            if self._sz != (b.size.width, b.size.height):
+                self._sz = (b.size.width, b.size.height)
+                self.layer.setFrame_(b)
+            self.layer.setContents_(img)
+        finally:
+            CATransaction.commit()
+        return True
+
+    def hide(self):
+        try:
+            from Quartz import CATransaction
+            CATransaction.begin()
+            CATransaction.setDisableActions_(True)
+            self.layer.setContents_(None)
+            CATransaction.commit()
+        except Exception:
+            pass
+
+    def destroy(self):
+        try:
+            self.layer.removeFromSuperlayer()
+        except Exception:
+            pass
+        self.layer = None
+        self.ok = False
+
+
 class _CharSheet:
     """캐릭터를 PIL 그림 한 장에 모으는, 캔버스인 척하는 물건 (매끈 경로).
 
@@ -5341,14 +5462,29 @@ class Mascot:
         self._smooth_spill = 0       # 시트가 못 알아봐 캔버스로 넘어간 그림 수
         self._soft_cache = {}        # 매끈한 둥근 도형 그림 (카드·말풍선·단추)
         self._pilfont_cache = {}     # 시트에 글자를 그릴 때 쓰는 글꼴
-        _sb = self.us.get("smooth_body",
-                          self.cfg.get("smooth_body", False))
+        # 맥은 **열쇠가 따로다**(smooth_body_mac). 맥에서 한 번도 못 돌려 본
+        # 길이라 기본을 꺼 두고, 사람이 환경설정에서 켜게 한다.
+        _key = "smooth_body_mac" if IS_MAC else "smooth_body"
+        _sb = self.us.get(_key, self.cfg.get(_key, False))
         if isinstance(_sb, str):     # 손으로 고친 설정 파일 대비
             _sb = _sb.strip().lower() not in ("", "0", "false", "no")
         # 정한 값을 설정에 적어 둔다 — 환경설정 창이 이 값을 그대로 보여야
         # '켜져 있는데 꺼짐으로 보이고, 저장하면 꺼지는' 일이 안 생긴다.
-        self.us["smooth_body"] = bool(_sb)
-        self._smooth_on = bool(IS_WIN and _sb and not SMOOTH_OFF)
+        self.us[_key] = bool(_sb)
+        self._smooth_key = _key
+        # **켜다 죽으면 다음에 스스로 꺼진다.** 첫 프레임을 올리기 전에
+        # 표시를 남기고, 한 번 성공하면 지운다. 표시가 남은 채로 켜졌다는
+        # 것은 지난번에 그 자리서 죽었다는 뜻이다 (맥 검증을 못 해 둔다).
+        self._smooth_try_path = os.path.join(self.state_dir, ".smooth_try")
+        if _sb and os.path.exists(self._smooth_try_path):
+            _sb = False
+            self.us[_key] = False
+            self._smooth_why = "지난번에 켜다 멈춰서 꺼 뒀어요"
+            try:
+                os.remove(self._smooth_try_path)
+            except Exception:
+                pass
+        self._smooth_on = bool((IS_WIN or IS_MAC) and _sb and not SMOOTH_OFF)
         self._load_parts()
 
         # 상태 변수는 한곳에 모아 둔다. 새 값을 넣을 자리를 헤매지
@@ -6117,7 +6253,7 @@ class Mascot:
                                  Image.LANCZOS)
             self.layout[nm9] = self._prop_at(key9)
             pil_cache[nm9] = im9
-            self.im[nm9] = ImageTk.PhotoImage(self._hard(im9))
+            self.im[nm9] = self._tkimg(self._hard(im9), im9)
             self.has[nm9] = True
             self._prop_bits.append(nm9)
             self._prop_bit_cfg[nm9] = mo_all.get(nm9) or {}
@@ -6154,7 +6290,7 @@ class Mascot:
                             max(1, round(im.height * s))), Image.LANCZOS)
         self.layout["prop_back"] = self._prop_at(name)
         pil_cache["prop_back"] = im
-        self.im["prop_back"] = ImageTk.PhotoImage(self._hard(im))
+        self.im["prop_back"] = self._tkimg(self._hard(im), im)
         self.has["prop_back"] = True
         # 기본 몸 뒤 파츠를 숨길지는 **캐릭터가 정한다.**
         # back.png 는 캐릭터마다 뜻이 다르다 — 기뽀는 요정 날개지만
@@ -6317,7 +6453,8 @@ class Mascot:
                               and name in self.layout)
             if self.has[name]:
                 pil_cache[name] = load_pil(name)
-                self.im[name] = ImageTk.PhotoImage(firm(name, pil_cache[name]))
+                self.im[name] = self._tkimg(firm(name, pil_cache[name]),
+                                            pil_cache[name])
 
         # 소품(prop1..N) — 켤 때마다 하나만 랜덤으로. 고른 것을 "prop"으로
         # 이름 붙여 두면 overlays 순서대로 얼굴 위에 함께 그려진다.
@@ -6527,7 +6664,7 @@ class Mascot:
         im = im.resize((max(8, round(im.width * k)), max(8, round(im.height * k))),
                        Image.LANCZOS)
         im = im.rotate(14, expand=True, resample=self._resample())
-        self.im["hat"] = ImageTk.PhotoImage(self._hard(im))
+        self.im["hat"] = self._tkimg(self._hard(im), im)
         self.has["hat"] = True
 
     TILT_PAD = 70                    # 회전 여유 (잘려나가지 않게 캔버스를 넓혀 합성)
@@ -12030,7 +12167,7 @@ class Mascot:
                                 for x in range(im.width):
                                     if a[x, y] and random.random() > keep:
                                         px[x, y] = (0, 0, 0, 0)
-                            lv.append(ImageTk.PhotoImage(self._hard(im)))
+                            lv.append(self._tkimg(self._hard(im), im))
                     made.append(lv)
                 self.fx_imgs[kind] = made
         except Exception:
@@ -14276,7 +14413,13 @@ class Mascot:
         if lay is not None:
             return lay
         try:
-            lay = CharLayer(self.root)
+            # 켜다 죽는 경우를 위해 표시를 먼저 남긴다 (첫 성공에 지운다)
+            try:
+                with open(self._smooth_try_path, "w") as fp:
+                    fp.write("1")
+            except Exception:
+                pass
+            lay = MacCharLayer(self.root) if IS_MAC else CharLayer(self.root)
             if not lay.ok:
                 raise RuntimeError("layer not ok")
         except Exception:
@@ -14284,8 +14427,9 @@ class Mascot:
             self._smooth_off("만들기 실패")
             return None
         self._char_lay = lay
-        lay.place_above(self._main_hwnd)
-        self._safe("smooth_bind", self._bind_char_layer, lay)
+        if not IS_MAC:
+            lay.place_above(self._main_hwnd)
+            self._safe("smooth_bind", self._bind_char_layer, lay)
         return lay
 
     def _pil_font(self, px, bold=False):
@@ -14375,8 +14519,25 @@ class Mascot:
             # 켜진 상태는 그대로 두어야 되돌아올 때 다시 그려진다.
             return
         try:
-            ok = lay.push(sheet.im, self.root.winfo_rootx(),
-                          self.root.winfo_rooty())
+            if IS_MAC:
+                ok = lay.push(sheet.im)
+            else:
+                ok = lay.push(sheet.im, self.root.winfo_rootx(),
+                              self.root.winfo_rooty())
+            if ok and self._smooth_try_path:
+                # 한 프레임 올라갔다 = 이 컴퓨터에서 되는 길이다.
+                # **무엇이 켜졌는지 기록에 남긴다** — 맥은 눈으로 못 봐서
+                # 제보를 받을 때 이 줄 하나로 갈린다.
+                try:
+                    os.remove(self._smooth_try_path)
+                except Exception:
+                    pass
+                self._smooth_try_path = None
+                if IS_MAC:
+                    self._safe("mac_smooth_log", self._mac_log,
+                               "매끈 덧레이어 켜짐 — 화면배율 %.2f · 그림 %dx%d"
+                               % (getattr(lay, "scale", 1.0),
+                                  sheet.im.width, sheet.im.height))
         except Exception:
             ok, _ = False, self._log_error("smooth_push")
         if not ok:
@@ -14425,6 +14586,14 @@ class Mascot:
         except Exception:
             pass
         if not quiet:
+            # 맥은 검증을 못 한 길이라, 한 번 실패하면 설정에도 꺼 둔다 —
+            # 다음에 켤 때 같은 자리서 또 멈추지 않게.
+            if IS_MAC:
+                try:
+                    self.us[getattr(self, "_smooth_key", "smooth_body_mac")]                         = False
+                    self._save_settings()
+                except Exception:
+                    pass
             try:
                 self._log_error("smooth_off:%s" % self._smooth_why)
             except Exception:
@@ -14486,6 +14655,21 @@ class Mascot:
             return
         cv.create_image(cx - r - 1, cy - r - 1, image=got, anchor="nw")
 
+    def _tkimg(self, im, soft=None):
+        """ImageTk 로 바꾸면서 **매끈 경로가 쓸 원본을 달아 둔다.**
+
+        시트가 원본을 못 찾으면 그 그림만 진짜 캔버스로 새고, 캔버스는
+        캐릭터 레이어보다 아래라 **캐릭터 뒤에 그려진다** — 간식과 쓰담
+        손이 그렇게 숨었다. 캐릭터 위에 얹는 그림은 전부 이 함수로
+        만들 것. `soft` 를 주면 그것을(이분화 전 원본) 달아 둔다.
+        """
+        ph = ImageTk.PhotoImage(im)
+        try:
+            ph._pil_src = im if soft is None else soft
+        except Exception:
+            pass
+        return ph
+
     def _pic(self, im, edge=False, soft=False):
         """캐시에 담을 그림 한 장 — 지금 경로에 맞는 형태로 만든다.
 
@@ -14497,9 +14681,8 @@ class Mascot:
         if self._smooth:
             return im
         if soft:                     # 부르는 쪽이 이미 손봐 둔 그림
-            return ImageTk.PhotoImage(im)
-        return ImageTk.PhotoImage(self._hard_edge(im) if edge
-                                  else self._hard(im))
+            return self._tkimg(im)
+        return self._tkimg(self._hard_edge(im) if edge else self._hard(im), im)
 
     def _put(self, name, x, y, anchor="nw"):
         """파츠 이미지 그리기. 파일이 없으면 조용히 건너뛴다(업데이트 끊김 대비)."""
@@ -17782,11 +17965,11 @@ class Mascot:
                 lambda ry: toggle(ry, "타블렛 낙서 표시", "trail"),
                 lambda ry: toggle(ry, "항상 위에 표시", "topmost"),
             ]
-            if IS_WIN:
-                # 맥에는 이 길이 없다(UpdateLayeredWindow 가 없음). 켜도
-                # 아무 일이 안 일어나는 항목이 보이면 제보가 온다.
-                disp.append(lambda ry: toggle(ry, "부드러운 가장자리",
-                                              "smooth_body"))
+            # 맥은 열쇠가 따로다 — 기본 꺼짐이고, 켜 본 뒤 이상하면
+            # 여기서 다시 끄면 된다 (실패하면 스스로도 꺼진다).
+            disp.append(lambda ry: toggle(
+                ry, "부드러운 가장자리",
+                "smooth_body_mac" if IS_MAC else "smooth_body"))
             if getattr(sys, "frozen", False):
                 disp.append(lambda ry: toggle(ry, "윈도우 시작 시 자동 실행",
                                               "autostart"))
@@ -17986,8 +18169,8 @@ class Mascot:
                             or bool(new["shadow"]) != bool(self.us.get("shadow", True))
                             # 가장자리 방식은 파츠 캐시가 통째로 달라진다
                             # (한쪽은 PIL, 한쪽은 ImageTk) — 다시 켜는 게 안전하다
-                            or (bool(new.get("smooth_body"))
-                                != bool(self.us.get("smooth_body"))))
+                            or (bool(new.get(self._smooth_key))
+                                != bool(self.us.get(self._smooth_key))))
             old_slime = self.us.get("slime_kind")
             # 방 코드가 바뀌면 붙어 있던 연결을 끊는다 — 안 그러면 옛 방에
             # 계속 앉아 있는다 (RoomNet 은 만들 때의 코드를 그대로 쓴다).
@@ -32365,7 +32548,7 @@ class Mascot:
             im = im.rotate(-ang, resample=Image.BICUBIC, expand=True)
             a = im.getchannel("A")      # 돌리면 가장자리가 흐려진다 — 다시 굽는다
             im.putalpha(a.point(lambda v: 255 if v >= 128 else 0))
-        got = ImageTk.PhotoImage(im)
+        got = self._tkimg(im)
         if len(self._hand_cache) > 24:
             for k2 in list(self._hand_cache)[:12]:
                 self._hand_cache.pop(k2, None)
