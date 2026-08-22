@@ -253,10 +253,17 @@ class _MacChromaKey:
                 for i in range(n)]
 
     def apply_all(self):
-        """이 앱의 모든 창에 필터를 건다.
+        """색상키를 칠하는 창에만 필터를 건다.
 
         말풍선·할 일 패널은 나중에 생기므로 주기적으로 다시 부른다. 이미 걸린 창은
-        건너뛰므로 반복 호출이 싸다. 키 색만 지우는 필터라 다른 창에 걸려도 무해하다.
+        건너뛰므로 반복 호출이 싸다.
+
+        **모든 창에 걸면 안 된다.** 예전에는 '키 색만 지우는 필터라 다른 창에
+        걸려도 무해하다'고 두었는데, 그건 보이는 모습 이야기였다. 이 필터는
+        레이어 합성 단계의 CIColorCube 라, 걸린 창은 **다시 그릴 때마다**
+        64^3 색 큐브를 지난다. 60fps 로 도는 수박게임 창에 걸리니 맥에서
+        앱이 멈춘 것처럼 느려졌다 (사가·퀸시 제보). `want` 를 주면 그 창들만
+        건드린다 — 못 고르면(빈 값) 예전처럼 전부 건다.
         """
         if not self.filter:
             return 0
@@ -277,6 +284,9 @@ class _MacChromaKey:
                 if self._srgb is None:
                     self._srgb = self._hold(self._msg(
                         self._cls("NSColorSpace"), "sRGBColorSpace"))
+                # **매번 다시 건다.** 한 번만 걸도록 아꼈다가 되돌렸다 —
+                # 화면을 옮기면 창의 색공간이 화면 프로필로 되돌아가는데
+                # (지뢰 66, 사가 신티크 검은 줄), 한 번만 걸면 그때 못 잡는다.
                 if self._srgb:
                     self._msg(w, "setColorSpace:", self._srgb,
                               argtypes=(ctypes.c_void_p,))
@@ -6686,8 +6696,12 @@ class Mascot:
         # 그림 위쪽에 빈 여백이 큰 캐릭터(햄북이 86px)는 카드와 머리가
         # 늘 그만큼 떨어진다 — 여백만큼 캐릭터를 올려 틈을 좁힌다.
         lift = int(self.cfg.get("char_lift", 0))
-        # 사람이 환경설정에서 직접 맞추는 보정 (머리가 카드에 겹치면 +)
-        gap = max(-20, min(60, int(self.us.get("card_gap") or 0)))
+        # 사람이 환경설정에서 직접 맞추는 보정 (머리가 카드에 겹치면 +).
+        # `card_gap_base` 는 그 눈금의 기준을 캐릭터마다 옮긴다 — 맨 아래
+        # (-20)까지 줄여도 아직 머니까 더 줄이게 해 달라는 요청(도로롱).
+        # 눈금 폭은 그대로 두고 0 이 가리키는 자리만 옮기는 것이다.
+        gap = (max(-20, min(60, int(self.us.get("card_gap") or 0)))
+               + int(self.cfg.get("card_gap_base", 0)))
         if self.has_clock:
             base = OY_CLOCK_OPEN if self.clock_open else OY_CLOCK_COMPACT
             return max(0, base + self._yt_bar() + GOAL_ROW
@@ -10901,11 +10915,12 @@ class Mascot:
         """상태 텍스트 폭(px) — 캔버스로 측정·캐시 (tkinter.font 의존 제거)."""
         w = self._tw_cache.get(text)
         if w is None:
-            t = self.canvas.create_text(-2000, -2000, text=text, anchor="nw",
-                                        font=(UI_FONT, 8))
-            bb = self.canvas.bbox(t)
+            cv = self._real_canvas          # 시트로 재면 안 된다 (_mw 참고)
+            t = cv.create_text(-2000, -2000, text=text, anchor="nw",
+                               font=(UI_FONT, 8))
+            bb = cv.bbox(t)
             w = (bb[2] - bb[0]) if bb else len(text) * 11
-            self.canvas.delete(t)
+            cv.delete(t)
             self._tw_cache[text] = w
         return w
 
@@ -13829,11 +13844,16 @@ class Mascot:
             # 다시 재는 값이라 비워도 그림은 그대로다.
             if len(self._tw_cache) > self.TW_CACHE_MAX:
                 self._tw_cache.clear()
-            t = self.canvas.create_text(-3000, -3000, text=text, anchor="nw",
-                                        font=font)
-            bb = self.canvas.bbox(t)
+            # **진짜 캔버스로 잰다.** 몸을 그리는 동안에는 self.canvas 가
+            # 시트를 가리키는데, 시트는 잴 수 없어 `글자수 × 11` 이라는
+            # 대충값으로 떨어진다 — 말풍선이 글자보다 좁아져 양옆이 잘렸다
+            # (제보). 21자짜리 말이 231 로 나왔고 실제는 272 였다.
+            cv = self._real_canvas
+            t = cv.create_text(-3000, -3000, text=text, anchor="nw",
+                               font=font)
+            bb = cv.bbox(t)
             w = (bb[2] - bb[0]) if bb else len(text) * 11
-            self.canvas.delete(t)
+            cv.delete(t)
             self._tw_cache[key] = w
         return w
 
@@ -13842,11 +13862,12 @@ class Mascot:
         key = ("__height__", font)
         h = self._tw_cache.get(key)
         if h is None:
-            t = self.canvas.create_text(-3000, -3000, text="가", anchor="nw",
-                                        font=font)
-            bb = self.canvas.bbox(t)
+            cv = self._real_canvas          # 시트로 재면 안 된다 (_mw 참고)
+            t = cv.create_text(-3000, -3000, text="가", anchor="nw",
+                               font=font)
+            bb = cv.bbox(t)
             h = (bb[3] - bb[1]) if bb else 16
-            self.canvas.delete(t)
+            cv.delete(t)
             self._tw_cache[key] = h
         return h
 
@@ -24140,17 +24161,24 @@ class Mascot:
             except Exception:
                 pass
         if IS_MAC:
+            # **AppKit 모달을 Tk 콜백 안에서 열면 앱이 죽는다.**
+            # 크래시 리포트 두 건이 같은 자리를 가리켰다 —
+            #   Tk 단추 콜백 → NSOpenPanel(=NSSavePanel) runModal
+            #   → 그 모달 루프가 Tk 이벤트를 계속 돌림
+            #   → 창 이동 알림이 Tk 바인딩을 다시 부름(재진입)
+            #   → PyEval_RestoreThread 에서 fatal_error → Abort trap 6
+            # 그래서 고르기는 **다른 프로세스**에 맡긴다. 모달 루프가 이
+            # 프로세스 안에 없으니 재진입 자체가 없다.
             try:
-                from AppKit import NSOpenPanel
-                pan = NSOpenPanel.openPanel()
-                pan.setCanChooseFiles_(True)
-                pan.setCanChooseDirectories_(False)
-                pan.setAllowsMultipleSelection_(False)
-                if pan.runModal():
-                    return str(pan.URLs()[0].path())
-                return ""
+                import subprocess
+                scr = ('POSIX path of (choose file with prompt "그림 고르기" '
+                       'of type {"png","jpg","jpeg","webp","bmp"})')
+                r = subprocess.run(["osascript", "-e", scr],
+                                   capture_output=True, text=True,
+                                   timeout=600)
+                return (r.stdout or "").strip()      # 취소하면 빈 글자
             except Exception:
-                pass
+                return ""
         try:
             from tkinter import filedialog
             return filedialog.askopenfilename(
@@ -33425,6 +33453,10 @@ class Mascot:
             clear = NSColor.clearColor()
             for w in self._mac_windows():
                 try:
+                    # **건너뛰지 말 것.** '이미 투명하면 넘어간다'로 아끼려
+                    # 했다가 사가가 타이머를 아예 못 켰다 — 창이 투명해도
+                    # 그 위 뷰의 레이어는 따로 비워야 하는데, 건너뛰면 그
+                    # 일이 영영 안 일어난다 (검은 상자로 남는다).
                     w.setOpaque_(False)
                     w.setBackgroundColor_(clear)
                     # 창을 투명하게 해도 그 위를 덮는 뷰가 스스로 배경을 칠하면
