@@ -521,5 +521,7 @@
     "phase": 0.72
    }
   }
- }
+ },
+ "chips": true,
+ "prop_over_arms": true
 }
