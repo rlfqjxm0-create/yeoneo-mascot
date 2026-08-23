@@ -420,9 +420,22 @@ def main():
     try:
         _main()
     except Exception as e:
+        # **왜 못 떴는지 두 갈래로 남긴다.**
+        # ① 부모의 stderr — 그 자리는 .yt_err.txt 다. 굳힌 창 없는 exe 는
+        #    sys.stderr 가 None 일 수 있으므로 서술자 2 번에 직접 쓴다.
+        # ② 부모에게 한 줄 보고 — 예전에는 예외 **이름만** 보냈고 부모가
+        #    그것을 읽지도 않아, 기록에 '준비 못 하고 죽음' 한 줄만 남고
+        #    이유가 없었다 (멸종·젖소 도로롱 제보).
         try:
-            sys.stdout.write('@YT {"ready": false, "fatal": "%s"}\n'
-                             % type(e).__name__)
+            import traceback
+            os.write(2, ("재생기가 못 떴습니다\n"
+                         + traceback.format_exc()).encode("utf-8", "replace"))
+        except Exception:
+            pass
+        try:
+            sys.stdout.write("@YT " + json.dumps(
+                {"ready": False,
+                 "fatal": "%s: %s" % (type(e).__name__, e)}) + "\n")
             sys.stdout.flush()
         except Exception:
             pass

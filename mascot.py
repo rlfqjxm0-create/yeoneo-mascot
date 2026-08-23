@@ -2189,9 +2189,6 @@ class MacSoundPack(_MacSoundPool):
     인자만 맞춰 두고 무시한다.
     """
 
-    def play(self, key, code=None):
-        return super().play(key)
-
     def __init__(self, folder, volume=60):
         with open(os.path.join(folder, "config.json"), encoding="utf-8") as fp:
             cfg = json.load(fp)
@@ -2207,7 +2204,12 @@ class MacSoundPack(_MacSoundPool):
                 paths.append(p)
         super().__init__(paths, volume)
 
-    def play(self, key):
+    def play(self, key, code=None):
+        # **인자를 둘 받아야 한다.** 부르는 쪽은 늘
+        # `sp.play(key, self._scan_code(key))` 이고, 그 자리는
+        # `except Exception: pass` 로 감싸여 있어서 맞지 않으면 **아무 소리도
+        # 안 나면서 아무 자국도 안 남는다** — 맥에서 타자 소리가 한 번도
+        # 안 났던 원인 (사가 제보). 맥은 어느 키인지 몰라 code 는 안 쓴다.
         self._fire(hash(str(key)) % max(len(self.pool), 1))
 
     def reap(self):
@@ -2704,9 +2706,6 @@ class MacAmbientSound:
     def has(self, name):
         return str(name) in self.names
 
-    def is_on(self, name):
-        return str(name) in self.voices
-
     def on_names(self):
         return sorted(self.voices)
 
@@ -2964,6 +2963,50 @@ def list_monitors():
     return out
 
 
+def _screens_union(frames, top):
+    """NSScreen 프레임 목록을 Tk 좌표의 한 범위로 합친다. → (x, y, w, h)
+
+    맥의 화면 좌표는 **주 화면 왼쪽 아래가 0,0 이고 y 가 위로** 자란다.
+    Tk 는 주 화면 왼쪽 위가 0,0 이고 y 가 아래로 자란다. `top` 은 주 화면의
+    높이(= NS 좌표에서 주 화면 위쪽 끝)다.
+
+    맥이 없어도 검사할 수 있게 계산만 떼어 두었다.
+    """
+    if not frames:
+        return None
+    x0 = min(f[0] for f in frames)
+    x1 = max(f[0] + f[2] for f in frames)
+    y0 = min(top - (f[1] + f[3]) for f in frames)
+    y1 = max(top - f[1] for f in frames)
+    return int(x0), int(y0), int(x1 - x0), int(y1 - y0)
+
+
+def _mac_desktop_rect():
+    """맥에서 **모든 화면을 합친** 범위 (Tk 좌표). 못 구하면 None.
+
+    `winfo_screenwidth/vrootwidth` 는 맥에서 **주 화면만** 알려 준다. 그래서
+    보조 화면에 둔 창은 '화면 밖'으로 판정되어 저장해 둔 자리가 버려지고,
+    켤 때마다 주 화면 기본 자리로 돌아갔다 (사가 제보 — 캐릭터도 환경설정
+    창도 같은 이유였다).
+
+    AppKit 은 맥 번들에 반드시 있다 (지뢰 21·57). 실패하면 None 을 돌려
+    예전 판정으로 물러난다.
+    """
+    try:
+        from AppKit import NSScreen
+        scr = list(NSScreen.screens())
+        if not scr:
+            return None
+        p = scr[0].frame()                      # 첫 번째가 주 화면이다
+        top = float(p.origin.y) + float(p.size.height)
+        frames = [(float(s.frame().origin.x), float(s.frame().origin.y),
+                   float(s.frame().size.width), float(s.frame().size.height))
+                  for s in scr]
+        return _screens_union(frames, top)
+    except Exception:
+        return None
+
+
 def monitor_at(x, y):
     if IS_WIN:
         try:
@@ -3057,6 +3100,10 @@ CHARS = [
     # 어긋났는지 보는 검사가 이 자리를 건너뛴다.
     {"slot": "parts_jerry", "repo": "jerry-mascot", "name": "제리",
      "tint": "#9a9ba3", "tint_custom": True},
+    {"slot": "parts_ginggyu", "repo": "ginggyu-mascot", "name": "깅규",
+     "tint": "#8ed3f9"},
+    {"slot": "parts_hadok", "repo": "hadok-mascot", "name": "하독",
+     "tint": "#3b57d4"},
     # 소스로 도는 내 도로롱 — 자리는 선물본 쪽 그림을 빌려 쓴다
     {"slot": "parts_dororong", "repo": "dororong-mascot", "name": "도로롱",
      "tint": "#f2a7c5", "gift": False},
@@ -5352,8 +5399,12 @@ class Mascot:
         self._bubble_cookie = None   # 그 말풍선 안의 깐 포춘쿠키 (지뢰 13)
         self._cur_near = False       # 커서가 캐릭터 곁에 있는가 (지뢰 13 —
                                      # tick 이 draw 보다 먼저 이 값을 본다)
+        self._tongue_at = 0.0        # 마지막으로 날름거린 시각
+        self._tongue_cache = {}      # 칸별로 구워 둔 혀 그림
+        self._tongue_next = 0.0      # 다음 차례 (지뢰 13)
         self._face_now = None        # 지금 짓고 있는 곁표정 (지뢰 13)
         self._face_until = 0.0
+        self._face_text = ""         # 그 표정을 지을 때 한 말 (같은 말이면 유지)
         self._face_part = None       # 이번 프레임에 그릴 곁표정
         self._fortune_at = 0.0       # 이 시각이 되면 운세를 말한다 (0=없음)
         self._brief_key = None       # 브리핑을 어느 날짜로 찍을지 (지뢰 14)
@@ -5488,6 +5539,22 @@ class Mascot:
         # 정한 값을 설정에 적어 둔다 — 환경설정 창이 이 값을 그대로 보여야
         # '켜져 있는데 꺼짐으로 보이고, 저장하면 꺼지는' 일이 안 생긴다.
         self.us[_key] = bool(_sb)
+        # **config 로 한 번만 켜 주는 길.** 위에서 설정값이 config 를 이기는데
+        # 그 값은 켤 때마다 저장되므로, 한 번이라도 돈 사람은 config 를 바꿔도
+        # 안 바뀐다 — 새 맥 앱을 받은 사람에게 '환경설정에서 손으로 켜라'고
+        # 해야 했다. config 의 번호가 올라간 그때 **한 번만** config 를 따른다
+        # (lv_cut·FLOOR_FIX 와 같은 꼴). 사람이 나중에 끈 것은 그대로 지켜진다.
+        _cut = self.cfg.get("smooth_cut")
+        if _cut is not None and self.us.get("smooth_cut_at") != _cut:
+            self.us["smooth_cut_at"] = _cut
+            _sb = bool(self.cfg.get(_key, False))
+            self.us[_key] = _sb
+            if _sb:
+                # 지난 시도 표시가 남아 있으면 켜자마자 도로 꺼진다 — 깨끗이.
+                try:
+                    os.remove(os.path.join(self.state_dir, ".smooth_try"))
+                except Exception:
+                    pass
         self._smooth_key = _key
         # **켜다 죽으면 다음에 스스로 꺼진다.** 첫 프레임을 올리기 전에
         # 표시를 남기고, 한 번 성공하면 지운다. 표시가 남은 채로 켜졌다는
@@ -5671,6 +5738,8 @@ class Mascot:
         self._yt = {}                # 마지막 상태 (재생 중인지·제목)
         self._yt_want = False        # 사람이 재생을 원하는가
         self._yt_err = 0             # 마지막으로 알린 오류 (같은 말 반복 방지)
+        self._yt_fatal = ""          # 재생기가 못 뜬 이유 (자식이 보내 준다)
+        self._yt_unblocked = False   # 차단 표식 풀기를 이미 해 봤는가
         self._yt_idle = 0.0          # 멈춘 채로 지낸 시각
         self._yt_btn = None          # 버튼 자리 (x, y, 반지름)
         self._amb_btn = None         # 환경음 알약 자리 (x0,y0,x1,y1)
@@ -6481,7 +6550,8 @@ class Mascot:
         pil_cache = {}
         for name in ("body_open", "pupils", "body_mask", "lashes", "hair",
                      "eyes_closed", "head", "desk", "arm_pen",
-                     "smile", "pet1", "pet2", "scarf", "back") \
+                     "smile", "pet1", "pet2", "scarf", "back",
+                     "tongue") \
                 + tuple(self.layout.get("faces") or []):
             # 파일과 layout 위치가 둘 다 있어야 사용 (자동업데이트 섞임 대비)
             self.has[name] = (os.path.exists(os.path.join(self.parts_dir,
@@ -7072,6 +7142,18 @@ class Mascot:
             elif deco == "sushi":                  # 연어: 초밥 실루엣
                 d.ellipse([mx - 23, cy0 - 17, mx + 23, cy0 + 12],
                           fill=(0, 0, 0, 255))
+            elif deco == "ice":                    # 깅규: 각얼음 실루엣
+                d.polygon([(mx - 14, cy0 - 13), (mx - 4, cy0 - 23),
+                           (mx + 16, cy0 - 23), (mx + 16, cy0 - 1),
+                           (mx + 6, cy0 + 9), (mx - 14, cy0 + 9)],
+                          fill=(0, 0, 0, 255))
+            elif deco == "heart":                  # 하독: 하트 실루엣
+                d.ellipse([mx - 18.5, cy0 - 32, mx + 0.5, cy0 - 13],
+                          fill=(0, 0, 0, 255))
+                d.ellipse([mx - 0.5, cy0 - 32, mx + 18.5, cy0 - 13],
+                          fill=(0, 0, 0, 255))
+                d.polygon([(mx - 18.5, cy0 - 21), (mx + 18.5, cy0 - 21),
+                           (mx, cy0 - 2)], fill=(0, 0, 0, 255))
             elif deco == "tangerine":              # 레냥: 귤 실루엣
                 d.ellipse([mx - 16, cy0 - 15, mx + 16, cy0 + 13],
                           fill=(0, 0, 0, 255))
@@ -9347,6 +9429,75 @@ class Mascot:
         except Exception:
             pass
 
+    def _yt_unblock(self, root=None):
+        """우리 프로그램 폴더의 '차단 표식'을 지운다. 지운 개수를 돌려준다.
+
+        인터넷에서 받은 zip 을 풀면 윈도우가 파일마다
+        `Zone.Identifier` 라는 딸린 흐름을 붙인다. 그러면 .NET 이
+        `Python.Runtime.dll` 을 안 읽어 주고 음악 재생기가 그 자리에서
+        죽는다 (지뢰 61·131). 멸종과 젖소 도로롱이 같은 오류였다 —
+        한 사람은 원드라이브, 한 사람은 다운로드 폴더라 공통점은
+        '받은 zip 을 그냥 풀었다' 하나뿐이었다.
+
+        사람에게 '우클릭 → 속성 → 차단 해제' 를 시키는 대신 우리가
+        지운다. **범위를 좁게 잡는 것이 핵심이다** —
+          · 굳힌 배포본에서만 (소스로 도는 내 것은 표식이 없다)
+          · 우리 exe 가 있는 폴더 **안**만
+          · 프로그램 부품(.dll/.exe/.pyd)만
+        표식만 지우고 파일은 건드리지 않는다.
+        """
+        if root is None:
+            if not (IS_WIN and getattr(sys, "frozen", False)):
+                return 0
+            root = os.path.dirname(os.path.abspath(sys.executable))
+        n = 0
+        try:
+            for dirpath, _dirs, files in os.walk(root):
+                for f in files:
+                    if not f.lower().endswith((".dll", ".exe", ".pyd")):
+                        continue
+                    try:
+                        os.remove(os.path.join(dirpath, f)
+                                  + ":Zone.Identifier")
+                        n += 1
+                    except OSError:
+                        pass          # 표식이 없거나 권한이 없으면 넘어간다
+        except Exception:
+            pass
+        return n
+
+    def _yt_advice(self, fatal):
+        """재생기가 못 뜬 이유 → 사람이 할 수 있는 일. (짧게, 길게, 갈래)
+
+        멸종의 기록에서 실제로 받은 문장이 판정의 근거다 —
+            RuntimeError: Failed to resolve Python.Runtime.Loader.Initialize
+            from ...\\_internal\\pythonnet\\runtime\\Python.Runtime.dll
+        인터넷에서 받은 zip 에 윈도우가 붙인 차단 표식 때문에 .NET 이
+        그 어셈블리를 안 읽어 준다 (지뢰 61). 게다가 그 폴더가
+        원드라이브 안이라 파일이 실제로 안 내려와 있을 수도 있다.
+
+        짐작으로 늘리지 말 것 — **기록에서 본 문장에만** 길을 단다.
+        모르는 이유면 예전처럼 파일을 보라고만 한다.
+        """
+        s = str(fatal or "").lower()
+        if not s:
+            return ("음악을 켤 수 없어요 — 자세한 건 .yt_err.txt",
+                    "음악을 켤 수 없어요.", "")
+        if any(k in s for k in ("python.runtime", "pythonnet", "clr_loader",
+                                "assembly", "winerror 126")):
+            long = ("음악 프로그램이 윈도우에 막혔어요. 받은 zip 을 "
+                    "우클릭 → 속성 → '차단 해제'를 체크하고 새 폴더에 "
+                    "다시 풀어 주세요.")
+            if "onedrive" in s:
+                long += " 원드라이브 밖 폴더에 두는 게 좋아요."
+            return ("zip 을 '차단 해제'하고 다시 풀어 주세요", long, "block")
+        if any(k in s for k in ("webview2", "edge", "runtime not found")):
+            return ("WebView2 런타임을 설치해 주세요",
+                    "음악을 켜려면 마이크로소프트 WebView2 런타임이 "
+                    "필요해요. 무료로 받을 수 있어요.", "webview2")
+        return ("음악을 켤 수 없어요 — 자세한 건 .yt_err.txt",
+                "음악을 켤 수 없어요.", "")
+
     def _yt_bar(self):
         """카드 위 줄(음악·환경음)이 요구하는 여백. 아무것도 없으면 0.
 
@@ -9474,6 +9625,7 @@ class Mascot:
         self._yt_born = time.time()
         self._yt = {}
         self._yt_err = 0
+        self._yt_fatal = ""          # 지난번 이유가 남아 딴소리하지 않게
         self._yt_idle = 0.0
         q = self._yt_q = []
         threading.Thread(target=self._yt_reader, args=(self._yt_proc, q),
@@ -9615,20 +9767,50 @@ class Mascot:
                 # 한 번도 준비되지 못하고 죽었으면 사람에게 알린다.
                 # (WebView2 런타임이 없는 컴퓨터 등)
                 if self._yt_want and not self._yt.get("ready"):
-                    self._say("음악을 켤 수 없어요.", 4.0)
+                    # 이유를 알면 **무엇을 하면 되는지** 말해 준다.
+                    # '음악을 켤 수 없어요' 만으로는 사람이 할 수 있는
+                    # 일이 없다 (멸종은 그 말만 보고 스물세 번 눌렀다).
+                    short, long, kind = self._yt_advice(
+                        getattr(self, "_yt_fatal", ""))
+                    # 막힌 것이면 사람에게 시키지 말고 우리가 풀어 본다.
+                    # 한 번만 — 안 풀리면 안내로 물러난다.
+                    if kind == "block" and not self._yt_unblocked:
+                        self._yt_unblocked = True
+                        n = 0
+                        try:
+                            n = self._yt_unblock()
+                        except Exception:
+                            self._log_error("yt_unblock")
+                        self._safe("yt_unblock_log", self._yt_log,
+                                   "차단 표식 지움: %d개" % n)
+                        if n:
+                            short = "막힌 것을 풀었어요 — 다시 눌러 주세요"
+                            long = ("음악 프로그램이 윈도우에 막혀 있어서 "
+                                    "풀어 봤어요. 한 번 더 눌러 주세요.")
+                    self._say(long, 10.0 if kind else 4.0)
                     # **홈 창에도 띄운다.** 플레이리스트는 홈에서 누르는데
                     # 캐릭터 말풍선만 뜨면 못 본다 — '눌러도 아무 일이
                     # 없다'로 보인다 (멸종 제보).
-                    self._room_toast = ("음악을 켤 수 없어요 — 자세한 건 "
-                                        ".yt_err.txt", time.time())
+                    self._room_toast = (short, time.time())
                     self._safe("yt_dead_log", self._yt_log,
-                               "재생기가 준비 못 하고 죽음")
+                               "재생기가 준비 못 하고 죽음"
+                               + (" — " + self._yt_fatal
+                                  if getattr(self, "_yt_fatal", "") else ""))
                 self._yt_forget()
                 return
             try:
                 s = json.loads(line)
             except ValueError:
                 continue
+            if s.get("fatal"):
+                # **자식이 왜 못 떴는지 보내 온 것.** 예전에는 이 값을
+                # 아무도 안 읽어서 .yt_err.txt 에 '준비 못 하고 죽음'
+                # 한 줄만 남고 이유가 없었다 — 멸종·젖소 도로롱의 기록
+                # 둘 다 자식 자국이 0줄이었다. 답은 오고 있었는데 받는
+                # 쪽에서 버리고 있던 것이다 (지뢰 51 과 같은 이야기).
+                self._yt_fatal = str(s.get("fatal"))[:300]
+                self._safe("yt_fatal", self._yt_log,
+                           "재생기가 못 떴어요: " + self._yt_fatal)
             was = self._yt.get("title", "")
             self._yt = s
             if s.get("signed") and not self.us.get("yt_signed"):
@@ -9643,11 +9825,30 @@ class Mascot:
                     # 플레이리스트 중 막힌 곡(임베드 금지 등)은 건너뛴다.
                     # 전부 막혀 있으면 한 바퀴 돌고 멈춘다 (무한 넘김 방지).
                     self._pl_skip += 1
-                    if self._pl_skip >= max(1, len(self._room_pl_songs())):
+                    songs = self._room_pl_songs()
+                    t = (songs[self._pl_i]["t"]
+                         if 0 <= self._pl_i < len(songs) else "")
+                    # **어느 곡이 왜 막혔는지 남긴다.** 예전에는 번호도
+                    # 곡도 안 남겨서, '누굴 눌러도 딴 사람 노래가 나온다'
+                    # 는 제보가 와도 임베드 금지인지 다른 오류인지 가를
+                    # 길이 없었다 (지뢰 131 과 같은 이야기).
+                    self._safe("pl_err_log", self._yt_log,
+                               "곡을 못 틀었어요 (오류 %d) %s · %s"
+                               % (err, str(t)[:60],
+                                  str(getattr(self, "_pl_url", ""))[:120]))
+                    # **홈 창에도 띄운다.** 플레이리스트는 홈에서 누르는데
+                    # 캐릭터 말풍선만 뜨면 못 본다 — 곡이 저절로 넘어간
+                    # 것처럼만 보인다 (젖소 도로롱·멸종 제보).
+                    why = ("막아 둔 영상" if err in (101, 150)
+                           else self.YT_ERRS.get(err, "오류 %d" % err))
+                    if self._pl_skip >= max(1, len(songs)):
                         self._pl_stop()
                         self._say("틀 수 있는 노래가 없네요.", 4.0)
+                        self._room_toast = ("틀 수 있는 노래가 없어요 (%s)"
+                                            % why, time.time())
                     else:
                         self._say("이 노래는 막혀 있어요 — 다음 곡!", 3.0)
+                        self._room_toast = ("건너뜀 — %s" % why, time.time())
                         self._safe("pl_next", self._pl_play, self._pl_i + 1)
                 else:
                     self._yt_want = False
@@ -10163,6 +10364,14 @@ class Mascot:
                 vh = u32.GetSystemMetrics(79)
                 return (vx - 40 <= x <= vx + vw - 60
                         and vy - 20 <= y <= vy + vh - 60)
+            # 맥은 화면이 여럿일 수 있는데 winfo_screenwidth 는 주 화면만
+            # 알려 준다 — 보조 화면에 둔 창이 '화면 밖'이 되어 자리가
+            # 버려졌다 (사가 제보).
+            rect = _mac_desktop_rect() if IS_MAC else None
+            if rect:
+                vx, vy, vw, vh = rect
+                return (vx - 40 <= x <= vx + vw - 60
+                        and vy - 20 <= y <= vy + vh - 60)
             sw = self.root.winfo_screenwidth()
             sh = self.root.winfo_screenheight()
             return -40 <= x <= sw - 60 and -20 <= y <= sh - 60
@@ -10575,10 +10784,18 @@ class Mascot:
             x, y = int(d["win_x"]), int(d["win_y"])
         except Exception:
             return base
-        vx = self.root.winfo_vrootx() if hasattr(self.root, "winfo_vrootx") else 0
-        vy = self.root.winfo_vrooty() if hasattr(self.root, "winfo_vrooty") else 0
-        vw = max(self.root.winfo_vrootwidth(), sw)
-        vh = max(self.root.winfo_vrootheight(), sh)
+        # 맥은 vroot 도 **주 화면만** 알려 준다 — 보조 화면에 둔 캐릭터가
+        # 켤 때마다 주 화면 기본 자리로 돌아간 원인 (사가 제보).
+        rect = _mac_desktop_rect() if IS_MAC else None
+        if rect:
+            vx, vy, vw, vh = rect
+        else:
+            vx = (self.root.winfo_vrootx()
+                  if hasattr(self.root, "winfo_vrootx") else 0)
+            vy = (self.root.winfo_vrooty()
+                  if hasattr(self.root, "winfo_vrooty") else 0)
+            vw = max(self.root.winfo_vrootwidth(), sw)
+            vh = max(self.root.winfo_vrootheight(), sh)
         if (x + self.W < vx + 40 or x > vx + vw - 40
                 or y + self.H < vy + 40 or y > vy + vh - 40):
             return base                      # 그 자리에 이제 화면이 없다
@@ -11368,6 +11585,39 @@ class Mascot:
                 sx2, cy2 = mx + dx2, y0 - 8
                 c.create_line(sx2 - 4, cy2 + half, sx2 + 4, cy2 - half,
                               fill="#f8cfb6", width=2, capstyle="round")
+        elif deco == "ice":
+            # 깅규: 각얼음 한 덩이 (윗면·앞면·옆면으로 각을 낸다)
+            mx = (x0 + x1) / 2
+            top, front, side = "#dcf2fd", "#a9ddf8", "#86c8ee"
+            line = "#3f5560"
+            c.create_polygon(mx - 14, y0 - 13, mx - 4, y0 - 23,
+                             mx + 16, y0 - 23, mx + 6, y0 - 13,
+                             fill=top, outline=line, width=2)
+            c.create_polygon(mx - 14, y0 - 13, mx + 6, y0 - 13,
+                             mx + 6, y0 + 9, mx - 14, y0 + 9,
+                             fill=front, outline=line, width=2)
+            c.create_polygon(mx + 6, y0 - 13, mx + 16, y0 - 23,
+                             mx + 16, y0 - 1, mx + 6, y0 + 9,
+                             fill=side, outline=line, width=2)
+            self._oval(c, mx - 10, y0 - 20, mx - 2, y0 - 16,
+                       fill="#ffffff", outline="")
+        elif deco == "heart":
+            # 하독: 파란 하트 (몸도 하트 모양이다). 광은 넣지 않는다.
+            # **꼬리까지 카드 위에** 둔다 — 아래가 잘리면 하트로 안 보인다.
+            # 그래서 이 캐릭터는 card_top 을 넉넉히(34) 잡아 둔다.
+            mx = (x0 + x1) / 2
+            col, hw = "#3f6fd6", 38
+            img = self._soft_heart(hw, col)
+            if img is not None:
+                c.create_image(mx - img.width() / 2,
+                               y0 - 2 - img.height(), image=img, anchor="nw")
+            else:                       # 매끈하게 못 만들면 도형으로
+                r, cy = hw / 4.0, y0 - 2 - hw * 0.75 + hw / 4.0
+                for ex in (mx - hw / 4.0, mx + hw / 4.0):
+                    self._oval(c, ex - r, cy - r, ex + r, cy + r,
+                               fill=col, outline="")
+                c.create_polygon(mx - hw / 2.0, cy, mx + hw / 2.0, cy,
+                                 mx, y0 - 2, fill=col, outline="")
         elif deco == "tangerine":
             # 레냥: 귤 한 알 (열매 + 초록 꼭지잎)
             mx = (x0 + x1) / 2
@@ -11580,12 +11830,27 @@ class Mascot:
         return random.choice(pool)
 
     def _face_show(self, text=None, secs=None, now=None):
-        """곁표정을 짓는다. 그릴 것이 없으면 아무 일도 안 한다."""
+        """곁표정을 짓는다. 그릴 것이 없으면 아무 일도 안 한다.
+
+        **같은 말이 이어지는 동안에는 다시 뽑지 않는다.** 스트레칭 알림은
+        말풍선을 붙잡아 두려고 매 프레임 `_say` 를 부르는데, 그때마다
+        새로 뽑으면 `_face_for` 가 무작위로 고르므로 초당 수십 번 얼굴이
+        바뀐다 — '표정이 엄청 빠르게 깜빡거린다'(사가 제보). 곁표정이
+        있는 캐릭터가 사가뿐이라 다른 사람에게는 안 보였다.
+        시간이 다 되어 표정이 내려간 뒤에 같은 말을 또 하면 그때는
+        새로 뽑는다.
+        """
+        now = time.time() if now is None else now
+        if (self._face_now and now < self._face_until
+                and str(text or "") == self._face_text):
+            self._face_until = max(self._face_until,
+                                   now + float(secs or self.FACE_SECS))
+            return self._face_now
         pick = self._face_for(text)
         if not pick:
             return None
-        now = time.time() if now is None else now
         self._face_now = pick
+        self._face_text = str(text or "")
         self._face_until = now + float(secs or self.FACE_SECS)
         return pick
 
@@ -14689,6 +14954,7 @@ class Mascot:
         for cache in (getattr(self, "_tilt_cache", None),
                       getattr(self, "_back_cache", None),
                       getattr(self, "_arm_cache", None),
+                      getattr(self, "_tongue_cache", None),
                       getattr(self, "_pet_cache", None)):
             try:
                 cache.clear()
@@ -14762,6 +15028,46 @@ class Mascot:
             for old in list(self._soft_cache)[:self.SOFT_MAX // 2]:
                 self._soft_cache.pop(old, None)
         self._soft_cache[ck] = got
+        return got
+
+    def _soft_heart(self, w, fill, pad=2):
+        """매끈한 납작 하트 한 장 (캐시). 실패하면 None.
+
+        흔한 하트 = **동그라미 둘 + 아래 세모**. Tk 로 그리면 셋이 만나는
+        자리가 계단지므로 4배로 그려 줄이고 가장자리를 키 색과 섞는다
+        (지뢰 65·124 — 카드·말풍선이 쓰는 그 방법).
+
+        가로 w 를 주면 높이는 0.75w 가 된다 (흔한 하트의 비율).
+        """
+        w = int(round(w))
+        h = int(round(w * 0.75))
+        ck = ("heart", w, fill, pad, self.canvas_bg)
+        got = self._soft_cache.get(ck)
+        if got is not None:
+            return got
+        try:
+            S = 4
+            iw, ih = w + pad * 2, h + pad * 2
+            im = Image.new("RGBA", (iw * S, ih * S), (0, 0, 0, 0))
+            d = ImageDraw.Draw(im)
+            o = pad * S
+            W, H = w * S, h * S
+            r = W / 4.0
+            for cx in (o + r, o + W - r):
+                d.ellipse([cx - r, o, cx + r, o + 2 * r], fill=fill)
+            d.polygon([(o, o + r), (o + W, o + r), (o + W / 2.0, o + H)],
+                      fill=fill)
+            im = im.resize((iw, ih), Image.LANCZOS)
+            key2 = tuple(int(str(self.canvas_bg)[i:i + 2], 16)
+                         for i in (1, 3, 5))
+            got = ImageTk.PhotoImage(flat_on_key(im, key2))
+            got._pil_src = im        # 매끈 경로의 시트가 알아보게 (지뢰 128)
+            if len(self._soft_cache) > 240:
+                for old in list(self._soft_cache)[:120]:
+                    self._soft_cache.pop(old, None)
+            self._soft_cache[ck] = got
+        except Exception:
+            return None
         return got
 
     def _soft_circle(self, cv, cx, cy, r, fill, outline, lw=None):
@@ -16902,6 +17208,10 @@ class Mascot:
             self._safe("prop_back", self._draw_prop_back, now, yo)
         bx, by = self._pos("body_open")
         self._safe("body", self._put, "body_open", bx, by + yo)
+        # 뱀 혓바닥 — 몸 위·머리 아래 (PSD 레이어 차례 그대로).
+        # 머리를 뒤에 그리므로 위로 밀면 저절로 입 안으로 들어간다.
+        if self.has.get("tongue"):
+            self._safe("tongue", self._draw_tongue, now, yo)
         if not self.has.get("head"):
             self._safe("face", self._draw_face, yo, pdx, pdy, blinking, smiling)
         elif head_early:                # 준사: 책상·팔이 머리 위 (PSD 순서)
@@ -17235,6 +17545,65 @@ class Mascot:
             self._pen_vec = ((tipx * s + m) - ax, tipy * s - ay)
         except Exception:
             self._pen_vec = None
+
+    # ── 뱀 혓바닥 (하독) ──────────────────────────────────────────────
+    # 쉭— 하고 두 번 날름거렸다 들어간다. 머리를 나중에 그리므로 위로
+    # 밀어 넣기만 하면 입 안으로 사라진다 — 파츠를 껐다 켤 필요가 없다.
+    TONGUE_GAP = (2.6, 7.0)      # 쉭쉭 사이 쉬는 시간 (초)
+    TONGUE_OUT = 0.28            # 한 번 내밀었다 넣는 데 걸리는 시간
+    TONGUE_TIMES = 2             # 한 번에 몇 번 (쉭·쉭)
+
+    def _tongue_ext(self, now):
+        """지금 혀가 얼마나 나와 있나 — 0(숨음) ~ 1(끝까지)."""
+        if now >= self._tongue_next:
+            self._tongue_at = now
+            self._tongue_next = now + random.uniform(*self.TONGUE_GAP)
+        t = now - self._tongue_at
+        span = self.TONGUE_OUT * self.TONGUE_TIMES
+        if t < 0.0 or t > span:
+            return 0.0
+        u = (t % self.TONGUE_OUT) / self.TONGUE_OUT
+        return math.sin(u * math.pi) ** 0.7        # 쑥 나왔다 쏙 들어감
+
+    TONGUE_STEPS = 10            # 미리 구워 두는 칸 수
+
+    def _tongue_pic(self, k):
+        """혀를 위에서 k/N 만큼만 남긴 그림. 칸마다 한 번만 굽는다.
+
+        **위로 밀어 숨기는 방법은 안 된다** — 몸이 불투명이라 안 가려지고
+        얼굴 위에 빨간 자국으로 남는다 (찍어서 확인했다). 입에서 스르륵
+        나오게 하려면 나온 만큼만 잘라 그려야 한다.
+        """
+        got = self._tongue_cache.get(k)
+        if got is not None:
+            return got
+        src = self._pil_cache.get("tongue")
+        if src is None:
+            return None
+        h = max(1, int(round(src.height * k / self.TONGUE_STEPS)))
+        im = src.crop((0, 0, src.width, h))
+        firm = im if "tongue" in self._soft_parts else self._hard(im)
+        got = (im, self._tkimg(firm, im))
+        self._tongue_cache[k] = got
+        return got
+
+    def _draw_tongue(self, now, yo):
+        """혓바닥 — 입에서 나온 만큼만 그린다. 다 들어가면 안 그린다."""
+        e = 0.0 if self._force.get("sleep") else self._tongue_ext(now)
+        k = int(round(e * self.TONGUE_STEPS))
+        if k <= 0:
+            return                                 # 입 안 — 아무것도 없다
+        got = self._tongue_pic(k)
+        if not got:
+            return
+        pil, tk = got
+        tx, ty = self._pos("tongue")
+        dx = math.sin(now * 30.0) * 2.6 * self.s * e
+        sh = self._sheet
+        if sh is not None:
+            sh.blit(pil, tx + dx, ty + yo, "nw")
+        else:
+            self.canvas.create_image(tx + dx, ty + yo, image=tk, anchor="nw")
 
     def _draw_pen_hand(self):
         """펜 쥔 손. 퀸시처럼 펜이 맨 위 레이어인 캐릭터는 머리를 그린 뒤 호출.
@@ -17642,6 +18011,21 @@ class Mascot:
                     cv.create_line(sx2 - 4, y + half, sx2 + 4, y - half,
                                    fill="#f8cfb6", width=2,
                                    capstyle="round")
+            elif deco == "ice":                # 깅규: 각얼음
+                cv.create_polygon(mx - 16, y + 2, mx - 5, y - 9,
+                                  mx + 18, y - 9, mx + 7, y + 2,
+                                  fill="#dcf2fd", outline="#3f5560", width=2)
+                cv.create_polygon(mx - 16, y + 2, mx + 7, y + 2,
+                                  mx + 7, y + 24, mx - 16, y + 24,
+                                  fill="#a9ddf8", outline="#3f5560", width=2)
+                cv.create_polygon(mx + 7, y + 2, mx + 18, y - 9,
+                                  mx + 18, y + 13, mx + 7, y + 24,
+                                  fill="#86c8ee", outline="#3f5560", width=2)
+            elif deco == "heart":              # 하독: 파란 하트
+                img2 = self._soft_heart(42, "#3f6fd6")
+                if img2 is not None:
+                    cv.create_image(mx - img2.width() / 2, y - 9,
+                                    image=img2, anchor="nw")
             elif deco == "tangerine":          # 레냥: 귤 한 알
                 self._oval(cv, mx - 19, y - 8, mx + 19, y + 24,
                                fill="#f5a623", outline="#c97c12", width=2)
@@ -23460,19 +23844,6 @@ class Mascot:
 
     CAL_S = 0.72             # 달력 아이콘 크기 배율 (요청 — 더 작게)
     CAL_PAD = 6              # 카드 왼쪽·위 모서리에서 떨어진 거리 (k 배)
-
-    def _room_cal_box(self, kx0, ky0, k):
-        """달력 아이콘이 차지하는 네모.
-
-        **그리는 쪽(_room_cal_draw)과 비켜 서는 쪽(말풍선)이 같은 값을
-        본다.** 예전에는 달력이 제 안에서 자리를 정하고 말풍선은 손으로
-        적은 수(32*k)를 비켜 서고 있어서, 한쪽만 고치면 말풍선이 아이콘
-        뒤로 들어갔다.
-        """
-        r = 10 * k * self.CAL_S
-        x0 = kx0 + self.CAL_PAD * k
-        y0 = ky0 + self.CAL_PAD * k
-        return (x0, y0, x0 + 2 * r, y0 + 2 * r)
 
     def _room_cal_img(self, col, px):
         """달력 아이콘 한 장 — PIL 로 구워 얹는다.
