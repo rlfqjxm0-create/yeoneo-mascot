@@ -1,7 +1,7 @@
 {
- "version": 1787489059,
+ "version": 1787498080,
  "files": {
-  "mascot.py": "594c9bff085bf96fe5528c32f446f654e443aad676dd092350291cd77e9f85bf",
+  "mascot.py": "45231455aac7149730ffe595d27f2002809ce9ea3c3c0276aed42b4b60c77d5f",
   "parts_yeoneo/arm_key.png": "5880d3ef755195b0ab6574ec3c408940da9a49cfba4ef0419b6701d59898a8b6",
   "parts_yeoneo/arm_pen.png": "9f5989174ed0c9eb0e9b1d62040292a5122bf743d748e2e8b1943a1a6afa83d8",
   "parts_yeoneo/arm_right.png": "e8955c8085bfbd801dfdd7ae776124c0f53bbc7c263ead9811d4091a7bdea159",
@@ -477,8 +477,6 @@
   "stickers/__init__.py": "d77e3dc92cb353dced8d192c140643c6458bc3901facdf2e0a0d0830fa4244b7",
   "youtube_player.py": "958da4bd526d867ec8250db02da4729ceb168664c04419091fe6ebf040122f80"
  },
- "notes": [
-  "새 친구가 둘 들어왔어요 — 각얼음 깅규와 독사 하독이에요. 홈에서 만나 보세요!",
-  "우클릭 메뉴에 '오류 기록 폴더 열기'가 생겼어요. 뭔가 안 될 때 보내 주실 파일을 바로 찾을 수 있어요."
- ]
+ "notes": [],
+ "silent": true
 }
