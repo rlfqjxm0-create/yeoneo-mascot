@@ -1,7 +1,7 @@
 {
- "version": 1787615260,
+ "version": 1787691812,
  "files": {
-  "mascot.py": "ababc499835b013ae317989896a3e2bcdd66a2669a694f7177bbda851e066e4d",
+  "mascot.py": "fbbd51154d02b797fd8c4927f73b974fc08c82657ef60526e60ec725b2f1ec99",
   "parts_yeoneo/arm_key.png": "5880d3ef755195b0ab6574ec3c408940da9a49cfba4ef0419b6701d59898a8b6",
   "parts_yeoneo/arm_pen.png": "9f5989174ed0c9eb0e9b1d62040292a5122bf743d748e2e8b1943a1a6afa83d8",
   "parts_yeoneo/arm_right.png": "e8955c8085bfbd801dfdd7ae776124c0f53bbc7c263ead9811d4091a7bdea159",
@@ -21,7 +21,7 @@
   "parts_yeoneo/hat.png": "4bd1da80b760cff3694c7b21350e8dce6a177026846dcd737d796ad7560f277f",
   "parts_yeoneo/head.png": "ddad4705ec55415e097d7c2ba75ae2bba57a136a652dadfdf7a2f8e7a936603f",
   "parts_yeoneo/head_raw.png": "74f08c4b89e3744b939499e028ad12366f69aaf422cfc629c3006564a5a4b40d",
-  "parts_yeoneo/layout.json": "9070a3b75d5bff21b9f0a167191cfa181344e7782b01b1495561b86df951877a",
+  "parts_yeoneo/layout.json": "cc3ef93120de6b1cb6794b482afa9c3e52687433987fb80374ddc33d3e4656d2",
   "parts_yeoneo/prop1.png": "7b4594e98f38bbe009d7b49196f818a7d99b8306ea6c7b20fc913d405a5c91d0",
   "parts_yeoneo/prop10_back.png": "9c151b667a305e0b40917014640ebb0b599d65f77fbb44f467f973eb245a4198",
   "parts_yeoneo/prop11.png": "5018d089066acf04ff2118046d99d1112eacb9819345988f562674b49035022f",
@@ -43,8 +43,14 @@
   "parts_yeoneo/prop21.png": "66a57bddeeba14b6b5a426b4e2baf9c9d511cbb1091df36fee374157c362adaa",
   "parts_yeoneo/prop21_bit2.png": "d58d2e52c560028a8d2fbd72607d300e4497ab90c74b6f151f75c4ba9e39f840",
   "parts_yeoneo/prop21_bit3.png": "a57385959d741788e857aa42d6234573f4b9abba5b57840da59cc4e0ec120159",
-  "parts_yeoneo/prop22.png": "6c15019adbbe07d517a0c8c3f51a19186a2539e0a0c8b66a0f141d448a5bc127",
-  "parts_yeoneo/prop23.png": "c6b09d5fef7b549a9a7863e18724cb8ff1a50f8f9dcd339c846c0a68c0fab6bd",
+  "parts_yeoneo/prop22.png": "c0aa93ef6aa94b317ba85b3c13ae930ba732293cd61658736141591ca9bdd935",
+  "parts_yeoneo/prop23.png": "7d4f4b88707a5ccf76b61adad66707b119f17aedb8ed2650b8455c900a4690f4",
+  "parts_yeoneo/prop24.png": "2a3b1a7dc0516884a5a84a2433f690e3e269ab22bfcb9a4916357ef53021f89b",
+  "parts_yeoneo/prop24_bit2.png": "5376641648882bb6e7411e2db4894e611582b682334918071c0e710d455888a6",
+  "parts_yeoneo/prop25.png": "fa2b0bd486e87df1e54316f78d9c219874aa9fc0fe3fc47c8e38f8cdfaa1832b",
+  "parts_yeoneo/prop25_bit2.png": "0c164a75abb81b157a715c8e560c01331b7256b3f34202c0971183fb6a2dc425",
+  "parts_yeoneo/prop25_bit3.png": "f28b0164c2cc2817a54c3a1f952e18f3dd869695a2c9814b913311cace9a413b",
+  "parts_yeoneo/prop25_bit4.png": "2f7bdf483649d9e2e412f893591ed376924c236b5c8ff94ec4703d5be9d7c029",
   "parts_yeoneo/prop3.png": "dba10e4fcad189d2e05f4b593863ce77eeb8428fd7e7461ec8d2212217500b6d",
   "parts_yeoneo/prop4.png": "fd94501858e8df571a256f9817540f792bce00e72db5c91a3324c71aadbd871c",
   "parts_yeoneo/prop5.png": "e5a46738678dd630807369f97ba3f64d5203910ec2ed658e9938746975d49b00",
@@ -483,6 +489,7 @@
   "stickers/__init__.py": "d77e3dc92cb353dced8d192c140643c6458bc3901facdf2e0a0d0830fa4244b7",
   "youtube_player.py": "958da4bd526d867ec8250db02da4729ceb168664c04419091fe6ebf040122f80"
  },
- "notes": [],
- "silent": true
+ "notes": [
+  "새 소품 4종이 왔어요 — 잠자는 고양이(가끔 눈을 뜨고 빤히 봐요), 김이 폴폴 나는 왕만두, 아기 쪽쪽이, 토끼 머리띠. '소품 새로고침'을 누르다 보면 만날 수 있어요."
+ ]
 }
