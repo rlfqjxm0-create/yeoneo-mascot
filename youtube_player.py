@@ -257,13 +257,16 @@ class Player:
         # 부모가 다음 곡을 정하므로 꺼 둔다 — 둘이 같이 정하면 자식이
         # 먼저 되감아 부모가 'ended' 를 못 보고 같은 곡이 반복된다.
         self.loop = True
-        self.mode = "play"           # play | login
+        self.mode = "play"           # play | login | watch(임베드 막힘 폴백)
         self.signed = None           # 로그인 상태를 확인했는가 (모르면 None)
         self.cur = ("", "")          # 지금 틀어 둔 (영상, 재생목록)
         self.resume = False          # 로그인에서 돌아와 다시 틀어야 하는가
         self._last = None
         self._sent = 0.0
         self._replay = 0.0
+        self._watch_at = 0.0         # watch 폴백을 시작한 시각
+        self._watch_kick = 0.0       # watch 에서 마지막으로 재생을 민 시각
+        self._watch_vol = -1         # watch 페이지에 적용해 둔 볼륨
 
     # ── 페이지에 말 걸기 ──────────────────────────────────────────────────
     def js(self, expr):
@@ -288,23 +291,108 @@ class Player:
                 self.cur = (str(msg.get("v") or ""), str(msg.get("list") or ""))
                 self.resume = True
                 return
+            if self.mode == "watch":
+                # 임베드로 돌아가 새 곡을 튼다 — 새 곡이 또 막히면
+                # 상태 폴링이 다시 폴백한다
+                self.end_watch(str(msg.get("v") or ""),
+                               str(msg.get("list") or ""))
+                return
             self.load(str(msg.get("v") or ""), str(msg.get("list") or ""))
         elif c == "play":
             self.want_play = True
-            self.js("ytPlay()")
+            if self.mode == "watch":
+                self._watch_js_do("playVideo()", "v.play()")
+            else:
+                self.js("ytPlay()")
         elif c == "pause":
             self.want_play = False
-            self.js("ytPause()")
+            if self.mode == "watch":
+                self._watch_js_do("pauseVideo()", "v.pause()")
+            else:
+                self.js("ytPause()")
         elif c == "vol":
             try:
                 self.vol = max(0, min(100, int(msg.get("v", 60))))
             except (TypeError, ValueError):
                 return
-            self.js("ytVol(%d)" % self.vol)
+            if self.mode == "watch":
+                self._watch_vol = -1         # 다음 바퀴에 새 볼륨을 건다
+            else:
+                self.js("ytVol(%d)" % self.vol)
         elif c == "login":
             self.begin_login(msg.get("x", 200), msg.get("y", 120))
         elif c == "login_done":
             self.end_login(None)
+
+    # ── 임베드 막힘 폴백 (watch 페이지) ─────────────────────────────────
+    # 임베드 차단(101·150)은 iframe 에만 걸린다 — 본 페이지(watch)는 늘
+    # 재생된다. 막힌 곡만 같은 창을 본 페이지로 갈아 끼워 틀고, 다음 곡
+    # load 가 오면 임베드 페이지로 돌아온다 (본 페이지는 메모리를 두 배
+    # 쓴다 — 실측 USS 190 → 400MB — 그래서 머무는 시간을 최소로 한다).
+    # 부모에게는 err=0 인 보통 재생으로 보고한다 — 부모(옛 판 포함)가
+    # '막힌 곡'으로 알고 건너뛰지 않게. 부모 수정 없이 재생기 혼자 끝낸다.
+    WATCH_JS = (
+        "(function(){"
+        "var p=document.getElementById('movie_player');"
+        "if(p&&p.getPlayerState){try{var d=p.getVideoData()||{};"
+        "return {ok:1,state:p.getPlayerState(),"
+        "pos:p.getCurrentTime()||0,dur:p.getDuration()||0,"
+        "title:d.title||'',vid:d.video_id||''};}catch(e){}}"
+        "var v=document.querySelector('video');"
+        "if(!v)return {ok:0};"
+        "return {ok:1,state:(v.ended?0:(v.paused?2:1)),"
+        "pos:v.currentTime||0,dur:v.duration||0,"
+        "title:document.title.replace(/ - YouTube$/,''),vid:''};"
+        "})()")
+
+    def _watch_js_do(self, api_call, video_stmt):
+        """movie_player API 를 먼저, 없으면 video 요소로."""
+        self.js("(function(){var p=document.getElementById('movie_player');"
+                "if(p&&p.%s){try{p.%s;return}catch(e){}}"
+                "var v=document.querySelector('video');"
+                "if(v){try{%s}catch(e){}}})()"
+                % (api_call.split("(")[0], api_call, video_stmt))
+
+    def begin_watch(self, vid):
+        self.mode = "watch"
+        self._watch_at = time.time()
+        self._watch_kick = 0.0
+        self._watch_vol = -1
+        try:
+            self.win.load_url("https://www.youtube.com/watch?v=" + vid)
+        except Exception:
+            pass
+
+    def end_watch(self, vid, lst):
+        """다음 곡이 왔다 — 임베드 페이지로 돌아가 그 곡을 튼다."""
+        self.mode = "play"
+        self.cur = (vid, lst)
+        self.resume = True
+        try:
+            self.win.load_url(self.page)
+        except Exception:
+            pass
+
+    def watch_tick(self, s):
+        """watch 페이지 살림 — 볼륨 맞추기·재생 밀기·끝나면 되감기."""
+        now = time.time()
+        if not s.get("ready"):
+            return
+        if self._watch_vol != self.vol:
+            self._watch_vol = self.vol
+            self._watch_js_do("setVolume(%d)" % self.vol,
+                              "v.volume=%f" % (self.vol / 100.0))
+        st = int(s.get("state", -9))
+        if self.want_play and st in (-1, 2, 5) and now - self._watch_kick > 3.0:
+            # 자동재생이 안 걸렸으면 민다 (정책 플래그는 이미 풀려 있다)
+            self._watch_kick = now
+            self._watch_js_do("playVideo()", "v.play()")
+        if (self.loop and self.want_play and st == 0
+                and now - self._replay > 3.0):
+            self._replay = now
+            self._watch_js_do("playVideo()", "v.play()")
+        if not self.want_play and st == 1:
+            self._watch_js_do("pauseVideo()", "v.pause()")
 
     # ── 로그인 ───────────────────────────────────────────────────────────
     def begin_login(self, x, y):
@@ -341,6 +429,24 @@ class Player:
     # ── 상태 알리기 ──────────────────────────────────────────────────────
     def status(self):
         base = {"mode": self.mode, "signed": self.signed}
+        if self.mode == "watch":
+            o = self.js(self.WATCH_JS)
+            if isinstance(o, dict) and o.get("ok"):
+                st = int(o.get("state", -9))
+                base.update({
+                    "ready": True, "state": st, "playing": st == 1,
+                    "buffering": st == 3, "ended": st == 0,
+                    "title": str(o.get("title") or ""),
+                    "vid": str(o.get("vid") or ""),
+                    "pos": float(o.get("pos") or 0.0),
+                    "dur": float(o.get("dur") or 0.0),
+                    # 부모에게는 보통 재생으로 보인다 — 건너뛰지 않게
+                    "err": 0})
+            else:
+                base.update({"ready": False, "state": 3, "playing": False,
+                             "buffering": True, "ended": False, "title": "",
+                             "vid": "", "pos": 0.0, "dur": 0.0, "err": 0})
+            return base
         o = self.js("ytStatus()") if self.mode == "play" else None
         if not isinstance(o, dict):
             base.update({"ready": False, "state": -9, "playing": False,
@@ -372,7 +478,7 @@ class Player:
         작업하는 내내 소리가 이어지라는 뜻이다. 사람이 멈춘 것(want_play가
         거짓)일 때는 건드리지 않는다.
         """
-        if not self.loop:
+        if not self.loop or self.mode != "play":
             return                   # 목록 재생 중 — 다음 곡은 부모가 정한다
         now = time.time()
         if s.get("ended") and self.want_play and now - self._replay > 3.0:
@@ -514,6 +620,16 @@ def _main():
                 if pl.mode == "login":
                     pl.check_login()
                 s = pl.status()
+                # 임베드 차단(101·150) — 본 페이지로 갈아 끼워 튼다.
+                # 단일 곡일 때만 (재생목록은 유튜브가 알아서 다음 곡으로
+                # 넘어가고, 어느 곡이 막혔는지도 확실치 않다).
+                if (pl.mode == "play" and pl.want_play and pl.cur[0]
+                        and not pl.cur[1]
+                        and int(s.get("err") or 0) in (101, 150)):
+                    pl.begin_watch(pl.cur[0])
+                    s = pl.status()
+                if pl.mode == "watch":
+                    pl.watch_tick(s)
                 pl.resume_if_needed(s)
                 pl.loop_if_ended(s)
             except Exception:

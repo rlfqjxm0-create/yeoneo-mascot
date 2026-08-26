@@ -1,5 +1,5 @@
 {
- "version": 1787698063,
+ "version": 1787703869,
  "files": {
   "mascot.py": "979d46443da9c8d0a47e92c71b34342fcf302eb7ba46c587203061a01a3c0b1f",
   "parts_yeoneo/arm_key.png": "5880d3ef755195b0ab6574ec3c408940da9a49cfba4ef0419b6701d59898a8b6",
@@ -499,8 +499,11 @@
   "stickers/sticker_icon.ico": "e1ced0f5c5cd1b963ebfad7d839b5b1d78959ac0fc37bba5859a40c0afda4221",
   "stickers/textmaker.py": "f75a9e4e9cac8ac120ee2ac3bec6546572e1cb908f3bd6ca6605913b6f18f471",
   "stickers/__init__.py": "d77e3dc92cb353dced8d192c140643c6458bc3901facdf2e0a0d0830fa4244b7",
-  "youtube_player.py": "958da4bd526d867ec8250db02da4729ceb168664c04419091fe6ebf040122f80"
+  "youtube_player.py": "0b2e0560b1bf72e55b8ab8623e3083a401842cdafe905a5a0186012617aee9bb"
  },
- "notes": [],
- "silent": true
+ "notes": [
+  "새 소품 4종이 왔어요 — 잠자는 고양이, 김이 폴폴 나는 왕만두, 아기 쪽쪽이, 토끼 머리띠. '소품 새로고침'을 누르다 보면 만날 수 있어요.",
+  "고양이를 클릭하면 야옹 하고 울어요. 고양이 머리를 살살 쓰다듬으면(드래그) 고롱고롱 소리를 내요.",
+  "모두의 플레이리스트에서 퍼오기가 막혀 건너뛰던 곡도 이제 재생돼요. 유튜브 프리미엄을 쓰신다면 음악 메뉴에서 한 번 로그인해 두면 광고 없이 나와요."
+ ]
 }
