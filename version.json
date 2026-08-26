@@ -1,7 +1,7 @@
 {
- "version": 1787709874,
+ "version": 1787716120,
  "files": {
-  "mascot.py": "018be95a9e3a5d7bb3d8bd20d600d438dc46a9ad7d7710fb8a518fa457c6946c",
+  "mascot.py": "5efb6f5198fe437b2ecbe25ecc283968d6357e03c0184e4e2d104530b016cd86",
   "parts_yeoneo/arm_key.png": "5880d3ef755195b0ab6574ec3c408940da9a49cfba4ef0419b6701d59898a8b6",
   "parts_yeoneo/arm_pen.png": "9f5989174ed0c9eb0e9b1d62040292a5122bf743d748e2e8b1943a1a6afa83d8",
   "parts_yeoneo/arm_right.png": "e8955c8085bfbd801dfdd7ae776124c0f53bbc7c263ead9811d4091a7bdea159",
@@ -21,7 +21,7 @@
   "parts_yeoneo/hat.png": "4bd1da80b760cff3694c7b21350e8dce6a177026846dcd737d796ad7560f277f",
   "parts_yeoneo/head.png": "ddad4705ec55415e097d7c2ba75ae2bba57a136a652dadfdf7a2f8e7a936603f",
   "parts_yeoneo/head_raw.png": "74f08c4b89e3744b939499e028ad12366f69aaf422cfc629c3006564a5a4b40d",
-  "parts_yeoneo/layout.json": "b11a8691d200efd48b68c8286622b960c284a1e04b1158b6afd2e7b4922d884a",
+  "parts_yeoneo/layout.json": "8b5546c4905161dc26f59efa56653c3a980e6ad8b7c7864d73a302f56f44de23",
   "parts_yeoneo/prop1.png": "d378b6bdfceb85731ca32727343a4468ad5c44f141f893fd636b53f308782f04",
   "parts_yeoneo/prop10_back.png": "9c151b667a305e0b40917014640ebb0b599d65f77fbb44f467f973eb245a4198",
   "parts_yeoneo/prop11.png": "5018d089066acf04ff2118046d99d1112eacb9819345988f562674b49035022f",
@@ -54,6 +54,11 @@
   "parts_yeoneo/prop26.png": "45be8d74b44de4efe25c7626999f3f3c4ac0fd5c991439aaa4d9105b586bcdb5",
   "parts_yeoneo/prop27.png": "7e41d46f5ce18d6a0897b1f570315e9d64a68b24c1e10bcdf045f60287a3ae04",
   "parts_yeoneo/prop28.png": "8a5e7570a35c1b49c72b92eb1e94a007adef6349cd4975960142aded81cc4a68",
+  "parts_yeoneo/prop29.png": "4d01310a86785a5444059632768f9f042a12042f4d9ed9cf9184ba140ce1e4b4",
+  "parts_yeoneo/prop29_bit2.png": "3e2a7df52182066ea74b93962e0472f063f293b17751930822ac1780554d9fb5",
+  "parts_yeoneo/prop29_bit3.png": "470398c88aef25686754f8bcbdde7a01150774cbe4231cb41d3aa2e2eb848471",
+  "parts_yeoneo/prop29_bit4.png": "ec6ae8eb11643cdf2bc66e9c1f03db0a6a068764a03cdd00b6373c9dd35d1cb7",
+  "parts_yeoneo/prop29_bit5.png": "a96c9d1756dda554222c73d6050913ea28f2898358c7776948adae88b47d4132",
   "parts_yeoneo/prop3.png": "dba10e4fcad189d2e05f4b593863ce77eeb8428fd7e7461ec8d2212217500b6d",
   "parts_yeoneo/prop4.png": "fd94501858e8df571a256f9817540f792bce00e72db5c91a3324c71aadbd871c",
   "parts_yeoneo/prop5.png": "e5a46738678dd630807369f97ba3f64d5203910ec2ed658e9938746975d49b00",
@@ -501,6 +506,10 @@
   "stickers/__init__.py": "d77e3dc92cb353dced8d192c140643c6458bc3901facdf2e0a0d0830fa4244b7",
   "youtube_player.py": "0b2e0560b1bf72e55b8ab8623e3083a401842cdafe905a5a0186012617aee9bb"
  },
- "notes": [],
- "silent": true
+ "notes": [
+  "새 소품 4종이 왔어요 — 잠자는 고양이, 김이 폴폴 나는 왕만두, 아기 쪽쪽이, 토끼 머리띠. '소품 새로고침'을 누르다 보면 만날 수 있어요.",
+  "고양이를 클릭하면 야옹 하고 울어요. 고양이 머리를 살살 쓰다듬으면(드래그) 고롱고롱 소리를 내요.",
+  "모두의 플레이리스트에서 퍼오기가 막혀 건너뛰던 곡도 이제 재생돼요. 유튜브 프리미엄을 쓰신다면 음악 메뉴에서 한 번 로그인해 두면 광고 없이 나와요.",
+  "하독의 반려동물 고양이 비비도 있어요! 발과 꼬리를 살랑이는 비비를 클릭하거나 몸을 쓰다듬어 보세요."
+ ]
 }
