@@ -473,10 +473,339 @@ if getattr(sys, "frozen", False) and not os.path.exists(os.path.abspath(__file__
     HERE = sys._MEIPASS
 else:
     HERE = os.path.dirname(os.path.abspath(__file__))
+# ── 맥 유튜브 재생기 (퀸시 맥에서 검증한 판) ─────────────────────────
+# 맥은 pywebview 가 없어 음악이 통째로 꺼져 있었다. 시스템 WebKit
+# (WKWebView) + 번들 pyobjc 로 윈도우 youtube_player 와 **같은 줄
+# 프로토콜**의 재생기를 만든다 (추가 의존성 없음). 창 숨김(소리만)·
+# 임베드 막힌 곡 watch 우회까지 퀸시의 실기기에서 검증했다.
+# `queue`/`http.server` 는 맥 번들에 없어 list+Lock·raw socket 을 쓴다.
+_MAC_YT_HTML = """<!doctype html><html><head><meta charset="utf-8">
+<style>html,body{margin:0;background:#000;height:100%;overflow:hidden}
+#p{width:100%;height:100%}</style></head><body><div id="p"></div>
+<script>
+(function(){try{
+  Object.defineProperty(document,'hidden',{configurable:true,get:function(){return false;}});
+  Object.defineProperty(document,'visibilityState',{configurable:true,get:function(){return 'visible';}});
+  document.addEventListener('visibilitychange',function(e){e.stopImmediatePropagation();},true);
+}catch(e){}})();
+var player=null, ready=false, pend=null, pendVol=null;
+function send(o){ try{ window.webkit.messageHandlers.yt.postMessage(JSON.stringify(o)); }catch(e){} }
+function doLoad(v,list){ if(!player)return;
+  try{ if(list){ player.loadPlaylist({list:list}); } else if(v){ player.loadVideoById({videoId:v}); } }catch(e){} }
+function applyPend(){ if(pend){ doLoad(pend.v,pend.list); pend=null; } if(pendVol!=null){ try{player.setVolume(pendVol);}catch(e){} pendVol=null; } }
+function report(){
+  if(!player||!player.getPlayerState) return;
+  var st=player.getPlayerState();
+  var d={ready:ready, playing: st===1};
+  try{ var vd=player.getVideoData(); if(vd){ if(vd.title) d.title=vd.title; if(vd.video_id) d.vid=vd.video_id; } }catch(e){}
+  send(d);
+}
+function onYouTubeIframeAPIReady(){
+  player=new YT.Player('p',{ height:'100%', width:'100%',
+    playerVars:{autoplay:1, controls:1, rel:0, playsinline:1, modestbranding:1,
+                enablejsapi:1},
+    events:{
+      'onReady':function(){ ready=true; applyPend(); send({ready:true}); report(); },
+      'onStateChange':function(e){ report(); if(e.data===0){ send({ended:true}); } },
+      'onError':function(e){ send({err:e.data||1}); }
+    }});
+}
+window.ytLoad=function(v,list){ if(!ready){ pend={v:v,list:list}; return; } doLoad(v,list); };
+window.ytPlay=function(){ if(player&&ready) player.playVideo(); };
+window.ytPause=function(){ if(player&&ready) player.pauseVideo(); };
+window.ytVol=function(x){ if(!ready){ pendVol=x; return; } try{player.setVolume(x);}catch(e){} };
+var t=document.createElement('script'); t.src="https://www.youtube.com/iframe_api";
+document.head.appendChild(t);
+</script></body></html>"""
+
+
+def _mac_yt_player_main():
+    """맥 WebKit 유튜브 재생기 — 윈도우 youtube_player 와 같은 줄 프로토콜.
+
+    임베드가 막힌 곡(err 150/101/100)은 watch 페이지로 우회해 그래도 튼다.
+    stdin: {"c":"load/play/pause/vol/quit"} · stdout: '@YT {json}'.
+    """
+    import objc
+    import threading
+    import socket
+    import AppKit
+    from Foundation import (NSObject, NSURL, NSURLRequest, NSTimer,
+                            NSMakeRect)
+
+    objc.loadBundle("WebKit", globals(),
+                    bundle_path="/System/Library/Frameworks/WebKit.framework")
+    WKWebView = objc.lookUpClass("WKWebView")
+    WKWebViewConfiguration = objc.lookUpClass("WKWebViewConfiguration")
+    WKUserContentController = objc.lookUpClass("WKUserContentController")
+    WKUserScript = objc.lookUpClass("WKUserScript")
+
+    cmds = []
+    cmds_lock = threading.Lock()
+    # loop: 한 곡 반복 (윈도우 재생기와 같은 규칙 — load 에 loop 가 없으면
+    #        1, 목록 재생은 부모가 loop=0 을 보낸다. 지뢰 98)
+    # esent: 이 곡의 ended 를 이미 알렸는가 — watch 모드는 1초마다 상태를
+    #        보내므로, 안 막으면 곡 하나 끝에 ended 가 여러 번 나가
+    #        부모가 다음 곡을 건너뛸 수 있다.
+    st = {"mode": "iframe", "vid": "", "title": "", "vol": None, "home": "",
+          "loop": 1, "esent": False}
+
+    def emit(d):
+        try:
+            sys.stdout.write("@YT " + json.dumps(d) + "\n")
+            sys.stdout.flush()
+        except Exception:
+            pass
+
+    def run_js(js):
+        try:
+            web.evaluateJavaScript_completionHandler_(js, None)
+        except Exception:
+            pass
+
+    def go_watch(vid):
+        st["mode"] = "watch"
+        st["esent"] = False
+        page_ready[0] = True
+        try:
+            web.loadRequest_(NSURLRequest.requestWithURL_(NSURL.URLWithString_(
+                "https://www.youtube.com/watch?v=%s&autoplay=1" % vid)))
+        except Exception:
+            pass
+
+    def go_home():
+        st["mode"] = "iframe"
+        st["esent"] = False
+        page_ready[0] = False
+        try:
+            web.loadRequest_(NSURLRequest.requestWithURL_(
+                NSURL.URLWithString_(st["home"])))
+        except Exception:
+            pass
+
+    class Handler(NSObject):
+        def userContentController_didReceiveScriptMessage_(self, ucc, msg):
+            try:
+                body = msg.body()
+                d = json.loads(body) if isinstance(body, str) else dict(body)
+            except Exception:
+                return
+            if d.get("watch"):
+                dur = float(d.get("d") or 0.0)
+                tt = float(d.get("t") or 0.0)
+                if st.get("vol") is not None:
+                    run_js("window.ytVol(%d)" % int(st["vol"]))
+                out = {"ready": True, "playing": bool(d.get("p")),
+                       "vid": st["vid"]}
+                ttl = d.get("title") or st["title"]
+                if ttl:
+                    out["title"] = st["title"] = ttl
+                fin = bool(d.get("e")) or (dur > 0 and tt >= dur - 2.0)
+                if fin and st.get("loop") and bool(d.get("e")):
+                    # 한 곡 반복 (개인 노래) — 되감아 다시 튼다
+                    st["esent"] = False
+                    run_js("window.ytReplay()")
+                elif fin and not st.get("esent"):
+                    # 목록 재생 — ended 는 곡마다 **한 번만** 알린다
+                    # (1초마다 또 보내면 부모가 다음 곡을 건너뛴다)
+                    st["esent"] = True
+                    out["ended"] = True
+                emit(out)
+                return
+            if d.get("vid"):
+                st["vid"] = d["vid"]
+            if d.get("title"):
+                st["title"] = d["title"]
+            if d.get("ended") and st.get("loop") and \
+                    st["mode"] == "iframe" and st["vid"]:
+                # 한 곡 반복 (개인 노래) — 윈도우 재생기의 loop_if_ended 와
+                # 같은 일. 목록 재생은 부모가 loop=0 을 보내므로 안 탄다.
+                run_js("window.ytLoad(%s,'')" % json.dumps(st["vid"]))
+            err = int(d.get("err") or 0)
+            if err in (2, 100, 101, 150) and st["vid"]:
+                go_watch(st["vid"])
+                return
+            emit(d)
+
+    class Delegate(NSObject):
+        def applicationShouldTerminateAfterLastWindowClosed_(self, app):
+            return True
+
+    page_ready = [False]
+
+    class NavDelegate(NSObject):
+        def webView_didFailProvisionalNavigation_withError_(self, wv, nav, err):
+            try:
+                emit({"nav_fail": str(err.localizedDescription())})
+            except Exception:
+                pass
+
+        def webView_didFinishNavigation_(self, wv, nav):
+            page_ready[0] = True
+
+    app = AppKit.NSApplication.sharedApplication()
+    app.setActivationPolicy_(AppKit.NSApplicationActivationPolicyAccessory)
+    delegate = Delegate.alloc().init()
+    app.setDelegate_(delegate)
+
+    ucc = WKUserContentController.alloc().init()
+    handler = Handler.alloc().init()
+    ucc.addScriptMessageHandler_name_(handler, "yt")
+    # 끊김 방지 v.play() 는 **셋을 가려야** 한다 (사가 제보 둘의 뿌리) —
+    # ① 사용자가 멈췄을 때 되살리면 '멈춤이 안 먹힌다'
+    # ② 곡이 끝났을 때 되살리면 '한 곡이 무한 반복'되고 ended 도 못 낸다
+    # 그래서 UP(사용자 멈춤)·v.ended 를 보고, 끝은 e 깃발로 알린다.
+    WATCH_JS = (
+        "(function(){if(location.hostname.indexOf('youtube.com')<0"
+        "||location.pathname.indexOf('/watch')<0)return;"
+        "var UP=false;"
+        "function vd(){return document.querySelector('video');}"
+        "window.ytPlay=function(){UP=false;var v=vd();if(v)v.play();};"
+        "window.ytPause=function(){UP=true;var v=vd();if(v)v.pause();};"
+        "window.ytReplay=function(){UP=false;var v=vd();"
+        "if(v){try{v.currentTime=0;v.play();}catch(e){}}};"
+        "window.ytVol=function(x){var v=vd();if(v)v.volume=Math.max(0,Math.min(1,x/100));};"
+        "setInterval(function(){var v=vd();if(!v)return;"
+        "try{if(v.paused&&!UP&&!v.ended)v.play();}catch(e){}"
+        "var t=(document.title||'').replace(/ - YouTube$/,'');"
+        "try{window.webkit.messageHandlers.yt.postMessage(JSON.stringify("
+        "{watch:1,t:Math.round(v.currentTime),d:Math.round(v.duration||0),"
+        "p:!v.paused,e:(v.ended?1:0),title:t}));}catch(e){}},1000);})();")
+    ucc.addUserScript_(
+        WKUserScript.alloc().initWithSource_injectionTime_forMainFrameOnly_(
+            WATCH_JS, 1, True))
+
+    cfg = WKWebViewConfiguration.alloc().init()
+    cfg.setUserContentController_(ucc)
+    try:
+        cfg.setMediaTypesRequiringUserActionForPlayback_(0)
+    except Exception:
+        pass
+
+    # localhost origin 필수 — loadHTMLString 은 origin 이 비어 유튜브가
+    # err 150/152 로 막는다. 그래서 한 파일짜리 로컬 서버를 띄운다.
+    _srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    _srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    _srv.bind(("127.0.0.1", 0))
+    _srv.listen(8)
+    _port = _srv.getsockname()[1]
+    st["home"] = "http://127.0.0.1:%d/" % _port
+    _body = _MAC_YT_HTML.encode("utf-8")
+    _resp = (b"HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n"
+             b"Content-Length: " + str(len(_body)).encode()
+             + b"\r\nConnection: close\r\n\r\n" + _body)
+
+    def _serve():
+        while True:
+            try:
+                conn, _a = _srv.accept()
+            except Exception:
+                break
+            try:
+                conn.recv(8192)
+                conn.sendall(_resp)
+            except Exception:
+                pass
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    threading.Thread(target=_serve, daemon=True).start()
+
+    rect = NSMakeRect(0, 0, 400, 300)
+    web = WKWebView.alloc().initWithFrame_configuration_(rect, cfg)
+    navdel = NavDelegate.alloc().init()
+    web.setNavigationDelegate_(navdel)
+    win = AppKit.NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
+        rect, AppKit.NSWindowStyleMaskBorderless,
+        AppKit.NSBackingStoreBuffered, False)
+    win.setContentView_(web)
+    win.setOpaque_(False)
+    win.setAlphaValue_(0.0)
+    win.setIgnoresMouseEvents_(True)
+    win.orderFrontRegardless()
+    web.loadRequest_(NSURLRequest.requestWithURL_(
+        NSURL.URLWithString_(st["home"])))
+
+    def reader():
+        try:
+            for line in sys.stdin:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    c = json.loads(line)
+                except Exception:
+                    continue
+                with cmds_lock:
+                    cmds.append(c)
+        except Exception:
+            pass
+        with cmds_lock:
+            cmds.append({"c": "quit"})
+
+    threading.Thread(target=reader, daemon=True).start()
+
+    def pump(_timer=None):
+        if not page_ready[0]:
+            return
+        drained = 0
+        while drained < 50:
+            with cmds_lock:
+                if not cmds:
+                    break
+                c = cmds.pop(0)
+            drained += 1
+            k = c.get("c")
+            if k == "quit":
+                AppKit.NSApp().terminate_(None)
+                return
+            elif k == "load":
+                v = c.get("v") or ""
+                lst = c.get("list") or ""
+                st["vid"] = v
+                # 되감기 규칙은 부모가 정한다 (지뢰 98 — 정하는 쪽은 하나).
+                # 옛 부모(loop 없이 보냄)와도 맞물리게 기본은 '되감는다'.
+                st["loop"] = 1 if c.get("loop", 1) else 0
+                st["esent"] = False
+                if st["mode"] == "watch":
+                    go_home()
+                    with cmds_lock:
+                        cmds.insert(0, c)
+                    return
+                run_js("window.ytLoad(%s,%s)"
+                       % (json.dumps(v), json.dumps(lst)))
+                if st.get("vol") is not None:
+                    run_js("window.ytVol(%d)" % int(st["vol"]))
+            elif k == "play":
+                run_js("window.ytPlay()")
+            elif k == "pause":
+                run_js("window.ytPause()")
+            elif k == "vol":
+                try:
+                    st["vol"] = int(c.get("v", 50))
+                    run_js("window.ytVol(%d)" % st["vol"])
+                except Exception:
+                    pass
+
+    NSTimer.scheduledTimerWithTimeInterval_repeats_block_(0.05, True, pump)
+    app.run()
+
+
 if "--yt-player" in sys.argv:
     # 음악 재생기로 넘어가는 갈림길. 얼려 배포한 exe 안에는 파이썬이 따로
     # 없어서, 재생기를 자식으로 띄울 때 같은 실행 파일을 이 깃발로 다시 부른다.
     # 이 파일은 자동 업데이트를 타므로 런처를 다시 굽지 않아도 길이 생긴다.
+    # 맥 런처(quincy_mac)는 갈림길이 없지만 mascot 을 import 하는 순간
+    # 이 블록이 돌므로 같은 길이 생긴다 (sys.exit 는 SystemExit 라
+    # 런처의 except Exception 에 안 잡힌다).
+    if IS_MAC:
+        try:
+            _mac_yt_player_main()
+        except Exception:
+            import traceback
+            traceback.print_exc()
+        sys.exit(0)
     try:
         if HERE not in sys.path:
             sys.path.insert(0, HERE)
@@ -528,6 +857,12 @@ TIMER_H = 92                     # 타이머 카드 영역 높이 (게이지형 
 OY_CLOCK_COMPACT = 70            # 시계형 카드 접힘 (상태+시간 한 줄)
 OY_CLOCK_OPEN = 182             # 시계형 카드 펼침 (시계 + 시간)
 YT_BAR = 24                      # 음악 버튼이 카드 위에 요구하는 여백
+# 타이머 카드와 머리 사이 여백 보정의 범위. 머리 위에 소품을 얹으면
+# 세로가 많이 필요해 60 으로는 모자란다(도로롱) — 넉넉히 넓혀 두고,
+# 정밀한 조정은 '끌어서 맞추기'(직접 드래그)로 한다. 세 곳(읽기 클램프·
+# 슬라이더·저장 클램프)이 같은 값을 써야 한다.
+CARD_GAP_MIN = -40
+CARD_GAP_MAX = 240
 
 # 타이머 카드 팔레트 (준사 배색)
 CARD_BORDER = "#f2b8c6"          # 소프트 핑크
@@ -638,6 +973,13 @@ def load_ui_font(char_dir):
     """
     global UI_FONT
     if not IS_WIN:
+        if IS_MAC:
+            # '맑은 고딕'은 맥에 없다 — 없는 이름을 주면 Tk 가 **없는
+            # 글꼴의 메트릭**으로 세로 중앙을 잡고 글리프는 대체 글꼴로
+            # 그려서, 글자가 알약보다 몇 px 아래로 쏠린다 (사가 제보 —
+            # CI 맥 러너 캡처로 재현). ♥ 같은 기호가 깨져 보이는 것도
+            # 같은 뿌리다. 모든 맥에 있는 한글 글꼴을 준다.
+            UI_FONT = "Apple SD Gothic Neo"
         return
     try:
         d = os.path.join(char_dir, "fonts")
@@ -1146,6 +1488,7 @@ class MacCharLayer:
         self.ok = False
         self.layer = None
         self._sz = None
+        self._last_src = None    # 직전에 올린 프레임 (같으면 push 스킵)
         # **Quartz 가 있어야 한다.** 맥 번들에 pyobjc-framework-Quartz 가
         # 빠져 있으면 여기서 ImportError 로 깔끔하게 물러난다 — 부르는 쪽이
         # 색상키로 되돌린다.
@@ -1222,6 +1565,13 @@ class MacCharLayer:
         from Quartz import (CATransaction, CGColorSpaceCreateDeviceRGB,
                             CGDataProviderCreateWithCFData, CGImageCreate,
                             kCGImageAlphaPremultipliedLast)
+        # 안 바뀐 프레임은 통째로 건너뛴다 (퀸시 맥 실측 — 캐릭터가 멈춰
+        # 있을 때 push 가 그대로 프레임 비용이었다). 비교(700KB memcmp)는
+        # 변환+CGImage 만들기보다 훨씬 싸다.
+        src = im.tobytes()
+        if src == getattr(self, "_last_src", None):
+            return True
+        self._last_src = src
         w, h = im.size
         raw = im.convert("RGBa").tobytes("raw", "RGBa")
         data = NSData.dataWithBytes_length_(raw, len(raw))
@@ -1245,6 +1595,7 @@ class MacCharLayer:
         return True
 
     def hide(self):
+        self._last_src = None      # 다음 push 는 반드시 그린다 (스킵 무효화)
         try:
             from Quartz import CATransaction
             CATransaction.begin()
@@ -5548,6 +5899,9 @@ class Mascot:
         self._bubble_box = None      # 말풍선 전체 자리 (눌러서 끄는 말풍선)
         self._bubble_hold = None     # 눌러야 꺼지는 말 (오늘의 운세)
         self._bubble_cookie = None   # 그 말풍선 안의 깐 포춘쿠키 (지뢰 13)
+        self._gap_adj = False        # '여백 직접 조정' 모드 (끌어서 맞추기)
+        self._gap_adj_y0 = None      # 끌기 시작 화면 y
+        self._gap_adj_g0 = 0         # 끌기 시작 card_gap
         self._cur_near = False       # 커서가 캐릭터 곁에 있는가 (지뢰 13 —
                                      # tick 이 draw 보다 먼저 이 값을 본다)
         self._tongue_at = 0.0        # 마지막으로 날름거린 시각
@@ -7358,7 +7712,7 @@ class Mascot:
         # `card_gap_base` 는 그 눈금의 기준을 캐릭터마다 옮긴다 — 맨 아래
         # (-20)까지 줄여도 아직 머니까 더 줄이게 해 달라는 요청(도로롱).
         # 눈금 폭은 그대로 두고 0 이 가리키는 자리만 옮기는 것이다.
-        gap = (max(-20, min(60, int(self.us.get("card_gap") or 0)))
+        gap = (max(CARD_GAP_MIN, min(CARD_GAP_MAX, int(self.us.get("card_gap") or 0)))
                + int(self.cfg.get("card_gap_base", 0)))
         if self.has_clock:
             base = OY_CLOCK_OPEN if self.clock_open else OY_CLOCK_COMPACT
@@ -8334,6 +8688,13 @@ class Mascot:
 
     def _on_press(self, e):
         self._press = (e.x, e.y, e.x_root, e.y_root)
+        # 여백 직접 조정 중 — 누른 자리를 기준으로 위아래 끌기를 시작한다.
+        # 다른 반응(쓰다듬·슬라임·창 옮기기)은 모두 건너뛴다.
+        if self._gap_adj:
+            self._gap_adj_y0 = e.y_root
+            self._gap_adj_g0 = int(self.us.get("card_gap") or 0)
+            self._dragged = False
+            return
         # 고양이 소품의 **머리**를 잡았다 — 쓰다듬기다. 창을 옮기면 안
         # 된다 (요청) — 슬라임 잡기와 같은 길로 _on_drag 가 가로챈다.
         hb9 = self._safe_str(self._cat_box, True) or None
@@ -8368,6 +8729,16 @@ class Mascot:
             self._safe("slime_press", self._slime_press, e.x, e.y)
 
     def _on_drag(self, e):
+        # 여백 직접 조정 — 세로로 끈 만큼만 여백을 바꾼다 (가로는 무시).
+        # 아래로 끌면 캐릭터가 커서를 따라 내려가며 카드와의 틈이 벌어진다.
+        if self._gap_adj:
+            if self._gap_adj_y0 is None:
+                return
+            dy = e.y_root - self._gap_adj_y0
+            if abs(dy) >= 3:
+                self._dragged = True
+            self._safe("gap_set", self._gap_set, self._gap_adj_g0 + dy)
+            return
         # 슬라임을 잡고 있으면 창을 옮기지 않는다 — 그 손짓은 늘이기다
         if self._slime_grab is not None:
             self._safe("slime_move", self._slime_move, e.x, e.y)
@@ -8397,6 +8768,11 @@ class Mascot:
         self.root.geometry(f"+{e.x_root - px}+{e.y_root - py}")
 
     def _on_release(self, e):
+        # 여백 직접 조정 — 놓으면 지금 여백을 저장하고 모드를 끝낸다.
+        if self._gap_adj:
+            self._gap_adjust_done()
+            self._press = None
+            return
         if self._slime_grab is not None:
             self._safe("slime_up", self._slime_release)
             self._slime_grab = None
@@ -8970,6 +9346,46 @@ class Mascot:
         self._build_shadow_img()
         if self.shadow is not None and self.shadow_img is not None:
             self.shadow.set_image(self.shadow_img)
+
+    def _gap_adjust_start(self):
+        """'여백 직접 조정' 모드 진입 — 캐릭터를 위아래로 끌어 카드와의
+        틈을 눈으로 맞춘다. 슬라이더로는 안 되는 큰 여백(머리 위 소품)을
+        위한 길이다. 놓으면 저장되고, 가로로는 움직이지 않는다."""
+        if not self.timer_on:
+            self._safe("say", self._say,
+                       "타이머가 꺼져 있어 맞출 여백이 없어요", secs=3.0)
+            return
+        self._gap_adj = True
+        self._gap_adj_y0 = None
+        self._say("위아래로 끌어 여백을 맞춰요 · 놓으면 저장돼요",
+                  hold=True)
+
+    def _gap_set(self, new_gap):
+        """card_gap 을 바꾸고 그 자리에서 다시 배치한다 — 조정 모드에서는
+        창 '위'를 고정해 캐릭터가 커서를 따라 아래로 내려가게 한다
+        (_relayout_card 는 아래를 고정하므로 되돌려 놓는다)."""
+        new_gap = max(CARD_GAP_MIN, min(CARD_GAP_MAX, int(new_gap)))
+        if new_gap == int(self.us.get("card_gap") or 0):
+            return
+        top = self.root.winfo_y()
+        x = self.root.winfo_x()
+        self.us["card_gap"] = new_gap
+        self._relayout_card()          # 아래 고정 — 창이 위로 자란다
+        # 위 고정으로 되돌린다 — 캐릭터가 커서 따라 내려가며 여백이 벌어진다
+        self.root.geometry("+%d+%d" % (x, top))
+
+    def _gap_adjust_done(self):
+        """조정 끝 — 지금 여백과 창 자리를 저장하고 모드를 끝낸다."""
+        if not self._gap_adj:
+            return
+        self._gap_adj = False
+        self._gap_adj_y0 = None
+        if self._bubble_hold:          # 안내 말풍선을 지운다
+            self.bubble = None
+            self._bubble_hold = None
+        self._save_settings()
+        self._safe("win_pos", self._save_win_pos)
+        self._say("여백을 저장했어요", secs=2.0)
 
     def _toggle_clock(self):
         """시계 펼침/접힘 — 창 높이를 바꾸고(아래 고정) 좌표·그림자 재계산."""
@@ -9947,12 +10363,19 @@ class Mascot:
             # 얼린 배포본에는 재생기가 exe 안에 구워져 있어 파일이 없을 수 있다.
             has_file = (os.path.exists(os.path.join(HERE, "youtube_player.py"))
                         or getattr(sys, "frozen", False))
-            if IS_WIN and self.cfg.get("youtube") and has_file:
-                try:
-                    import importlib.util
-                    got = importlib.util.find_spec("webview") is not None
-                except Exception:
-                    got = False
+            if IS_MAC and self.cfg.get("youtube"):
+                # 맥 재생기는 mascot.py 안에 있다(_mac_yt_player_main) —
+                # youtube_player.py 존재 확인이 필요 없다. 맥 배포 레포에는
+                # 그 파일이 안 실려서(WIN_EXTRA), 파일을 요구하면 소스로
+                # 도는 검증(CI)에서만 꺼져 헛짚게 된다.
+                got = True
+            elif self.cfg.get("youtube") and has_file:
+                if IS_WIN:
+                    try:
+                        import importlib.util
+                        got = importlib.util.find_spec("webview") is not None
+                    except Exception:
+                        got = False
             self._yt_avail = got
             if not got:
                 # **왜 없는지 남긴다.** 단추가 아예 안 뜨면 사람은 이유를
@@ -9960,8 +10383,8 @@ class Mascot:
                 # 안 들어 있다). 굳힌 exe 는 자동 갱신이 안 되므로
                 # 새 exe 를 전달해야 하는 상황인지 이 줄로 갈린다.
                 why = []
-                if not IS_WIN:
-                    why.append("맥")
+                if not IS_WIN and not IS_MAC:
+                    why.append("지원 안 되는 OS")
                 if not self.cfg.get("youtube"):
                     why.append("config 에 youtube 없음")
                 if not has_file:
@@ -10224,6 +10647,9 @@ class Mascot:
             # 얼린 배포본: 파이썬이 따로 없으므로 같은 실행 파일을 부르고,
             # mascot.py 맨 위의 갈림길이 재생기로 넘겨 준다.
             cmd = [exe, "--yt-player"]
+        elif IS_MAC:
+            # 맥은 재생기가 mascot.py 안에 있다 (_mac_yt_player_main)
+            cmd = [exe, "-u", os.path.abspath(__file__), "--yt-player"]
         else:
             pyw = os.path.join(os.path.dirname(exe), "pythonw.exe")
             if os.path.exists(pyw):
@@ -10248,12 +10674,22 @@ class Mascot:
         except Exception:
             errf = None
         try:
-            self._yt_proc = subprocess.Popen(
-                cmd + ["--profile", prof],
+            popen_kw = dict(
                 cwd=HERE, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                 stderr=(errf or subprocess.DEVNULL),
-                encoding="utf-8", errors="replace",
-                creationflags=0x08000000)          # CREATE_NO_WINDOW
+                encoding="utf-8", errors="replace")
+            if IS_WIN:
+                # CREATE_NO_WINDOW — 윈도우 전용. 맥에서 넘기면 Popen 이
+                # ValueError 로 죽는다.
+                popen_kw["creationflags"] = 0x08000000
+            elif IS_MAC and getattr(sys, "frozen", False):
+                # 자식은 런처(quincy_mac)를 다시 지나온다 — 업데이트 확인을
+                # 건너뛰게 해 바로 재생기로 넘어온다 (런처가 이 env 를 안다).
+                env9 = dict(os.environ)
+                env9["MASCOT_NO_UPDATE"] = "1"
+                popen_kw["env"] = env9
+            self._yt_proc = subprocess.Popen(
+                cmd + ["--profile", prof], **popen_kw)
         except Exception:
             self._yt_proc = None
             self._log_error("yt_spawn")
@@ -12896,8 +13332,14 @@ class Mascot:
         # **타이머 카드 자리까지 올린다** (요청). 카드 아래에 두면
         # 말풍선이 캐릭터 얼굴을 덮었다 — 이제 카드 쪽으로 올라간다.
         # 창 위로 넘치면 그만큼만 내린다 (글이 길어 말풍선이 클 때).
-        by = (max(h + 4.0, card_bottom + self.BUBBLE_UP)
-              + (1.0 - u) ** 2 * 8)
+        if getattr(self, "_gap_adj", False):
+            # 여백을 끌어 맞추는 동안에는 말풍선을 카드 위(맨 위)에 붙인다.
+            # 평소 자리는 아래끝이 카드 아래끝에 붙어, 여백이 작을 때 바로
+            # 그 자리에서 시작하는 머리와 겹쳐 '얼마나 벌어졌나'가 안 보인다.
+            by = h + 2.0 + (1.0 - u) ** 2 * 8
+        else:
+            by = (max(h + 4.0, card_bottom + self.BUBBLE_UP)
+                  + (1.0 - u) ** 2 * 8)
         x0, x1 = cx - w / 2, cx + w / 2
         # 눌러서 끄는 말풍선(오늘의 운세)이 쓸 자리. 화면에 그린 값 그대로라
         # 내부 깃발이 아니다 (지뢰 24).
@@ -15913,6 +16355,10 @@ class Mascot:
         # (자는 중 10fps / 오래 비움 15fps / 평소 30fps / 보고 있을 때 60fps)
         now = time.time()
         quiet = now - max(self.last_key, self.last_pointer)
+        # smooth 기본값을 먼저 둔다 — 아래 sleep/quiet 갈래에서는 정하지
+        # 않으므로, 안 두면 맥 분기에서 UnboundLocalError 가 난다
+        # (퀸시 클로드의 경고 그대로).
+        smooth = False
         if self._sleeping or self._fs_hidden:
             gap = self.GAP_SLEEP
         elif quiet > self.QUIET_SLOW:
@@ -15931,6 +16377,14 @@ class Mascot:
                     gap = max(gap, 50)
             except Exception:
                 pass
+        # 맥은 안 볼 때 프레임을 확 낮춘다 (퀸시 맥 실측 — 매끈 합성이
+        # 프레임당 ~14ms 라 30fps 로 계속 돌면 딴 작업 중에도 무겁다).
+        # 볼 때 24fps / 안 볼 때 12fps. 매끈이 아니어도 draw 자체가
+        # 프레임당 11ms 라(같은 실측) 안 볼 때는 15fps 로 낮춘다.
+        if IS_MAC and self._smooth_on:
+            gap = max(gap, 42 if smooth else 84)
+        elif IS_MAC and not smooth:
+            gap = max(gap, 66)
         # **예약은 본체를 돌린 뒤, 걸린 시간만큼 뒤로 미뤄서 한다**
         # (지뢰 129 의 본체판). 예전처럼 먼저 예약하면, 한 프레임이 gap 을
         # 넘길 때(맥에서 아바타를 키우면 시트가 커져 매 프레임 push 가
@@ -19546,6 +20000,19 @@ class Mascot:
                            font=(FONT, FS(9), "bold"), fill=cd["text"])
             sliders.append((sx0, sx1, y, key, lo, hi))
 
+        def gap_adjust_row(y):
+            """'끌어서 맞추기' — 설정을 닫고, 캐릭터를 위아래로 끌어 여백을
+            직접 맞추는 모드로 들어간다. 슬라이더 숫자로 맞추기 어려운
+            (머리 위 소품처럼) 큰 여백을 눈으로 보며 정한다."""
+            label(y, "여백 직접 조정")
+
+            def go():
+                win.destroy()      # 설정을 닫고 본체에서 끌어 맞춘다
+                self.root.after(
+                    150, lambda: self._safe("gap_adjust", self._gap_adjust_start))
+            pill(RX, y, "끌어서 맞추기", go, strong=True)
+            return 0
+
         def chevron(cx, y, sign):
             """sign -1이면 ‹, +1이면 › 모양."""
             for dy in (-5, 5):
@@ -19819,7 +20286,8 @@ class Mascot:
             disp += [
                 lambda ry: stepper(ry, "캐릭터 크기", "scale_pct", 50, 200, 10, "%"),
                 lambda ry: slider(ry, "타이머와 머리 사이 여백", "card_gap",
-                                  -20, 60),
+                                  CARD_GAP_MIN, CARD_GAP_MAX),
+                gap_adjust_row,
                 lambda ry: stepper(ry, "글자 크기", "font_pct",
                                    FONT_MIN, FONT_MAX, 5, "%"),
                 lambda ry: toggle(ry, "캐릭터 그림자", "shadow"),
@@ -20015,7 +20483,8 @@ class Mascot:
             new["sleep_min"] = max(1, int(new["sleep_min"]))
             new["day_start"] = max(0, min(12, int(new.get("day_start", 6))))
             new["scale_pct"] = max(50, min(200, int(new["scale_pct"])))
-            new["card_gap"] = max(-20, min(60, int(new.get("card_gap", 0))))
+            new["card_gap"] = max(CARD_GAP_MIN, min(CARD_GAP_MAX,
+                                                    int(new.get("card_gap", 0))))
             new["font_pct"] = max(FONT_MIN, min(FONT_MAX,
                                                 int(new["font_pct"])))
             for k in ("sound_volume", "pen_volume", "poke_volume",
@@ -24680,8 +25149,12 @@ class Mascot:
         flimg = self._safe_str(self._room_floor_img, kx1 - kx0, ky1 - ky0,
                                18 * k, ky1 - floor, band9)
         if flimg:
-            cv.create_image(int(kx0), int(floor), image=flimg, anchor="nw",
-                            tags="dyn")
+            # **카드 아래끝 기준(anchor="sw")** 으로 붙인다. 위끝 기준으로
+            # 놓으면 int 잘림 때문에 띠가 1~2px 떠서, 그 틈으로 뒤에 깔린
+            # 방 꾸미기 그림이 삐져 보인다 (사가 제보 — 맥은 배율이 달라
+            # 어긋남이 더 티가 난다). 아래를 붙이면 어긋날 수가 없다.
+            cv.create_image(int(kx0), int(math.ceil(ky1)), image=flimg,
+                            anchor="sw", tags="dyn")
         else:                     # 만들기 실패 — 예전 방식으로 물러난다
             self._rr(cv, kx0, floor, kx1, ky1, 18 * k,
                      fill=band9, width=0)
@@ -25301,10 +25774,13 @@ class Mascot:
                 self._oval(cv, hx + sx * hw * 0.23 - r2, ty - r2,
                                hx + sx * hw * 0.23 + r2, ty + r2,
                                fill=pink, width=0, tags="dyn")
+            # outline="" 필수 — 맥 Tk9 는 width=0 이어도 기본 검정
+            # 외곽선을 헤어라인으로 그려서, 작은 삼각형이 통째로 까맣게
+            # 보인다 (사가 제보 '하트 아래가 까만 삼각형' — CI 캡처 재현)
             cv.create_polygon(hx - hw * 0.47, ty + r2 * 0.35,
                               hx + hw * 0.47, ty + r2 * 0.35,
                               hx, cy2 + hw * 0.52,
-                              fill=pink, width=0, tags="dyn")
+                              fill=pink, outline="", width=0, tags="dyn")
             cv.create_text(hx + hw / 2 + gap, cy2, text=num, font=f2,
                            fill=pink, anchor="w", tags="dyn")
         self._room_song_hits[slot] = ((x0 - 3 * k, y0 - 3 * k,
