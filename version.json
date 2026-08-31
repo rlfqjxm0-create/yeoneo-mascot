@@ -1,7 +1,7 @@
 {
- "version": 1788092212,
+ "version": 1788186278,
  "files": {
-  "mascot.py": "bd1b61cdbbb0194d29bd5af7e9e6e11a074d7c43c0f38ba253232dd5814f3b4e",
+  "mascot.py": "96558e458abafb489796240fd15f270797af18ec00a48158a957568f9f5ef9a8",
   "parts_yeoneo/arm_key.png": "5880d3ef755195b0ab6574ec3c408940da9a49cfba4ef0419b6701d59898a8b6",
   "parts_yeoneo/arm_pen.png": "9f5989174ed0c9eb0e9b1d62040292a5122bf743d748e2e8b1943a1a6afa83d8",
   "parts_yeoneo/arm_right.png": "e8955c8085bfbd801dfdd7ae776124c0f53bbc7c263ead9811d4091a7bdea159",
@@ -529,6 +529,9 @@
   "stickers/__init__.py": "d77e3dc92cb353dced8d192c140643c6458bc3901facdf2e0a0d0830fa4244b7",
   "youtube_player.py": "0b2e0560b1bf72e55b8ab8623e3083a401842cdafe905a5a0186012617aee9bb"
  },
- "notes": [],
- "silent": true
+ "notes": [
+  "9월 1일 0시에 '월말정산'이 열려요 — 8월 한 달 동안 얼마나 그렸는지, 방 친구들 시상식까지 영수증 한 장으로 보여드려요 (홈 메뉴에 생깁니다)",
+  "그때 안 켜져 있어도 괜찮아요 — 다음에 타이머를 켜면 지난달 정산이 저절로 한 번 떠요",
+  "이번 업데이트를 받으려면 타이머를 껐다 켜 주세요 (켜 둔 채로는 새 기능이 안 들어와요)"
+ ]
 }
