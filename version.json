@@ -1,7 +1,7 @@
 {
- "version": 1788278249,
+ "version": 1788284303,
  "files": {
-  "mascot.py": "208048a98f6073ce8d5b067858a60a3e40adf08b54560e73832d2a9d7fc5ee47",
+  "mascot.py": "186436b5c5747e670a7c8ac1bd4142339fd65d7646604a9dc67419efce38c89e",
   "parts_yeoneo/arm_key.png": "5880d3ef755195b0ab6574ec3c408940da9a49cfba4ef0419b6701d59898a8b6",
   "parts_yeoneo/arm_pen.png": "9f5989174ed0c9eb0e9b1d62040292a5122bf743d748e2e8b1943a1a6afa83d8",
   "parts_yeoneo/arm_right.png": "e8955c8085bfbd801dfdd7ae776124c0f53bbc7c263ead9811d4091a7bdea159",
@@ -531,6 +531,9 @@
   "stickers/__init__.py": "d77e3dc92cb353dced8d192c140643c6458bc3901facdf2e0a0d0830fa4244b7",
   "youtube_player.py": "0b2e0560b1bf72e55b8ab8623e3083a401842cdafe905a5a0186012617aee9bb"
  },
- "notes": [],
- "silent": true
+ "notes": [
+  "보낸 쪽지도 열어 볼 수 있어요 — 쪽지함 > '보낸 쪽지' 에서 편지를 누르면 돼요",
+  "답장으로 보낸 편지에는 '답장' 표시가 붙고, 열면 위에 받은 편지·아래에 내 답장이 같이 보여요",
+  "편지가 길면 편지지 오른쪽 막대를 위아래로 눌러 넘겨요 (마우스 휠도 돼요)"
+ ]
 }
