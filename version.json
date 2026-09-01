@@ -1,7 +1,7 @@
 {
- "version": 1788266309,
+ "version": 1788267882,
  "files": {
-  "mascot.py": "130f99e904e6e69433684d7f748a3a6f302eaa18a3b8b914b9dadf42c4b96c47",
+  "mascot.py": "d02132c249a1e15d90e59874c0ac189108ae598dcd7c568e30b7fe6fd4a2d7c3",
   "parts_yeoneo/arm_key.png": "5880d3ef755195b0ab6574ec3c408940da9a49cfba4ef0419b6701d59898a8b6",
   "parts_yeoneo/arm_pen.png": "9f5989174ed0c9eb0e9b1d62040292a5122bf743d748e2e8b1943a1a6afa83d8",
   "parts_yeoneo/arm_right.png": "e8955c8085bfbd801dfdd7ae776124c0f53bbc7c263ead9811d4091a7bdea159",
@@ -532,10 +532,6 @@
   "youtube_player.py": "0b2e0560b1bf72e55b8ab8623e3083a401842cdafe905a5a0186012617aee9bb"
  },
  "notes": [
-  "뽀모도로 '이번 주' 그래프가 월요일부터 시작해요 — 요일이 늘 같은 자리!",
-  "타이머를 끈 채 아침 6시를 넘겨도 어제 뽀모도로 기록이 안 사라져요",
-  "긴 편지도 끝까지 읽혀요 — 편지지 오른쪽 화살표나 마우스 휠로 넘겨요",
-  "우표에 진한 테두리가 생겨 봉투 위에서도 또렷하게 보여요",
-  "맥에서도 하드모드 효과가 나와요 — 빨간 깜빡임과 감시 등장까지!"
+  "하루에 보낼 수 있는 편지가 10통에서 30통으로 늘었어요!"
  ]
 }
