@@ -73,18 +73,29 @@ OFF_X, OFF_Y = -30000, -30000
 LOGIN_URL = ("https://accounts.google.com/ServiceLogin"
              "?continue=https%3A%2F%2Fwww.youtube.com%2F&hl=ko")
 
+GWL_STYLE = -16
 GWL_EXSTYLE = -20
+WS_CHILD = 0x40000000
+WS_POPUP = 0x80000000
+# 끼워 넣을 때 벗길 창틀 — 제목 줄·테두리·크기 조절·단추
+WS_FRAME = 0x00C00000 | 0x00040000 | 0x00080000 | 0x00030000
+_STYLE0 = None                    # 끼우기 전 스타일 (뗄 때 되돌린다)
 WS_EX_TOOLWINDOW = 0x00000080     # 작업표시줄·Alt+Tab 에 안 뜨게
 WS_EX_NOACTIVATE = 0x08000000     # 포커스를 빼앗지 않게
 
 PAGE = """<!doctype html>
 <html><head><meta charset="utf-8">
-<style>html,body{margin:0;padding:0;background:#000;overflow:hidden}</style>
+<style>html,body{margin:0;padding:0;background:#000;overflow:hidden;
+width:100%;height:100%}
+#p{display:block;border:0}</style>
 </head><body>
 <div id="p"></div>
 <script src="https://www.youtube.com/iframe_api"></script>
 <script>
 var pl = null, ready = false, lastErr = 0, pending = null;
+// 소리만 쓸 때는 가장 낮은 화질로 둔다 (디코딩을 아낀다). 영상을 보여
+// 줄 때만 fit 을 켜서 창을 꽉 채우고 화질을 유튜브에 맡긴다.
+var fit = false;
 
 function onYouTubeIframeAPIReady() {
   pl = new YT.Player('p', {
@@ -95,14 +106,16 @@ function onYouTubeIframeAPIReady() {
     events: {
       onReady: function () {
         ready = true;
-        try { pl.setPlaybackQuality('small'); } catch (e) {}
+        if (!fit) { try { pl.setPlaybackQuality('small'); } catch (e) {} }
         if (pending) { var q = pending; pending = null; q(); }
       },
       onError: function (e) { lastErr = e.data || 0; },
       onStateChange: function (e) {
         // 화질은 재생이 시작될 때마다 유튜브가 되돌리므로 다시 낮춘다.
         // 소리만 들으니 제일 낮은 화질이면 충분하다 (디코딩 비용 절약).
-        if (e.data === 1) { try { pl.setPlaybackQuality('small'); } catch (x) {} }
+        if (e.data === 1 && !fit) {
+          try { pl.setPlaybackQuality('small'); } catch (x) {}
+        }
       }
     }
   });
@@ -121,6 +134,22 @@ window.ytLoad = function (vid, list, vol) {
 window.ytPlay  = function () { return later(function () { pl.playVideo(); }); };
 window.ytPause = function () { return later(function () { pl.pauseVideo(); }); };
 window.ytVol   = function (v) { return later(function () { pl.setVolume(v); }); };
+
+window.ytFit = function (on) {
+  // 창을 꽉 채운다. setSize 는 CSS 픽셀이라 화면 배율만큼 커져 잘린다 —
+  // 100% 로 두고 브라우저에 맡긴다.
+  fit = !!on;
+  var el = document.getElementById('p');
+  if (el) {
+    el.removeAttribute('width');
+    el.removeAttribute('height');
+    el.style.width = fit ? '100%' : '320px';
+    el.style.height = fit ? '100%' : '180px';
+  }
+  return later(function () {
+    if (!fit) { try { pl.setPlaybackQuality('small'); } catch (e) {} }
+  });
+};
 
 window.ytStatus = function () {
   var o = {ready: ready, state: -9, pos: 0, dur: 0, title: '', vid: '',
@@ -201,6 +230,102 @@ def _park_offscreen():
         return False
 
 
+def _i32(v):
+    """SetWindowLongW 에 넘길 수 있게 부호 있는 32비트로."""
+    v &= 0xFFFFFFFF
+    return v - (1 << 32) if v >= (1 << 31) else v
+
+
+def _round_rgn(u, wh, w, h, r):
+    """창을 둥글게 오려 낸다 (카드 모서리와 맞추려고).
+
+    핸들은 반드시 형을 정해 받는다 — 64비트에서 잘리면 조용히 실패한다
+    (지뢰 23).
+    """
+    try:
+        if r <= 0:
+            return
+        g = ctypes.WinDLL("gdi32", use_last_error=True)
+        g.CreateRoundRectRgn.argtypes = [ctypes.c_int] * 6
+        g.CreateRoundRectRgn.restype = ctypes.c_void_p
+        u.SetWindowRgn.argtypes = [wt.HWND, ctypes.c_void_p, ctypes.c_int]
+        u.SetWindowRgn.restype = ctypes.c_int
+        rgn = g.CreateRoundRectRgn(0, 0, int(w) + 1, int(h) + 1,
+                                   int(r) * 2, int(r) * 2)
+        if rgn:
+            u.SetWindowRgn(wh, rgn, 1)      # 소유권이 창으로 넘어간다
+    except Exception:
+        pass
+
+
+def _embed(parent, x, y, w, h, r=0):
+    """부모 창(다른 프로세스여도 된다) 안에 자식 창으로 끼워 넣는다.
+
+    좌표는 부모의 **클라이언트 영역** 기준이다. 끼워 넣으면 부모를 끌거나
+    크기를 바꿀 때 저절로 따라오고 밖으로 나간 부분은 잘린다.
+    """
+    global _STYLE0
+    try:
+        u, wh = _main_window()
+        if not wh or not parent:
+            return False
+        u.SetParent.argtypes = [wt.HWND, wt.HWND]
+        u.SetParent.restype = wt.HWND
+        st = u.GetWindowLongW(wh, GWL_STYLE) & 0xFFFFFFFF
+        if _STYLE0 is None:
+            _STYLE0 = st
+        # 창틀을 통째로 벗긴다 — 안 벗기면 제목 줄과 단추가 같이 들어온다
+        u.SetWindowLongW(wh, GWL_STYLE,
+                         _i32((st & ~WS_POPUP & ~WS_FRAME) | WS_CHILD))
+        ex = u.GetWindowLongW(wh, GWL_EXSTYLE) & 0xFFFFFFFF
+        # 도구창 속성은 뗀다 (자식 창에는 뜻이 없다). 포커스는 계속 안 뺏는다.
+        u.SetWindowLongW(wh, GWL_EXSTYLE,
+                         _i32((ex | WS_EX_NOACTIVATE) & ~WS_EX_TOOLWINDOW))
+        u.SetParent(wh, wt.HWND(int(parent)))
+        # SWP_SHOWWINDOW | SWP_NOACTIVATE | SWP_NOZORDER | SWP_FRAMECHANGED
+        u.SetWindowPos(wh, 0, int(x), int(y), int(w), int(h),
+                       0x40 | 0x10 | 0x4 | 0x20)
+        _round_rgn(u, wh, w, h, r)
+        u.ShowWindow(wh, 8)                 # SW_SHOWNA
+        return True
+    except Exception:
+        return False
+
+
+def _vidbox(x, y, w, h, r=0):
+    """끼워 넣은 채로 자리·크기만."""
+    try:
+        u, wh = _main_window()
+        if not wh:
+            return False
+        u.SetWindowPos(wh, 0, int(x), int(y), int(w), int(h), 0x10 | 0x4)
+        _round_rgn(u, wh, w, h, r)
+        return True
+    except Exception:
+        return False
+
+
+def _unembed():
+    """떼어 내 다시 화면 밖으로 (부모 창이 사라지기 전에 반드시)."""
+    try:
+        u, wh = _main_window()
+        if not wh:
+            return False
+        u.SetParent.argtypes = [wt.HWND, wt.HWND]
+        u.SetParent.restype = wt.HWND
+        u.SetWindowRgn.argtypes = [wt.HWND, ctypes.c_void_p, ctypes.c_int]
+        u.SetWindowRgn(wh, None, 0)        # 둥글게 오린 것을 되돌린다
+        st = u.GetWindowLongW(wh, GWL_STYLE) & 0xFFFFFFFF
+        want = _STYLE0 if _STYLE0 is not None else ((st & ~WS_CHILD) | WS_POPUP)
+        u.SetWindowLongW(wh, GWL_STYLE, _i32(want))
+        u.SetParent(wh, wt.HWND(0))
+        # SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED
+        u.SetWindowPos(wh, 0, 0, 0, 0, 0, 0x2 | 0x1 | 0x4 | 0x20)
+        return _park_offscreen()
+    except Exception:
+        return False
+
+
 def _bring_out(x, y, w, h):
     """로그인할 때 — 평범한 창으로 되돌리고 화면 안으로 꺼낸다.
 
@@ -258,6 +383,7 @@ class Player:
         # 먼저 되감아 부모가 'ended' 를 못 보고 같은 곡이 반복된다.
         self.loop = True
         self.mode = "play"           # play | login | watch(임베드 막힘 폴백)
+        self.fit = False             # 부모 창 안에 끼워 넣어 영상을 보이는가
         self.signed = None           # 로그인 상태를 확인했는가 (모르면 None)
         self.cur = ("", "")          # 지금 틀어 둔 (영상, 재생목록)
         self.resume = False          # 로그인에서 돌아와 다시 틀어야 하는가
@@ -319,6 +445,23 @@ class Player:
                 self._watch_vol = -1         # 다음 바퀴에 새 볼륨을 건다
             else:
                 self.js("ytVol(%d)" % self.vol)
+        elif c == "embed":
+            # 영상 보기 — 부모 창 안으로 들어간다 (요청)
+            if _embed(msg.get("p"), msg.get("x", 0), msg.get("y", 0),
+                      msg.get("w", 320), msg.get("h", 180),
+                      msg.get("r", 0)):
+                self.fit = True
+                self.js("ytFit(1)")
+        elif c == "vidbox":
+            if self.fit:
+                _vidbox(msg.get("x", 0), msg.get("y", 0),
+                        msg.get("w", 320), msg.get("h", 180),
+                        msg.get("r", 0))
+                self.js("ytFit(1)")
+        elif c == "unembed":
+            self.fit = False
+            self.js("ytFit(0)")
+            _unembed()
         elif c == "login":
             self.begin_login(msg.get("x", 200), msg.get("y", 120))
         elif c == "login_done":
@@ -616,6 +759,17 @@ def _main():
         _park_offscreen()                # show가 자리를 되돌릴 수 있어 한 번 더
         # 창을 만들자마자 상태를 물으면 아직 페이지가 없다. 조금 기다린다.
         while not stop.wait(0.4):
+            if pl.fit:
+                # 끼워 넣은 채로 부모 창이 사라지면 우리 창도 같이 죽는다.
+                # 그대로 두면 '프로세스는 살아 있는데 소리가 안 나는' 상태가
+                # 되므로, 부모가 알아채게 여기서 끝낸다.
+                try:
+                    u9, h9 = _main_window()
+                    if not h9 or not u9.IsWindow(h9):
+                        os.write(2, b"embed: parent window gone\n")
+                        break
+                except Exception:
+                    pass
             try:
                 if pl.mode == "login":
                     pl.check_login()
