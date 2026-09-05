@@ -1,5 +1,5 @@
 {
- "version": 1788616910,
+ "version": 1788617211,
  "files": {
   "mascot.py": "02923098062b9ed864df4af0a5f583b02abac81bd3106cd039250e6c88e87287",
   "parts_yeoneo/arm_key.png": "5880d3ef755195b0ab6574ec3c408940da9a49cfba4ef0419b6701d59898a8b6",
@@ -537,6 +537,11 @@
   "stickers/__init__.py": "d77e3dc92cb353dced8d192c140643c6458bc3901facdf2e0a0d0830fa4244b7",
   "youtube_player.py": "9bf9c57c6b368e5ccb2765fb2fca423ea766c23596b606e52bc068046c8c8eac"
  },
- "notes": [],
- "silent": true
+ "notes": [
+  "오노추 하트 — 목록에도 보이고, 껐다 켜도 남아요 (노래 주인이 꺼져 있어도 세요)",
+  "재생 중에 복사한 주소(watch?v=…&list=…)도 재생목록으로 펼쳐요",
+  "브리핑 '하루의 구성'이 24시간을 넘던 것을 고쳤어요",
+  "(맥) 플레이리스트 영상이 까맣게 보이던 것 — 이제 창 위로 올라와요",
+  "(맥) 유튜브 로그인 뒤에도 '로그인 안 됨'이 남던 것을 고쳤어요"
+ ]
 }
