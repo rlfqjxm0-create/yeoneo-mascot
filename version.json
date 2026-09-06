@@ -1,7 +1,7 @@
 {
- "version": 1788726149,
+ "version": 1788727868,
  "files": {
-  "mascot.py": "02e63428c3345b2653e8fc8994dbdd4ee3e74f47416ef6888484979af473573f",
+  "mascot.py": "40e2d69a261e74ae76579d44856c5054d112cb612ad2f0e0bd4bb11015aec150",
   "parts_yeoneo/arm_key.png": "5880d3ef755195b0ab6574ec3c408940da9a49cfba4ef0419b6701d59898a8b6",
   "parts_yeoneo/arm_pen.png": "9f5989174ed0c9eb0e9b1d62040292a5122bf743d748e2e8b1943a1a6afa83d8",
   "parts_yeoneo/arm_right.png": "e8955c8085bfbd801dfdd7ae776124c0f53bbc7c263ead9811d4091a7bdea159",
@@ -13,7 +13,7 @@
   "parts_yeoneo/chip_meta.json": "19d1e6c8695852c7445dbb541df4050fb3d0ca7eb0fcbfb71f30cd96c3c757d2",
   "parts_yeoneo/chip_movie.png": "43bfa1493af45a8adc05b455acda466b56cad4394229cd8a706ae5cde09ed642",
   "parts_yeoneo/chip_spoon.png": "9c1f69af5de27a78fcff161bc8cacbe21aa3ce8cc5b8ea8294517ae23925f08f",
-  "parts_yeoneo/config.json": "c01802d4676b5cdd9e202446f56aa552ed908a4acde2479cf95f406fab8adf68",
+  "parts_yeoneo/config.json": "50b5de4e622d00b29af031641b921ce15075519fcac76e09226a3aeeb509d926",
   "parts_yeoneo/config.json.bak": "c01802d4676b5cdd9e202446f56aa552ed908a4acde2479cf95f406fab8adf68",
   "parts_yeoneo/crown.png": "b1b7426a0222ac294a782cb06db6c9c4aba4e660591dd1761dc9e4da050175fc",
   "parts_yeoneo/desk.png": "7002c97c2c42baea38744d02fe5abf2fee063845665bd7bcd4bbced4254daa06",
@@ -537,12 +537,6 @@
   "stickers/__init__.py": "d77e3dc92cb353dced8d192c140643c6458bc3901facdf2e0a0d0830fa4244b7",
   "youtube_player.py": "9bf9c57c6b368e5ccb2765fb2fca423ea766c23596b606e52bc068046c8c8eac"
  },
- "notes": [
-  "뽀모도로 창 ✿ 메뉴에 '소리 조절' — 알림음마다 게이지로 크기를 맞추고 바로 들어볼 수 있어요 (기본은 더 크게)",
-  "플레이리스트에 정지(■) 단추 — 누르면 재생기가 꺼지고 타이머 위 재생 줄도 사라져요 (환경음이 켜져 있어도)",
-  "같이하기 중에 앱을 끄면 이제 친구들 화면에 퇴장 인사(손 흔들기)가 나와요 — 전에는 8분 뒤 조용히 빠졌어요",
-  "홈 '오늘 다 같이' 목표가 40시간이 됐어요",
-  "폼(변신)을 입었을 때 도구로 넣은 소품이 안 보이던 것을 고쳤어요",
-  "깅규·하독에 빠져 있던 왕관·고깔·하늘 그림을 채우고, 전체 점검으로 숨은 오류(쓰다듬기 손 그림 등)를 고쳤어요"
- ]
+ "notes": [],
+ "silent": true
 }
