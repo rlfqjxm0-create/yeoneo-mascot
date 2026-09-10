@@ -107,6 +107,7 @@ function onYouTubeIframeAPIReady() {
       onReady: function () {
         ready = true;
         if (!fit) { try { pl.setPlaybackQuality('small'); } catch (e) {} }
+        noCaptions();
         if (pending) { var q = pending; pending = null; q(); }
       },
       onError: function (e) { lastErr = e.data || 0; },
@@ -116,9 +117,18 @@ function onYouTubeIframeAPIReady() {
         if (e.data === 1 && !fit) {
           try { pl.setPlaybackQuality('small'); } catch (x) {}
         }
+        // 자막은 기본 끄기 (요청) — 곡마다 유튜브가 계정 설정대로 도로
+        // 켜므로 재생이 시작될 때마다 내린다.
+        if (e.data === 1 || e.data === 3) { noCaptions(); }
       }
     }
   });
+}
+
+function noCaptions() {
+  // 자막 모듈을 내린다 — cc_load_policy 는 '켜기'만 있고 '끄기'가 없다.
+  try { pl.unloadModule('captions'); } catch (e) {}
+  try { pl.unloadModule('cc'); } catch (e) {}
 }
 
 function later(fn) { if (ready) { fn(); return true; } pending = fn; return false; }
@@ -134,6 +144,7 @@ window.ytLoad = function (vid, list, vol) {
 window.ytPlay  = function () { return later(function () { pl.playVideo(); }); };
 window.ytPause = function () { return later(function () { pl.pauseVideo(); }); };
 window.ytVol   = function (v) { return later(function () { pl.setVolume(v); }); };
+window.ytSeek  = function (t) { return later(function () { pl.seekTo(t, true); }); };
 
 window.ytFit = function (on) {
   // 창을 꽉 채운다. setSize 는 CSS 픽셀이라 화면 배율만큼 커져 잘린다 —
@@ -445,6 +456,17 @@ class Player:
                 self._watch_vol = -1         # 다음 바퀴에 새 볼륨을 건다
             else:
                 self.js("ytVol(%d)" % self.vol)
+        elif c == "seek":
+            # 재생 위치 옮기기 (부모의 위치 바) — 두 페이지 다
+            try:
+                t9 = max(0.0, float(msg.get("t", 0) or 0))
+            except (TypeError, ValueError):
+                return
+            if self.mode == "watch":
+                self._watch_js_do("seekTo(%.2f,true)" % t9,
+                                  "v.currentTime=%.2f" % t9)
+            else:
+                self.js("ytSeek(%.2f)" % t9)
         elif c == "embed":
             # 영상 보기 — 부모 창 안으로 들어간다 (요청)
             if _embed(msg.get("p"), msg.get("x", 0), msg.get("y", 0),
@@ -452,16 +474,30 @@ class Player:
                       msg.get("r", 0)):
                 self.fit = True
                 self.js("ytFit(1)")
+                self.watch_fit()
         elif c == "vidbox":
             if self.fit:
                 _vidbox(msg.get("x", 0), msg.get("y", 0),
                         msg.get("w", 320), msg.get("h", 180),
                         msg.get("r", 0))
                 self.js("ytFit(1)")
+                self.watch_fit()
         elif c == "unembed":
             self.fit = False
             self.js("ytFit(0)")
+            self.watch_fit()
             _unembed()
+        elif c == "js":
+            # 진단용 — 부모(검사)가 페이지 안을 들여다본다. 답은 상태 줄에
+            # 실어 보낸다 (지뢰 131 — 보내는 진단은 받는 쪽까지).
+            try:
+                got = self.js(str(msg.get("e") or ""))
+                sys.stdout.write("@YT " + json.dumps(
+                    {"js": got, "tag": msg.get("tag")}, ensure_ascii=False,
+                    default=str) + "\n")
+                sys.stdout.flush()
+            except Exception:
+                pass
         elif c == "login":
             self.begin_login(msg.get("x", 200), msg.get("y", 120))
         elif c == "login_done":
@@ -487,6 +523,52 @@ class Player:
         "pos:v.currentTime||0,dur:v.duration||0,"
         "title:document.title.replace(/ - YouTube$/,''),vid:''};"
         "})()")
+
+    # 본 페이지에는 머리띠·검색·추천·댓글이 다 있다. 영상을 보여 줄 때
+    # 그대로 끼워 넣으면 **유튜브 창이 통째로** 들어와 보인다 (제보 —
+    # 'Premium' 머리띠와 스크롤바가 보였다). 영상 칸만 창에 꽉 채우고
+    # 나머지는 감춘다. 조작 띠도 감춘다 — 위치 바는 부모가 그린다.
+    WATCH_FIT_CSS = (
+        "html,body{overflow:hidden!important;background:#000!important}"
+        "ytd-app{background:#000!important}"
+        "#masthead-container,ytd-masthead,#secondary,#below,#comments,"
+        "ytd-watch-metadata,#chat,tp-yt-app-drawer,#guide,#related,#info,"
+        "#player-ads,ytd-merch-shelf-renderer,.ytp-chrome-top,"
+        ".ytp-chrome-bottom,.ytp-gradient-top,.ytp-gradient-bottom,"
+        ".ytp-paid-content-overlay,.ytp-ce-element,.ytp-cards-button,"
+        ".ytp-pause-overlay,.ytp-cued-thumbnail-overlay,"
+        # 자막은 기본 끄기 (요청) — 본 페이지는 계정 설정대로 자막을 켠다
+        ".ytp-caption-window-container,.caption-window{display:none!important}"
+        "#movie_player{position:fixed!important;left:0!important;top:0!important;"
+        "width:100vw!important;height:100vh!important;z-index:2147483647!important;"
+        "background:#000!important}"
+        # 영상을 감싸는 칸도 같이 채워야 한다 — movie_player 만 채우면
+        # 안쪽 칸이 0 높이라 **까맣게만** 보인다 (실제 재생기로 재현 —
+        # video 의 rect 가 [0,0,640,0]).
+        ".html5-video-container{position:absolute!important;left:0!important;"
+        "top:0!important;width:100%!important;height:100%!important;"
+        "transform:none!important}"
+        "#movie_player video{position:absolute!important;width:100%!important;"
+        "height:100%!important;left:0!important;top:0!important;"
+        "transform:none!important;object-fit:contain}")
+
+    def watch_fit(self):
+        """본 페이지(watch 폴백)에서 영상만 남긴다 — fit 이면 걸고 아니면 뗀다.
+
+        한 번 걸면 페이지가 바뀔 때까지 남으므로 id 로 겹치지 않게 한다.
+        watch_tick 이 바퀴마다 부른다 — 페이지가 다시 떠도 다시 걸리게.
+        """
+        if self.mode != "watch":
+            return
+        if self.fit:
+            self.js("(function(){if(document.getElementById('enafit'))return;"
+                    "var s=document.createElement('style');s.id='enafit';"
+                    "s.textContent=%s;(document.head||document.documentElement)"
+                    ".appendChild(s);try{window.dispatchEvent(new Event('resize'))}"
+                    "catch(e){}})()" % json.dumps(self.WATCH_FIT_CSS))
+        else:
+            self.js("(function(){var s=document.getElementById('enafit');"
+                    "if(s)s.remove();})()")
 
     def _watch_js_do(self, api_call, video_stmt):
         """movie_player API 를 먼저, 없으면 video 요소로."""
@@ -521,6 +603,7 @@ class Player:
         now = time.time()
         if not s.get("ready"):
             return
+        self.watch_fit()                 # 페이지가 새로 떴으면 다시 건다
         if self._watch_vol != self.vol:
             self._watch_vol = self.vol
             self._watch_js_do("setVolume(%d)" % self.vol,
