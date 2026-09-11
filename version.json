@@ -1,7 +1,7 @@
 {
- "version": 1789114900,
+ "version": 1789133414,
  "files": {
-  "mascot.py": "05fe607827b429cb7562b9b7c31cd67303b84c95aea6d2b5ec812bbcdf1e238a",
+  "mascot.py": "a33dcd5a357f46f49fbceac49b2d2846cb3451f87fb44e6253286129b83736f3",
   "parts_yeoneo/arm_key.png": "5880d3ef755195b0ab6574ec3c408940da9a49cfba4ef0419b6701d59898a8b6",
   "parts_yeoneo/arm_pen.png": "9f5989174ed0c9eb0e9b1d62040292a5122bf743d748e2e8b1943a1a6afa83d8",
   "parts_yeoneo/arm_right.png": "e8955c8085bfbd801dfdd7ae776124c0f53bbc7c263ead9811d4091a7bdea159",
@@ -13,7 +13,7 @@
   "parts_yeoneo/chip_meta.json": "19d1e6c8695852c7445dbb541df4050fb3d0ca7eb0fcbfb71f30cd96c3c757d2",
   "parts_yeoneo/chip_movie.png": "43bfa1493af45a8adc05b455acda466b56cad4394229cd8a706ae5cde09ed642",
   "parts_yeoneo/chip_spoon.png": "9c1f69af5de27a78fcff161bc8cacbe21aa3ce8cc5b8ea8294517ae23925f08f",
-  "parts_yeoneo/config.json": "3c05d8d469edb854a8898efce7f79a4efb8d59b57c1f1f63e5a0110d516f9e23",
+  "parts_yeoneo/config.json": "a9b778350ee2d542254b4f3fe8dbdaa0d60fad6468dc9888cdae3626b18bd206",
   "parts_yeoneo/config.json.bak": "c01802d4676b5cdd9e202446f56aa552ed908a4acde2479cf95f406fab8adf68",
   "parts_yeoneo/crown.png": "b1b7426a0222ac294a782cb06db6c9c4aba4e660591dd1761dc9e4da050175fc",
   "parts_yeoneo/desk.png": "7002c97c2c42baea38744d02fe5abf2fee063845665bd7bcd4bbced4254daa06",
@@ -576,10 +576,14 @@
   "stickers/sticker_icon.ico": "e1ced0f5c5cd1b963ebfad7d839b5b1d78959ac0fc37bba5859a40c0afda4221",
   "stickers/textmaker.py": "f75a9e4e9cac8ac120ee2ac3bec6546572e1cb908f3bd6ca6605913b6f18f471",
   "stickers/__init__.py": "d77e3dc92cb353dced8d192c140643c6458bc3901facdf2e0a0d0830fa4244b7",
-  "youtube_player.py": "41c1ed27c7ffe17a489621285955c7ff33ad5ee5dae18b68b8e0caef678058e5"
+  "youtube_player.py": "6a1893353a56493b0168ecf6ab79433dd3bec126768add4ade33420407007dae"
  },
  "notes": [
-  "스톱워치 숫자가 커졌다 작아졌다 깜빡이던 것 고침 — 아이폰처럼 같은 크기·같은 자리에서 부드럽게 흘러요",
-  "스톱워치 다이얼 안 글자를 조금 줄여 눈금에 안 닿게 · 뽀모도로/스톱워치 탭 아이콘을 세로 정중앙에"
+  "새 기능 '데드라인 시계' — 뽀모도로 창 가운데 탭(시계 아이콘)에서 이름과 목표 시각을 정하면 바탕화면에 아날로그 시계 스티커가 붙어요. 창을 닫으면 시계가 나타나고, 끌어서 자리를 옮기고, 시계를 누르면 창이 열려요",
+  "목표는 '23:00' · '3시간' · '90분' · '내일 09:00' 처럼 적어요 (빠른 단추: +1시간 · +3시간 · 자정 · 06:00). 지난 시각을 적으면 내일 그 시각이에요",
+  "읽는 법 — 1시간 넘게 남으면 테두리 띠(시침 기준)로, 1시간 안이면 판 안쪽 칠(분침 기준)로 남은 시간이 보여요. 진한 점이 목표 시각이고, 색은 여유 → 1시간 안 → 15분 안 순으로 진해져요. 아래 알약에 이름·남은 시간·연장 횟수",
+  "시각이 되면 캐릭터가 물어요 — 끝냈어 / 그만할래 / +15분·+30분·+1시간·직접 입력. 답이 없으면 5분마다 다시 물어요 (자동으로 실패 처리하지 않아요). 결과는 탭 아래 '최근 기록'에 남아요",
+  "시계 우클릭 메뉴 — 끝냈어 · +30분/+1시간 연장 · 직접 입력('30' · '1시간 30분' · '23:00') · 크게/작게 · 아래 글자 숨기기 · 위치 고정 · 시계 창 열기 · 그만두기",
+  "함께 고친 것 — 플레이리스트를 켤 때 작업표시줄에 엉뚱한 이름의 단추가 뜨던 것. 맥은 시계 스티커가 색상키 창으로 떠요 (모양은 같고 그림자만 없어요)"
  ]
 }

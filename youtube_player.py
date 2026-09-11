@@ -68,6 +68,15 @@ except Exception:
     except Exception:
         pass
 
+# 작업표시줄 이름표. 없으면 윈도우가 '같은 pythonw.exe 를 가리키는 시작 메뉴
+# 바로가기'의 이름·아이콘으로 묶어, 단추가 '마비노기 숙제 탭'으로 떴다 (지뢰 209).
+# 창을 만들기 전에 걸어야 한다. 전용 손잡이로 부른다 (지뢰 21).
+try:
+    ctypes.WinDLL("shell32").SetCurrentProcessExplicitAppUserModelID(
+        "ena.mascot.player")
+except Exception:
+    pass
+
 # 모든 모니터 바깥이면서, 최소화한 창이 쓰는 마법의 자리(-32000)는 피한 좌표.
 OFF_X, OFF_Y = -30000, -30000
 LOGIN_URL = ("https://accounts.google.com/ServiceLogin"
@@ -82,6 +91,8 @@ WS_FRAME = 0x00C00000 | 0x00040000 | 0x00080000 | 0x00030000
 _STYLE0 = None                    # 끼우기 전 스타일 (뗄 때 되돌린다)
 WS_EX_TOOLWINDOW = 0x00000080     # 작업표시줄·Alt+Tab 에 안 뜨게
 WS_EX_NOACTIVATE = 0x08000000     # 포커스를 빼앗지 않게
+# WinForms 가 폼에 거는 표식 — 있으면 도구창이어도 작업표시줄에 뜬다 (지뢰 209)
+WS_EX_APPWINDOW = 0x00040000
 
 PAGE = """<!doctype html>
 <html><head><meta charset="utf-8">
@@ -226,19 +237,38 @@ def _park_offscreen():
         u, h = _main_window()
         if not h:
             return False
-        ex = u.GetWindowLongW(h, GWL_EXSTYLE)
-        want = ex | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE
+        ex = u.GetWindowLongW(h, GWL_EXSTYLE) & 0xFFFFFFFF
+        # APPWINDOW 도 떼야 한다 — 도구창 표식보다 우선해 단추를 만든다.
+        want = (ex | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE) & ~WS_EX_APPWINDOW
         if want != ex and u.IsWindowVisible(h):
             u.ShowWindow(h, 0)                 # SW_HIDE
-            u.SetWindowLongW(h, GWL_EXSTYLE, want)
+            u.SetWindowLongW(h, GWL_EXSTYLE, _i32(want))
             u.ShowWindow(h, 8)                 # SW_SHOWNA (활성화하지 않고)
         else:
-            u.SetWindowLongW(h, GWL_EXSTYLE, want)
+            u.SetWindowLongW(h, GWL_EXSTYLE, _i32(want))
         # SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE
         u.SetWindowPos(h, 0, OFF_X, OFF_Y, 0, 0, 0x1 | 0x4 | 0x10)
         return True
     except Exception:
         return False
+
+
+def _taskbar_guard():
+    """작업표시줄 표식이 되살아났으면 도로 뗀다 (끼워 넣지 않았을 때만 부른다).
+
+    뜨는 순간의 타이밍에 따라 WinForms 가 창을 보이며 APPWINDOW 를 다시 걸어
+    두 번 중 한 번은 단추가 남았다 (지뢰 209). 표식만 읽으므로 싸다.
+    """
+    try:
+        u, h = _main_window()
+        if not h:
+            return False
+        ex = u.GetWindowLongW(h, GWL_EXSTYLE) & 0xFFFFFFFF
+        if (ex & WS_EX_APPWINDOW) or not (ex & WS_EX_TOOLWINDOW):
+            return _park_offscreen()
+    except Exception:
+        pass
+    return False
 
 
 def _i32(v):
@@ -291,7 +321,8 @@ def _embed(parent, x, y, w, h, r=0):
         ex = u.GetWindowLongW(wh, GWL_EXSTYLE) & 0xFFFFFFFF
         # 도구창 속성은 뗀다 (자식 창에는 뜻이 없다). 포커스는 계속 안 뺏는다.
         u.SetWindowLongW(wh, GWL_EXSTYLE,
-                         _i32((ex | WS_EX_NOACTIVATE) & ~WS_EX_TOOLWINDOW))
+                         _i32((ex | WS_EX_NOACTIVATE) & ~WS_EX_TOOLWINDOW
+                              & ~WS_EX_APPWINDOW))
         u.SetParent(wh, wt.HWND(int(parent)))
         # SWP_SHOWWINDOW | SWP_NOACTIVATE | SWP_NOZORDER | SWP_FRAMECHANGED
         u.SetWindowPos(wh, 0, int(x), int(y), int(w), int(h),
@@ -842,6 +873,8 @@ def _main():
         _park_offscreen()                # show가 자리를 되돌릴 수 있어 한 번 더
         # 창을 만들자마자 상태를 물으면 아직 페이지가 없다. 조금 기다린다.
         while not stop.wait(0.4):
+            if not pl.fit and pl.mode != "login":
+                _taskbar_guard()           # 작업표시줄에 도로 뜨지 않게 (지뢰 209)
             if pl.fit:
                 # 끼워 넣은 채로 부모 창이 사라지면 우리 창도 같이 죽는다.
                 # 그대로 두면 '프로세스는 살아 있는데 소리가 안 나는' 상태가
