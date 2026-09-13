@@ -414,6 +414,34 @@ def _serve():
     return srv, srv.server_address[1]
 
 
+def _web_mute(win, on):
+    """WebView2 페이지 소리를 브라우저째 끄고 켠다. 못 하면 False (지뢰 214).
+
+    본 페이지(watch 폴백)는 유튜브가 **자기 기본 볼륨 100 으로 먼저 틀어**,
+    우리가 볼륨을 걸기까지 0.1~0.4초 동안 소리가 두 배 넘게 튄다 (실측 —
+    '가끔 볼륨이 확 커졌다가 돌아온다' 제보). 페이지 안에서는 그보다 먼저
+    손쓸 길이 없어 브라우저 쪽(CoreWebView2.IsMuted)에서 막는다.
+    옛 WebView2 부품이거나 가짜 창이면 조용히 물러난다.
+    """
+    try:
+        wv = win.native.browser.webview
+        from System import Action
+        wv.Invoke(Action(lambda: setattr(wv.CoreWebView2, "IsMuted", bool(on))))
+        return True
+    except Exception:
+        return False
+
+
+def _web_muted(win):
+    """지금 브라우저째 음소거인가 (진단·검사용). 못 읽으면 None."""
+    try:
+        wv = win.native.browser.webview
+        from System import Func, Object
+        return bool(wv.Invoke(Func[Object](lambda: wv.CoreWebView2.IsMuted)))
+    except Exception:
+        return None
+
+
 class Player:
     def __init__(self, window, page):
         self.win = window
@@ -435,6 +463,9 @@ class Player:
         self._watch_at = 0.0         # watch 폴백을 시작한 시각
         self._watch_kick = 0.0       # watch 에서 마지막으로 재생을 민 시각
         self._watch_vol = -1         # watch 페이지에 적용해 둔 볼륨
+        self._watch_ok = False       # 그 볼륨이 실제로 들어간 것을 읽어 확인했나
+        self._hush = False           # 볼륨이 들어갈 때까지 브라우저째 음소거 중 (지뢰 214)
+        self._hush_at = 0.0
 
     # ── 페이지에 말 걸기 ──────────────────────────────────────────────────
     def js(self, expr):
@@ -524,7 +555,8 @@ class Player:
             try:
                 got = self.js(str(msg.get("e") or ""))
                 sys.stdout.write("@YT " + json.dumps(
-                    {"js": got, "tag": msg.get("tag")}, ensure_ascii=False,
+                    {"js": got, "tag": msg.get("tag"), "hush": self._hush,
+                     "muted": _web_muted(self.win)}, ensure_ascii=False,
                     default=str) + "\n")
                 sys.stdout.flush()
             except Exception:
@@ -545,7 +577,7 @@ class Player:
         "(function(){"
         "var p=document.getElementById('movie_player');"
         "if(p&&p.getPlayerState){try{var d=p.getVideoData()||{};"
-        "return {ok:1,state:p.getPlayerState(),"
+        "return {ok:1,state:p.getPlayerState(),vol:p.getVolume(),"
         "pos:p.getCurrentTime()||0,dur:p.getDuration()||0,"
         "title:d.title||'',vid:d.video_id||''};}catch(e){}}"
         "var v=document.querySelector('video');"
@@ -609,11 +641,31 @@ class Player:
                 "if(v){try{%s}catch(e){}}})()"
                 % (api_call.split("(")[0], api_call, video_stmt))
 
+    HUSH_MAX = 8.0        # 볼륨 확인이 끝내 안 되면 이만큼 뒤에 그냥 푼다
+
+    def _unhush(self):
+        if self._hush:
+            self._hush = False
+            _web_mute(self.win, False)
+
+    def fast(self):
+        """바퀴를 촘촘히 돌 때인가 — 음소거 중이거나 볼륨을 아직 확인 못 했을 때.
+
+        음소거가 안 되는 판(옛 WebView2)에서도 튀는 시간을 0.1초 안으로 줄인다.
+        """
+        return self._hush or (self.mode == "watch" and not self._watch_ok
+                              and time.time() - self._watch_at < self.HUSH_MAX)
+
     def begin_watch(self, vid):
         self.mode = "watch"
         self._watch_at = time.time()
         self._watch_kick = 0.0
         self._watch_vol = -1
+        self._watch_ok = False
+        # 새 페이지가 유튜브 기본 볼륨(100)으로 먼저 틀기 전에 소리를 막는다.
+        # 우리 볼륨이 실제로 들어간 것을 읽어 확인하면 watch_tick 이 푼다.
+        self._hush = _web_mute(self.win, True)
+        self._hush_at = time.time()
         try:
             self.win.load_url("https://www.youtube.com/watch?v=" + vid)
         except Exception:
@@ -621,6 +673,7 @@ class Player:
 
     def end_watch(self, vid, lst):
         """다음 곡이 왔다 — 임베드 페이지로 돌아가 그 곡을 튼다."""
+        self._unhush()                   # 임베드는 볼륨을 먼저 걸고 곡을 싣는다
         self.mode = "play"
         self.cur = (vid, lst)
         self.resume = True
@@ -632,9 +685,29 @@ class Player:
     def watch_tick(self, s):
         """watch 페이지 살림 — 볼륨 맞추기·재생 밀기·끝나면 되감기."""
         now = time.time()
+        if self._hush and now - self._hush_at > self.HUSH_MAX:
+            # 끝내 확인이 안 됐다 — 소리가 영영 안 나는 것보다 낫다
+            try:
+                os.write(2, b"watch: volume not confirmed, unmute\n")
+            except Exception:
+                pass
+            self._unhush()
         if not s.get("ready"):
             return
         self.watch_fit()                 # 페이지가 새로 떴으면 다시 건다
+        # 볼륨은 걸었다고 믿지 말고 **읽어서** 확인한다. 유튜브는 본 페이지를
+        # 자기 기본값(100)으로 띄우므로, 들어가기 전까지는 음소거를 안 푼다.
+        got = s.get("wvol")
+        if got is not None:
+            try:
+                same = abs(float(got) - self.vol) <= 1
+            except (TypeError, ValueError):
+                same = False
+            if same:
+                self._watch_ok = True
+                self._unhush()
+            else:
+                self._watch_vol = -1     # 아직 안 들어갔거나 유튜브가 되돌렸다
         if self._watch_vol != self.vol:
             self._watch_vol = self.vol
             self._watch_js_do("setVolume(%d)" % self.vol,
@@ -653,6 +726,7 @@ class Player:
 
     # ── 로그인 ───────────────────────────────────────────────────────────
     def begin_login(self, x, y):
+        self._unhush()
         self.mode = "login"
         try:
             self.win.load_url(LOGIN_URL)
@@ -662,6 +736,7 @@ class Player:
 
     def end_login(self, signed):
         """로그인 화면을 접고 재생 페이지로 돌아간다."""
+        self._unhush()
         if signed is not None:
             self.signed = bool(signed)
         self.mode = "play"
@@ -697,6 +772,7 @@ class Player:
                     "vid": str(o.get("vid") or ""),
                     "pos": float(o.get("pos") or 0.0),
                     "dur": float(o.get("dur") or 0.0),
+                    "wvol": o.get("vol"),       # 볼륨 확인용 (watch_tick)
                     # 부모에게는 보통 재생으로 보인다 — 건너뛰지 않게
                     "err": 0})
             else:
@@ -872,7 +948,8 @@ def _main():
             pass
         _park_offscreen()                # show가 자리를 되돌릴 수 있어 한 번 더
         # 창을 만들자마자 상태를 물으면 아직 페이지가 없다. 조금 기다린다.
-        while not stop.wait(0.4):
+        # 볼륨 확인을 기다리는 동안은 촘촘히 — 음소거가 짧을수록 곡 앞이 덜 잘린다
+        while not stop.wait(0.1 if pl.fast() else 0.4):
             if not pl.fit and pl.mode != "login":
                 _taskbar_guard()           # 작업표시줄에 도로 뜨지 않게 (지뢰 209)
             if pl.fit:
