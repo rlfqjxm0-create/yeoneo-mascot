@@ -1,5 +1,6 @@
 {
  "themes": true,
+ "dark_theme": true,
  "name": "연어",
  "scale": 0.34,
  "screen_quad": [
