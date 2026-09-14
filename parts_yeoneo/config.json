@@ -824,6 +824,7 @@
   }
  },
  "deadline": true,
+ "tomato_tower": true,
  "feature_hints": true,
  "feature_hints_reset": 1
 }
