@@ -1631,6 +1631,32 @@ DEFAULT_SETTINGS = {
 UI_FONT = "Malgun Gothic"     # 시작할 때 프리텐다드가 실리면 바뀐다
 
 
+def _mac_font_register(path):
+    """맥 — 글꼴 파일 하나를 이 프로세스에만 등록한다 (설치 불필요 · CoreText).
+    pyobjc 의 CoreText 꾸러미는 굳힌 앱에 없으므로 ctypes 로 부른다 (색상키와 같은 길).
+    맥 러너 실측: Tk 를 만든 뒤에 등록해도 Tk 가 그 글꼴을 본다."""
+    cf = ctypes.CDLL("/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation")
+    ct = ctypes.CDLL("/System/Library/Frameworks/CoreText.framework/CoreText")
+    cf.CFURLCreateFromFileSystemRepresentation.restype = ctypes.c_void_p
+    cf.CFURLCreateFromFileSystemRepresentation.argtypes = [
+        ctypes.c_void_p, ctypes.c_char_p, ctypes.c_long, ctypes.c_bool]
+    cf.CFRelease.argtypes = [ctypes.c_void_p]
+    ct.CTFontManagerRegisterFontsForURL.restype = ctypes.c_bool
+    ct.CTFontManagerRegisterFontsForURL.argtypes = [ctypes.c_void_p, ctypes.c_int,
+                                                    ctypes.c_void_p]
+    b = os.fsencode(path)
+    url = cf.CFURLCreateFromFileSystemRepresentation(None, b, len(b), False)
+    if not url:
+        return False
+    try:
+        return bool(ct.CTFontManagerRegisterFontsForURL(url, 1, None))   # 1 = 이 프로세스만
+    finally:
+        cf.CFRelease(url)
+
+
+MAC_FONTS = []               # 맥에서 등록한 글꼴 파일 이름 (진단)
+
+
 def load_ui_font(char_dir):
     """파츠에 실린 프리텐다드를 이 프로세스에만 등록한다 (설치 불필요).
 
@@ -1646,6 +1672,19 @@ def load_ui_font(char_dir):
             # CI 맥 러너 캡처로 재현). ♥ 같은 기호가 깨져 보이는 것도
             # 같은 뿌리다. 모든 맥에 있는 한글 글꼴을 준다.
             UI_FONT = "Apple SD Gothic Neo"
+            # 마이 보드 글꼴(SUIT)만 등록한다 — 다른 창의 글꼴은 그대로 둔다.
+            # 실패하면 보드가 시스템 글꼴로 물러난다 (죽지는 않는다).
+            try:
+                d = os.path.join(char_dir, "fonts")
+                for f in sorted(os.listdir(d)) if os.path.isdir(d) else ():
+                    if f.startswith("SUIT-") and f.lower().endswith(".otf"):
+                        try:
+                            if _mac_font_register(os.path.join(d, f)):
+                                MAC_FONTS.append(f)
+                        except Exception:
+                            pass
+            except Exception:
+                pass
         return
     try:
         d = os.path.join(char_dir, "fonts")
@@ -3811,6 +3850,158 @@ class MacCharLayer:
             pass
         self.layer = None
         self.ok = False
+
+
+class MacMagLayer:
+    """맥 자석 모드 — 기운 몸을 담는 따로 된 창 (요청 2026-09-27).
+
+    맥의 몸 레이어(`MacCharLayer`)는 본체 창 **안**의 덧레이어라 창 밖으로 못 나간다.
+    자석 모드의 그림은 본체 창보다 크다(위쪽 벽은 위로, 옆 벽은 아래로, 위·아래 벽은
+    양옆으로). 그래서 윈도우의 레이어 창과 같은 짜임으로 테두리 없는 창을 하나 더 두고,
+    **그 창의 덧레이어**에 그림을 올린다 — 올리는 코드는 이미 실기기에서 돌고 있는
+    `MacCharLayer` 그대로다 (새 네이티브 길을 안 만든다 · 지뢰 130).
+
+    · 창 바탕은 키 색이고 색상키 필터(apply_all)가 지운다 — 친구 띠·말풍선 패널과 같다.
+    · 창은 자석 모드로 붙어 있는 동안에만 보인다. 떼면 withdraw 하고, 숨은 창은
+      건드리지 않는다 (지뢰 136 — 숨은 창을 옮기면 맥 Tk9 가 도로 화면에 올린다).
+    · 자리·크기는 **달라졌을 때만** 건다 (끌 때마다 그림을 다시 올리지 않는다 · 지뢰 157).
+    """
+
+    SEED = (131, 87)             # 처음 크기 — 다른 창과 안 겹치는 수 (NSWindow 를 크기로 찾는다)
+
+    def __init__(self, root, key, layer_cls=None):
+        self.ok = False
+        self.lay = None
+        self._shown = True
+        self._geo = None
+        self.diag = ""
+        self.pushes = 0              # 실제로 그림을 올린 수 (검사·진단)
+        self.blanked = False         # 그림만 비워 둔 채인가 (끄는 도중에 떨어졌다)
+        self.moves = 0               # 자리·크기를 건 수
+        self.top = tk.Toplevel(root)
+        self.top.overrideredirect(True)
+        for k9, v9 in (("-topmost", True), ("-transparent", True)):
+            try:
+                self.top.attributes(k9, v9)
+            except Exception:
+                pass
+        self.top.config(bg=key)
+        self.top.geometry("%dx%d+%d+%d" % (self.SEED[0], self.SEED[1],
+                                           root.winfo_rootx(), root.winfo_rooty()))
+        self.top.update_idletasks()
+        self.lay = (layer_cls or MacCharLayer)(self.top)
+        if not getattr(self.lay, "ok", False):
+            raise RuntimeError("mag layer not ok")
+        self._clear()
+        self.diag = str(getattr(self.lay, "diag", "") or "")
+        self.ok = True
+
+    def _clear(self):
+        """창과 그 뷰의 바탕을 비운다 (본체 창의 _mac_clear_bg 와 같은 호출)."""
+        view = getattr(self.lay, "view", None)
+        if view is None:
+            return
+        try:
+            from AppKit import NSColor
+            clear = NSColor.clearColor()
+            w = view.window()
+            if w is not None:
+                w.setOpaque_(False)
+                w.setBackgroundColor_(clear)
+                w.setHasShadow_(False)
+            host = getattr(self.lay, "host", None)
+            if host is not None:
+                host.setBackgroundColor_(clear.CGColor())
+                host.setOpaque_(False)
+        except Exception:
+            pass
+
+    def push(self, im, x, y):
+        """그림을 화면 (x, y) 자리에 올린다. 자리·크기는 달라졌을 때만 건다."""
+        geo = (int(im.width), int(im.height), int(x), int(y))
+        if not self._shown:
+            self.top.deiconify()
+            self._shown = True
+            self._geo = None
+            # 맥 Tk 는 withdraw → deiconify 를 거치면 '항상 위'가 풀린다 (띠와 같다)
+            try:
+                self.top.attributes("-topmost", True)
+                self.top.lift()
+            except Exception:
+                pass
+        if geo != self._geo:
+            old = self._geo
+            self._geo = geo
+            self.moves += 1
+            if old is not None and old[:2] == geo[:2]:
+                self.top.geometry("+%d+%d" % geo[2:])
+            else:
+                self.top.geometry("%dx%d+%d+%d" % geo)
+                # 크기가 바뀌었다 — 뷰 크기가 그 자리에서 따라오게 (덧레이어가 뷰에 맞춘다)
+                self.top.update_idletasks()
+                self._clear()
+        self.pushes += 1
+        self.blanked = False
+        return bool(self.lay.push(im))
+
+    def move(self, x, y):
+        """그림은 그대로 두고 자리만 옮긴다."""
+        g = self._geo
+        if g is None or not self._shown:
+            return
+        if (int(x), int(y)) != g[2:]:
+            self._geo = g[:2] + (int(x), int(y))
+            self.moves += 1
+            self.top.geometry("+%d+%d" % (int(x), int(y)))
+
+    @property
+    def visible(self):
+        return bool(self._shown)
+
+    def blank(self):
+        """그림만 비운다 — 창은 그대로 둔다. 이 창을 잡고 끄는 도중에 벽에서 떨어졌을 때
+        쓴다: 누른 창이 사라지면 끌기·떼기가 갈 곳을 잃는다 (손을 뗄 때 내린다)."""
+        if self._shown and not self.blanked:
+            self.blanked = True
+            try:
+                self.lay.hide()
+            except Exception:
+                pass
+
+    def hide(self):
+        self.blanked = False
+        if not self._shown:
+            return
+        self._shown = False
+        self._geo = None
+        try:
+            self.lay.hide()
+        except Exception:
+            pass
+        try:
+            self.top.withdraw()
+        except Exception:
+            pass
+
+    def place_above(self, owner_hwnd):
+        pass
+
+    def set_topmost(self, on):
+        pass
+
+    def destroy(self):
+        try:
+            if self.lay is not None:
+                self.lay.destroy()
+        except Exception:
+            pass
+        self.lay = None
+        try:
+            self.top.destroy()
+        except Exception:
+            pass
+        self.ok = False
+        self._shown = False
 
 
 class _CharSheet:
@@ -8779,7 +8970,7 @@ class Mascot:
         # 커서를 올리면 목록이 옆으로 나온다.
         # 마이 보드 — 상태 칩 바로 위 (요청). 홈 내 칸의 집 아이콘과 같은 창을 연다.
         self._new_menu_idx = {}
-        if self.cfg.get("myhome") and IS_WIN:
+        if self._board_on():
             _nb9 = self._menu_new("board")
             menu.add_command(label="마이 보드  ●" if _nb9 else "마이 보드",
                              command=lambda: self._safe("board_open",
@@ -8870,7 +9061,7 @@ class Mascot:
                                  "unreset", self._timer_unreset))
         # 자석 모드 — 켜고 화면 끝으로 끌고 가면 붙는다 (요청: 이 자리에).
         # '오류 기록 폴더 열기'는 환경설정 아래쪽으로 옮겼다 (요청).
-        if self.cfg.get("magnet") and IS_WIN:
+        if self.cfg.get("magnet") and (IS_WIN or IS_MAC):
             self._mag_var = tk.BooleanVar(master=self.root,
                                           value=bool(self.us.get("magnet")))
             _nm9 = self._menu_new("mag")
@@ -8981,6 +9172,13 @@ class Mascot:
         self._mag_sig = None         # 그 그림을 정한 것 전부 (자세·몸 장·덧장·묶음)
         self._mag_same = False       # 이번 프레임이 직전과 같았나 (올리기를 건너뛴다)
         self._mag_push = None        # 마지막으로 올린 (자리, 시각)
+        self._mag_lay = None         # 맥 — 기운 몸을 담는 따로 된 창 (MacMagLayer)
+        self._crash_fp = None        # 맥 — 프로세스가 죽을 때의 자국을 남길 파일
+        if IS_MAC:
+            self._safe("crash_trace", self._crash_trace_on)
+        self._mag_bad = False        # 그 창을 못 만들었다 — 이 세션에서는 자석 모드를 끈다
+        self._mag_root_hid = False   # 맥 — 본체 창의 덧레이어를 비워 두었나
+        self._mag_pressed = False    # 맥 — 자석 창에서 '그림이 있는 자리'를 눌렀나
         self._mag_groups = None      # 옮겨 얹을 묶음 [(그림, dx, dy)]
         self._mag_ex_key = None
         self._mag_fig = None
@@ -12741,6 +12939,9 @@ class Mascot:
             if self._char_lay is not None:
                 self._char_lay.destroy()
                 self._char_lay = None
+            if getattr(self, "_mag_lay", None) is not None:
+                self._mag_lay.destroy()
+                self._mag_lay = None
             # 음악 재생기를 먼저 거둔다. 파이프가 닫히면 스스로 끝나지만,
             # 여기서 확실히 보내 두어야 고아 프로세스가 남지 않는다.
             self._yt_stop()
@@ -15232,6 +15433,11 @@ class Mascot:
             top = getattr(holder, "top", None)
             if top is not None:
                 out.append(top)
+        # 맥 자석 창 — **보이고 있을 때만.** 내려 둔 창을 넣으면 되돌릴 때 빈 창이
+        # 화면에 올라온다 (지뢰 136·147)
+        ml9 = getattr(self, "_mag_lay", None)
+        if ml9 is not None and ml9.visible:
+            out.append(ml9.top)
         return out
 
     def _fs_tick(self, now):
@@ -21023,8 +21229,160 @@ class Mascot:
             self._say("화면 끝으로 끌고 가면 착 붙어요", 3.0)
 
     def _mag_ok(self):
-        return bool(IS_WIN and self.cfg.get("magnet") and self.us.get("magnet")
-                    and self._smooth_on)
+        # 맥은 색상키 창일 때만 (자석 창의 바탕을 필터가 지운다). 자석 창을 못 만든
+        # 세션에서는 끈다 — 몸이 안 보이는 채로 붙어 있는 것보다 평소 모습이 낫다.
+        plat = IS_WIN or (IS_MAC and self.canvas_bg == MAC_KEY)
+        return bool(plat and not self._mag_bad and self.cfg.get("magnet")
+                    and self.us.get("magnet") and self._smooth_on)
+
+    def _crash_trace_on(self):
+        """맥 — 프로세스가 통째로 죽을 때(네이티브 크래시) 파이썬 쪽 자리를 `.crash_trace.txt`
+        에 남긴다. 파이썬 예외가 아니라 `.error.log` 에는 안 남는다 (지뢰 125). faulthandler 는
+        인터프리터에 내장된 모듈이라 굳힌 앱에도 있다. 켤 때마다 앞에 시각을 적는다."""
+        try:
+            import faulthandler
+        except Exception:
+            return
+        p = os.path.join(self.state_dir, ".crash_trace.txt")
+        try:
+            if os.path.exists(p) and os.path.getsize(p) > 200000:
+                os.remove(p)
+        except Exception:
+            pass
+        fp = open(p, "a", encoding="utf-8")
+        fp.write("\n===== 켬 %s · 판 %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"),
+                                          str(getattr(self, "_ver", "") or "")))
+        fp.flush()
+        faulthandler.enable(file=fp, all_threads=True)
+        self._crash_fp = fp
+
+    def _mag_sep(self):
+        """자석 그림을 따로 된 창에 올려야 하는가 — 맥. 본체 창 안의 덧레이어는 창 밖으로
+        못 나간다 (윈도우는 몸 레이어가 원래 따로 된 창이다)."""
+        return IS_MAC
+
+    def _mag_lay_get(self):
+        """맥 자석 창 (처음 붙을 때 만든다). 못 만들면 이 세션의 자석 모드를 끈다."""
+        lay = self._mag_lay
+        if lay is not None:
+            return lay
+        if self._mag_bad:
+            return None
+        try:
+            lay = MacMagLayer(self.root, self.canvas_bg)
+        except Exception:
+            self._log_error("mag_layer")
+            self._mag_bad = True
+            return None
+        self._mag_lay = lay
+        self._safe("mag_bind", self._bind_mag_layer, lay)
+        if IS_MAC:
+            # 새 창에 색상키 필터를 곧바로 건다 (2초 바퀴를 기다리면 그동안 키 색이 보인다)
+            self._safe("mac_ck", self._mac_chroma_key)
+            self._safe("mac_mag_log", self._mac_log, "자석 창 켜짐 — " + lay.diag)
+        return lay
+
+    def _mag_lay_off(self):
+        """자석 창을 내린다 (떼었거나 자석 그림이 없는 프레임)."""
+        lay = self._mag_lay
+        if lay is not None and lay.visible:
+            try:
+                if self._mag_pressed:
+                    # 이 창을 잡고 끄는 중이다 — 창을 내리면 끌기·떼기가 갈 곳을 잃는다.
+                    # 그림만 비우고, 손을 뗄 때 내린다.
+                    lay.blank()
+                    self._mag_push = None
+                else:
+                    lay.hide()
+            except Exception:
+                self._log_error("mag_layer_hide")
+        self._mag_root_hid = False
+
+    def _mag_lay_late(self):
+        """끌다 떨어져 그림만 비워 둔 자석 창을 내린다 (손을 뗀 뒤 · 다시 붙었으면 그대로 둔다)."""
+        lay = self._mag_lay
+        if lay is not None and lay.blanked and not self._mag_pressed and not self._mag_side():
+            self._mag_lay_off()
+
+    def _mag_lay_fail(self, why):
+        """자석 창이 터졌다 — 내리고 이 세션의 자석 모드를 끈다 (_mag_keep 이 평소 자리로 세운다)."""
+        self._mag_bad = True
+        self._log_error("mag_layer_" + str(why))
+        lay, self._mag_lay = self._mag_lay, None
+        if lay is not None:
+            try:
+                lay.destroy()
+            except Exception:
+                pass
+        self._mag_root_hid = False
+        self._mag_pressed = False
+        self._mag_keep_at = 0.0
+
+    def _mag_hit(self, e):
+        """자석 창의 그 자리에 그림이 있는가. 색상키 창은 투명한 자리도 클릭을 받으므로
+        (윈도우의 레이어 창은 알파 0 을 알아서 통과시킨다) 직접 가른다."""
+        im = self._mag_out
+        if im is None:
+            return False
+        try:
+            x, y = int(e.x), int(e.y)
+            if not (0 <= x < im.width and 0 <= y < im.height):
+                return False
+            for dx, dy in ((0, 0), (-3, 0), (3, 0), (0, -3), (0, 3)):
+                x9, y9 = x + dx, y + dy
+                if 0 <= x9 < im.width and 0 <= y9 < im.height \
+                        and im.getpixel((x9, y9))[3] >= 24:
+                    return True
+        except Exception:
+            return True
+        return False
+
+    def _bind_mag_layer(self, lay):
+        """자석 창을 누른 것을 본체 핸들러로 넘긴다 (_bind_char_layer 와 같은 넷).
+        맥 Tk 는 우클릭이 <Button-2> 이고 Ctrl+클릭도 우클릭이다."""
+        w = lay.top
+
+        def inroot(e):
+            """그 자리가 본체 창 안인가 — 자석 창은 본체 창 위를 덮고 있어서(위쪽 벽은 통째로)
+            카드·재생 단추를 누른 클릭이 전부 이 창으로 온다. 색상키 창은 투명한 자리도
+            클릭을 받으므로, 본체 안이면 그림이 없어도 본체로 넘겨야 한다 (안 넘기면
+            자석 모드 동안 카드가 안 눌린다)."""
+            off = getattr(self, "_mag_off", None) or (0, 0)
+            x9, y9 = int(e.x) + int(off[0]), int(e.y) + int(off[1])
+            return 0 <= x9 < self.W and 0 <= y9 < self.H
+
+        def press(e):
+            self._mag_pressed = (not lay.blanked) and (self._mag_hit(e) or inroot(e))
+            if self._mag_pressed:
+                return self._on_press(self._lay_ev(e))
+
+        def drag(e):
+            if self._mag_pressed:
+                return self._on_drag(self._lay_ev(e))
+
+        def release(e):
+            if self._mag_pressed:
+                self._mag_pressed = False
+                try:
+                    return self._on_release(self._lay_ev(e))
+                finally:
+                    if lay.blanked:
+                        # 끄는 도중에 떨어졌다 — 이제 내린다. **이 창의 이벤트 안에서
+                        # 내리지 않는다** (제 이벤트를 처리하는 중에 그 창을 거두지 않게)
+                        try:
+                            self.root.after(40, self._mag_lay_late)
+                        except Exception:
+                            pass
+
+        def menu(e):
+            if self._mag_hit(e) or inroot(e):
+                return self._menu_pop(self._lay_ev(e))
+
+        w.bind("<Button-1>", press)
+        w.bind("<B1-Motion>", drag)
+        w.bind("<ButtonRelease-1>", release)
+        for ev9 in ("<Button-3>", "<Button-2>", "<Control-Button-1>"):
+            w.bind(ev9, menu)
 
     def _mag_side(self):
         m = self._mag
@@ -21267,6 +21625,9 @@ class Mascot:
             self._mag_fig = None
             self._mag_out = self._mag_sig = None
             self._mag_same = False
+            self._mag_push = None
+            if self._mag_lay is not None:
+                self._mag_lay_off()
         return True
 
     def _mag_keep(self, now, force=False):
@@ -21706,18 +22067,22 @@ class Mascot:
             return
         im9, off9 = sheet.im, (0, 0)
         fig9, self._mag_fig = getattr(self, "_mag_fig", None), None
+        mag9 = False                     # 이번 프레임에 자석 그림을 만들었나
         if self._mag_now and fig9 is not None:
             # 자석 모드 — 몸을 기울여 벽에 붙이고 덧장을 그 위에 얹는다.
             # 터지면 덧장만 올린다 (몸이 한 프레임 안 보이는 쪽이 낫다).
             try:
                 im9, off9 = self._mag_compose(sheet.im, fig9, self._mag_now,
                                               time.time())
+                mag9 = True
             except Exception:
                 self._log_error("mag_compose")
                 im9, off9 = sheet.im, (0, 0)
         self._mag_off = off9
         try:
-            if IS_MAC:
+            if self._mag_sep():
+                ok = self._mag_push_sep(lay, sheet, im9, off9, mag9)
+            elif IS_MAC:
                 ok = lay.push(im9)
             else:
                 x9 = self.root.winfo_rootx() + off9[0]
@@ -21753,6 +22118,37 @@ class Mascot:
             # 말고 그 자리에서 색상키로 되돌아간다 (다음 프레임에 돌아온다).
             self._smooth_off("올리기 실패")
 
+    def _mag_push_sep(self, lay, sheet, im9, off9, mag9):
+        """맥 — 자석 그림은 따로 된 창에, 평소 그림은 본체 창의 덧레이어에 올린다.
+        → 본체 쪽 올리기가 됐는가 (자석 창의 고장은 매끈 경로를 끄지 않는다)."""
+        if not mag9:
+            self._mag_lay_off()
+            return lay.push(im9)
+        ml9 = self._mag_lay_get()
+        if ml9 is None:
+            # 자석 창이 없다 — 몸 없이 덧장만. 다음 바퀴에 _mag_keep 이 평소 자리로 세운다
+            self._mag_off = (0, 0)
+            return lay.push(sheet.im)
+        if not self._mag_root_hid:
+            # 본체 창의 덧레이어는 비워 둔다 (몸은 자석 창에 있다)
+            lay.hide()
+            self._mag_root_hid = True
+        x9 = self.root.winfo_rootx() + off9[0]
+        y9 = self.root.winfo_rooty() + off9[1]
+        try:
+            lp9 = self._mag_push
+            if (self._mag_same and lp9 is not None and ml9.visible
+                    and not ml9.blanked and time.time() - lp9[1] < 0.5):
+                # 직전과 같은 그림 — 다시 올리지 않는다. 자리가 달라졌으면 창만 옮긴다
+                ml9.move(x9, y9)
+                return True
+            if not ml9.push(im9, x9, y9):
+                raise RuntimeError("push returned false")
+            self._mag_push = ((x9, y9), time.time())
+        except Exception:
+            self._mag_lay_fail("push")
+        return True
+
     def _smooth_off(self, why="", quiet=False):
         """매끈 경로를 이 세션 동안 끈다 — 색상키 방식으로 되돌아간다.
 
@@ -21774,6 +22170,13 @@ class Mascot:
                 lay.destroy()
             except Exception:
                 pass
+        ml9, self._mag_lay = getattr(self, "_mag_lay", None), None
+        if ml9 is not None:
+            try:
+                ml9.destroy()
+            except Exception:
+                pass
+        self._mag_root_hid = False
         for cache in (getattr(self, "_tilt_cache", None),
                       getattr(self, "_back_cache", None),
                       getattr(self, "_anim_pil_cache", None),
@@ -39278,6 +39681,10 @@ class Mascot:
         self._chip_kernel = None       # 프레임마다 지운다 (지뢰 14)
         if key not in ("game", "movie", "food") or self.gest is not None:
             return
+        if self._mag_side():
+            # 자석 모드 — 책상(게임기·팝콘통·밥그릇)을 안 그린다. 손짓만 남으면 벽을 잡은
+            # 손이 끝없이 까딱이고 음표가 떠서 '음악도 없는데 리듬을 탄다'가 된다 (퀸시 제보).
+            return
         box = getattr(self, "_chip_box", None)
         if not box:
             return
@@ -39567,7 +39974,24 @@ class Mascot:
     BOARD_UI_MAX = 260         # 보드 UI 그림 캐시 상한 (지뢰 18) — 한 장이 작다
 
     def _board_on(self):
-        return bool(self.cfg.get("myhome")) and IS_WIN
+        return bool(self.cfg.get("myhome")) and (IS_WIN or IS_MAC)
+
+    def _kbd(self, key):
+        """단축키 글 — 윈도우 'Ctrl+V' · 맥 '⌘V'."""
+        return ("⌘" + key) if IS_MAC else ("Ctrl+" + key)
+
+    def _bd_bind_menu(self, w, fn):
+        """우클릭을 건다. 맥 Tk 는 우클릭이 <Button-2> 이고 Ctrl+클릭도 우클릭이다."""
+        w.bind("<Button-3>", fn)
+        if IS_MAC:
+            w.bind("<Button-2>", fn)
+            w.bind("<Control-Button-1>", fn)
+
+    def _bd_bind_key(self, w, key, fn):
+        """Ctrl+<key> 를 건다 — 맥은 ⌘ 도 같이."""
+        w.bind("<Control-%s>" % key, fn)
+        if IS_MAC:
+            w.bind("<Command-%s>" % key, fn)
 
     def _board_file(self):
         return os.path.join(self.state_dir, ".myhome.json")
@@ -40031,6 +40455,14 @@ class Mascot:
         """주인 창을 직접 건다 — 표시줄 없는 창(overrideredirect)은 transient 가
         주인을 못 걸어, 환경설정이 보드 **뒤**에 떴다 (실측 z 314 대 66).
         주인이 있는 창은 늘 주인 위에 뜨고 같이 최소화된다."""
+        if not IS_WIN:
+            # 맥은 표시줄 있는 평범한 창이라 transient 가 그대로 통한다
+            try:
+                win.transient(parent)
+                win.lift()
+            except Exception:
+                pass
+            return
         try:
             win.update_idletasks()
             u9 = ctypes.WinDLL("user32")                     # 지뢰 21·23
@@ -40077,7 +40509,14 @@ class Mascot:
                 import tkinter.font as tkf
                 fams = set(tkf.families(self.root))
                 for _nm, tk3, pil3 in self.BOARD_FACES:
-                    if tk3[0] in fams and os.path.exists(
+                    fam9 = tk3[0]
+                    if IS_MAC:
+                        # 맥은 집안 이름이 하나('SUIT')고 굵기는 얼굴 이름으로 고른다 —
+                        # 'SUIT-SemiBold'·'SUIT-Bold'·'SUIT-ExtraBold' (맥 러너 실측:
+                        # 띄어 쓴 'SUIT ExtraBold' 는 SemiBold 로 떨어진다)
+                        fam9 = pil3[0].split("-")[0]
+                        tk3 = tuple(os.path.splitext(f9)[0] for f9 in pil3)
+                    if fam9 in fams and os.path.exists(
                             os.path.join(self.dir, "fonts", pil3[0])):
                         got = (tk3, pil3)
                         break
@@ -40094,7 +40533,7 @@ class Mascot:
             return self._uf(size, bool(bold))
         k = 2 if bold == 2 else (1 if bold else 0)
         sz = max(7, round(size * getattr(self, "ui_k", 1.0)))
-        if k == 1:
+        if k == 1 and not IS_MAC:
             return (fc[0][1], sz, "bold")
         return (fc[0][k], sz)
 
@@ -40185,14 +40624,15 @@ class Mascot:
             w9.bind("<Button-1>", lambda e, t=tag: self._safe("board_press", self._board_press, e, t))
             w9.bind("<B1-Motion>", lambda e, t=tag: self._safe("board_drag", self._board_drag_ev, e, t))
             w9.bind("<ButtonRelease-1>", lambda e, t=tag: self._safe("board_release", self._board_release, e, t))
-            w9.bind("<Button-3>", lambda e, t=tag: self._safe("board_rclick", self._board_rclick, e, t))
+            self._bd_bind_menu(w9, lambda e, t=tag: self._safe("board_rclick",
+                                                               self._board_rclick, e, t))
             w9.bind("<Motion>", lambda e, t=tag: self._safe("board_motion", self._board_motion, e, t))
             w9.bind("<MouseWheel>", lambda e, t=tag: self._safe("board_wheel", self._board_wheel, e, t))
         cv.bind("<Leave>", lambda e: self._tip_hide())
         win.bind("<Configure>", lambda e: self._safe("board_size", self._board_resized, e), add="+")
         win.bind("<Escape>", lambda e: self._board_close())
-        win.bind("<Control-z>", lambda e: self._safe("board_undo", self._board_undo))
-        win.bind("<Control-v>", lambda e: self._safe("board_paste", self._board_paste))
+        self._bd_bind_key(win, "z", lambda e: self._safe("board_undo", self._board_undo))
+        self._bd_bind_key(win, "v", lambda e: self._safe("board_paste", self._board_paste))
         win.protocol("WM_DELETE_WINDOW", self._board_close)
         self._win_place(win, "마이 보드")
         self._board_undo_stack = []
@@ -42980,9 +43420,10 @@ class Mascot:
         x = st["button"](W - 24, by, "확인", ok, "ink")
         st["button"](x - 8, by, "취소", st["close"], "fill")
         if multi:
-            cv.create_text(24, by, text="Ctrl+Enter 로 확인", font=self._bf(8, True),
+            cv.create_text(24, by, text=("⌘Enter 로 확인" if IS_MAC else "Ctrl+Enter 로 확인"),
+                           font=self._bf(8, True),
                            fill=self._mix(pal["sub"], pal["card"], 0.3), anchor="w")
-            ent.bind("<Control-Return>", ok)
+            self._bd_bind_key(ent, "Return", ok)
         else:
             ent.bind("<Return>", ok)
         st["place"]()
@@ -56818,6 +57259,29 @@ class Mascot:
                 return ""
             except Exception:
                 pass
+        if IS_MAC:
+            # **AppKit 색 패널을 이 프로세스에서 열지 않는다** — Tk 콜백 안의 모달은
+            # 앱을 죽인다 (지뢰 125). 그림 고르기와 같이 osascript 에 맡긴다.
+            try:
+                import subprocess
+                r0, g0, b0 = (int(str(init)[i:i + 2], 16) * 257 for i in (1, 3, 5))
+            except Exception:
+                r0 = g0 = b0 = 60000
+            try:
+                out = subprocess.run(
+                    ["osascript", "-e",
+                     "choose color default color {%d, %d, %d}" % (r0, g0, b0)],
+                    capture_output=True, timeout=300)
+                if out.returncode != 0:
+                    return ""                       # 취소
+                v = [int(float(x9)) for x9 in
+                     out.stdout.decode("utf-8", "replace").replace(",", " ").split()[:3]]
+                if len(v) != 3:
+                    return ""
+                return "#%02x%02x%02x" % tuple(max(0, min(255, x9 // 257)) for x9 in v)
+            except Exception:
+                self._log_error("pick_color_mac")
+                return ""
         try:
             from tkinter import colorchooser
             got = colorchooser.askcolor(init, title="단추 색 고르기")
