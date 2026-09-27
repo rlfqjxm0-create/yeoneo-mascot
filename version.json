@@ -1,7 +1,7 @@
 {
- "version": 1789883918,
+ "version": 1790517206,
  "files": {
-  "mascot.py": "cbda2a866a0afd3bd31e10d4a1104ab4841239e3162a5053be2159b3a6fae73b",
+  "mascot.py": "7799177b93508c87279f23286e1654b5f4c6c45159c25265ea7a4f127a46106f",
   "parts_yeoneo/arm_key.png": "5880d3ef755195b0ab6574ec3c408940da9a49cfba4ef0419b6701d59898a8b6",
   "parts_yeoneo/arm_pen.png": "9f5989174ed0c9eb0e9b1d62040292a5122bf743d748e2e8b1943a1a6afa83d8",
   "parts_yeoneo/arm_right.png": "e8955c8085bfbd801dfdd7ae776124c0f53bbc7c263ead9811d4091a7bdea159",
@@ -13,7 +13,7 @@
   "parts_yeoneo/chip_meta.json": "19d1e6c8695852c7445dbb541df4050fb3d0ca7eb0fcbfb71f30cd96c3c757d2",
   "parts_yeoneo/chip_movie.png": "43bfa1493af45a8adc05b455acda466b56cad4394229cd8a706ae5cde09ed642",
   "parts_yeoneo/chip_spoon.png": "9c1f69af5de27a78fcff161bc8cacbe21aa3ce8cc5b8ea8294517ae23925f08f",
-  "parts_yeoneo/config.json": "83b66886755daa39250074a4beeb5d82c9fd34d12ca05be568c0755a96571196",
+  "parts_yeoneo/config.json": "6d90b4e1e833393acc55cf3fa1c19ac7bad5a8124442f70fd49be0edbe4ad3c4",
   "parts_yeoneo/config.json.bak": "c01802d4676b5cdd9e202446f56aa552ed908a4acde2479cf95f406fab8adf68",
   "parts_yeoneo/crown.png": "b1b7426a0222ac294a782cb06db6c9c4aba4e660591dd1761dc9e4da050175fc",
   "parts_yeoneo/desk.png": "7002c97c2c42baea38744d02fe5abf2fee063845665bd7bcd4bbced4254daa06",
@@ -98,6 +98,9 @@
   "parts_yeoneo/wg_head.png": "baff2573c45f73d82187fee4b65f0007ecaf3393c90d81674b62caf3f6abaa58",
   "parts_yeoneo/fonts/Pretendard-Bold.otf": "2e91915fab54df71cc9598ebf608b2bdb54c6fe3c066ac61dff0bc44fca71cc7",
   "parts_yeoneo/fonts/Pretendard-Regular.otf": "3ffbacde6ab8411f1d2db54bb9b1f0b3ee2a738932033722cf0388c06aed1c93",
+  "parts_yeoneo/fonts/SUIT-Bold.otf": "40178aa07b8ce5ef7bfe8381641272de8e6020095245995d95ed71c26f54f2a8",
+  "parts_yeoneo/fonts/SUIT-ExtraBold.otf": "67e6733beb6192138e4651f4436f0e2be2fe6a519861dd23cb86cf136bac0232",
+  "parts_yeoneo/fonts/SUIT-SemiBold.otf": "faeab67df52b4400aec8893507b5b1502057b53f1224bfe6c89cdba2bece0ca1",
   "parts_yeoneo/snacks/apple.png": "1b07368fb7e1ff3141b29e726727d47b1f369c962ea3635af5239bb7fa9ae01e",
   "parts_yeoneo/snacks/banana.png": "16032c8970de5f4ac8ec73f44321f8c2e568fe3ff132890170cc6e629cdadab0",
   "parts_yeoneo/snacks/bar.png": "a22cacddcd150bdb2dfab6600d93c27d01fc04523faa0407f7d97fb3d4be71ae",
@@ -579,11 +582,11 @@
   "youtube_player.py": "cfe04eb4c6a7fb3f9470ad1cf539d384341bf104fb10ba891d430952cf2f6efe"
  },
  "notes": [
-  "소품을 바꾼 뒤 웃으며 몸을 흔들 때 옛 소품(계란 후라이)이 어긋난 자리에 나오던 것을 고쳤어요 — 이제 기울여도 바꾼 소품 그대로예요",
-  "새 몸짓 넷 — 막춤·좌우 스텝·파도타기·눈 비비기. 작업 중이든 쉴 때든 가끔 나와요 (춤은 20~40분, 눈 비비기는 40~90분에 한 번쯤)",
-  "고개를 끄덕이거나 기울일 때 머리 위 소품·양갈래·날개가 같이 따라 움직여요",
-  "윈도우 10: 뽀모도로·홈·환경설정·쪽지함 창과 우클릭 메뉴 모서리를 각진 모양으로 통일했어요",
-  "유리 테마: 밝은 바탕화면에서 글자가 안 읽히던 것과 흐림이 안 걸리는 컴퓨터에서 판이 불투명하던 것을 고쳤어요",
-  "우클릭 메뉴의 오른쪽 끝을 눌러도 항목이 안 먹던 것을 고쳤어요"
+  "**마이 보드가 생겼어요** — 캐릭터 우클릭 → '마이 보드' (홈 내 칸의 집 아이콘으로도 열려요). 내 캐릭터가 앉아 있는 보드에 사진·메모지·마스킹테이프·체크리스트·티켓·스티커를 붙여 꾸며요",
+  "**마이 보드 꾸미는 법** — 오른쪽 위 '꾸미기'를 누르면 도구 띠가 나와요. 붙인 것은 끌어서 옮기고, 손잡이로 크기·회전·지우기 · Ctrl+V 로 그림 붙여넣기 · 되돌리기와 프리셋 저장도 돼요. 톱니바퀴에서 테마·바탕·말풍선을 바꿔요",
+  "**달력 탭** — 마이 보드 위쪽 '달력'. 날짜를 눌러 일정을 넣고 단계(러프·선화·채색…)와 진행률을 적어요 (월·주·목록 보기). 일정을 바탕화면의 마감·할 일 말풍선에 띄울 수 있고, 말풍선의 마감도 달력에서 고치고 끝낼 수 있어요",
+  "**자석 모드** — 우클릭 → '자석 모드'를 켜고 캐릭터를 화면 가장자리(위·아래·왼쪽·오른쪽)로 끌고 가면 착 붙어서 벽 너머에서 빼꼼 내다봐요. 다시 끌어내면 떨어지고, 메뉴에서 끄면 평소대로예요 (환경설정의 '부드러운 가장자리'가 켜져 있어야 해요)",
+  "홈 '오늘 한 줄'에 **문구 저장** — 켜 두면 날이 바뀌어도 고칠 때까지 그대로예요 · '오류 기록 폴더 열기'는 환경설정 맨 아래 '문제 해결'로 옮겼어요",
+  "마이 보드와 자석 모드는 윈도우 전용이에요 (맥은 준비 중) · 메뉴의 새 항목 옆 빨간 점은 한 번 눌러 보면 사라져요"
  ]
 }
